@@ -1,6 +1,41 @@
 # mem-ai
 Basic MemOS AI memory system
 
+## 工程导航与检查
+
+工程目录和功能定位索引位于 [`docs/backend-scaffold-design.md`](docs/backend-scaffold-design.md#3-工程目录)。开始实现前先按索引定位能力负责人和已有入口，完成后运行：
+
+```bash
+python3 tools/check_architecture.py
+```
+
+该检查会校验已落地目录、功能索引重复路径、本地文档链接、重复字面量路由和源码文件规模。
+
+## 本地 PostgreSQL
+
+安装并启动 Docker 和 Docker Compose，然后在项目根目录执行：
+
+```bash
+cp .env.example .env
+```
+
+编辑 `.env` 中的 `POSTGRES_PASSWORD`，再启动数据库：
+
+```bash
+docker compose up -d
+```
+
+数据库默认只监听本机的 `127.0.0.1:5432`，数据库名和用户名均为 `mem_ai`。如端口被占用，可修改 `.env` 中的 `POSTGRES_PORT`。数据保存在 Docker 命名卷 `postgres_data` 中，普通的 `docker compose down` 会保留数据。
+
+查看状态与连接数据库：
+
+```bash
+docker compose ps
+docker compose exec postgres psql -U mem_ai -d mem_ai
+```
+
+如果修改了 `.env` 中的用户名或数据库名，连接命令也需要使用对应的值。PostgreSQL 的初始化变量仅在数据卷首次初始化时生效，修改 `.env` 不会更改已有数据库中的用户、密码或数据库名。当前配置只启动数据库，业务表后续由数据库迁移创建。
+
 ## MemOS Cloud Skills
 
 项目内安装了 [MemTensor 官方的两个 Skill](https://github.com/MemTensor/MemOS-Cloud-Skill/blob/main/README_zh.md)：
