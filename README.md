@@ -1,6 +1,19 @@
 # mem-ai
 Basic MemOS AI memory system
 
+## 快捷命令（Makefile）
+
+根目录提供职责分离的 [`Makefile`](Makefile)，数据库容器、迁移和 API 进程各自独立控制：
+
+```bash
+make db-up          # 启动本地 PostgreSQL 容器并等待健康检查通过
+make db-down        # 停止本地 PostgreSQL 容器（保留数据卷）
+make migrate        # 执行 Alembic 升级到 head
+make api            # 启动带 --reload 的本地 FastAPI 开发服务
+make test           # 运行 pytest 测试集
+make check          # 执行 Ruff lint/format、mypy 与架构检查
+```
+
 ## 工程导航与检查
 
 工程目录和功能定位索引位于 [`docs/backend-scaffold-design.md`](docs/backend-scaffold-design.md#3-工程目录)。开始实现前先按索引定位能力负责人和已有入口，完成后运行：

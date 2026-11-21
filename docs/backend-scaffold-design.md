@@ -162,7 +162,7 @@ Service
 | `.scratch/ai-chat-memory/` | 已落地 | 读取当前规格、依赖和实现边界 |
 | `.agents/skills/` | 已落地 | 按任务读取适用技能，技能文件不作为业务实现入口 |
 | `tools/check_architecture.py` | 已落地 | 校验工程目录、功能索引、文档链接、分层导入、装配例外、重复字面量路由、ticket 依赖图和源码文件规模 |
-| `compose.yaml`、`.env.example`、`pyproject.toml`、`uv.lock`、`.python-version`、`alembic.ini` | 已落地 | 本地依赖（支持 `POSTGRES_DATA_DIR` 自定义数据卷路径）、配置模板、锁定依赖与迁移配置 |
+| `compose.yaml`、`.env.example`、`Makefile`、`pyproject.toml`、`uv.lock`、`.python-version`、`alembic.ini` | 已落地 | 本地依赖（支持 `POSTGRES_DATA_DIR` 自定义数据卷路径）、配置模板、快捷命令、锁定依赖与迁移配置 |
 | `migrations/`、`.github/workflows/checks.yml` | 已落地 | Alembic 同步迁移基线与最小 CI 检查流水线 |
 | `src/mem_ai/main.py`、`src/mem_ai/application.py`、`src/mem_ai/core/config.py`、`src/mem_ai/core/logging.py`、`src/mem_ai/core/exceptions.py`、`src/mem_ai/core/exception_handlers.py`、`src/mem_ai/api/`、`src/mem_ai/db/`、`src/mem_ai/contracts/`、`src/mem_ai/integrations/`、`src/mem_ai/modules/health/` | 已落地 | 01 基础脚手架、应用装配、提供方协议、公共分页、错误处理与健康检查 |
 | `tests/conftest.py`、`tests/unit/`、`tests/api/`、`tests/integration/`、`tests/architecture/` | 已落地（持续扩展） | 01 基础测试 fixture、单元、API、PostgreSQL/迁移与架构测试 |
@@ -199,6 +199,7 @@ mem-ai/                                    # 项目根目录，管理应用、�
 ├── .env.example                           # 服务端环境变量模板和用途说明
 ├── .gitignore                             # 本地密钥、缓存和临时文件的忽略规则
 ├── alembic.ini                            # Alembic 入口配置和迁移日志设置
+├── Makefile                               # 独立的数据库、迁移、API 启动与检查快捷命令
 ├── compose.yaml                           # 本地 PostgreSQL 依赖和健康检查
 ├── Dockerfile                             # 应用容器定义，支持 API 与 Worker 入口
 ├── .dockerignore                          # 容器上下文过滤规则
