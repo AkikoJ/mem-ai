@@ -268,3 +268,50 @@ async def test_health_ready_returns_503_when_database_unreachable() -> None:
     payload = resp.json()
     assert payload["error"]["code"] == "database_unavailable"
     assert payload["error"]["request_id"] == "req_down"
+
+
+@pytest.mark.anyio
+async def test_api_docs_serve_local_offline_assets_without_external_cdn() -> None:
+    app = create_app(Settings(_env_file=None, app_env="development"))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        docs_resp = await client.get("/docs")
+        assert docs_resp.status_code == 200
+        assert "/static/docs/swagger-ui-bundle.js" in docs_resp.text
+        assert "/static/docs/swagger-ui.css" in docs_resp.text
+        assert "/static/docs/favicon.png" in docs_resp.text
+        assert "cdn.jsdelivr.net" not in docs_resp.text
+        assert "fastapi.tiangolo.com" not in docs_resp.text
+
+        redoc_resp = await client.get("/redoc")
+        assert redoc_resp.status_code == 200
+        assert "/static/docs/redoc.standalone.js" in redoc_resp.text
+        assert "/static/docs/favicon.png" in redoc_resp.text
+        assert "cdn.jsdelivr.net" not in redoc_resp.text
+        assert "fonts.googleapis.com" not in redoc_resp.text
+        assert "fastapi.tiangolo.com" not in redoc_resp.text
+
+        for asset in (
+            "/static/docs/swagger-ui-bundle.js",
+            "/static/docs/swagger-ui.css",
+            "/static/docs/redoc.standalone.js",
+            "/static/docs/favicon.png",
+        ):
+            asset_resp = await client.get(asset)
+            assert asset_resp.status_code == 200
+            assert len(asset_resp.content) > 0
+
+
+@pytest.mark.anyio
+async def test_api_docs_are_disabled_in_production() -> None:
+    prod_settings = Settings(
+        _env_file=None,
+        app_env="production",
+        postgres_password="strong-prod-password-123",
+    )
+    app = create_app(prod_settings)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        for path in ("/docs", "/redoc", "/openapi.json"):
+            resp = await client.get(path)
+            assert resp.status_code == 404
