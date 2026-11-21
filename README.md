@@ -8,6 +8,7 @@ Basic MemOS AI memory system
 ```bash
 uv sync --locked --dev
 uv run ruff check .
+uv run ruff format --check .
 uv run mypy src
 uv run alembic upgrade head
 uv run alembic check

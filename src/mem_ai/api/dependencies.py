@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Annotated, cast
+from typing import Annotated, TypeVar, cast
 
 import httpx
 from fastapi import Depends, Request
@@ -14,6 +14,17 @@ from mem_ai.contracts.model_provider import ModelProvider
 from mem_ai.contracts.persona_provider import PersonaProvider
 from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import ServiceUnavailableError
+
+_ProviderT = TypeVar("_ProviderT")
+
+
+def _require_provider(provider: _ProviderT | None, *, name: str) -> _ProviderT:  # noqa: UP047
+    if provider is None:
+        raise ServiceUnavailableError(
+            code="provider_not_configured",
+            message=f"{name} provider is not configured",
+        )
+    return provider
 
 
 @dataclass(slots=True)
@@ -43,34 +54,19 @@ def get_http_client(request: Request) -> httpx.AsyncClient:
 def get_model_provider(request: Request) -> ModelProvider:
     """Return the configured ModelProvider (overridable via `app.dependency_overrides`)."""
     registry = cast(ProviderRegistry, request.app.state.providers)
-    if registry.model_provider is None:
-        raise ServiceUnavailableError(
-            code="provider_not_configured",
-            message="model provider is not configured",
-        )
-    return registry.model_provider
+    return _require_provider(registry.model_provider, name="model")
 
 
 def get_memory_provider(request: Request) -> MemoryProvider:
     """Return the configured MemoryProvider (overridable via `app.dependency_overrides`)."""
     registry = cast(ProviderRegistry, request.app.state.providers)
-    if registry.memory_provider is None:
-        raise ServiceUnavailableError(
-            code="provider_not_configured",
-            message="memory provider is not configured",
-        )
-    return registry.memory_provider
+    return _require_provider(registry.memory_provider, name="memory")
 
 
 def get_persona_provider(request: Request) -> PersonaProvider:
     """Return the configured PersonaProvider (overridable via `app.dependency_overrides`)."""
     registry = cast(ProviderRegistry, request.app.state.providers)
-    if registry.persona_provider is None:
-        raise ServiceUnavailableError(
-            code="provider_not_configured",
-            message="persona provider is not configured",
-        )
-    return registry.persona_provider
+    return _require_provider(registry.persona_provider, name="persona")
 
 
 SettingsDep = Annotated[Settings, Depends(get_settings)]

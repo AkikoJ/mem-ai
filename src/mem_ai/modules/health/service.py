@@ -70,21 +70,26 @@ async def check_readiness(
                     await session.execute(text("SELECT to_regclass('public.alembic_version')"))
                 ).scalar_one_or_none()
                 if has_alembic_table is None:
-                    version_row = None
+                    applied_revisions: list[str] = []
                 else:
-                    version_row = (
-                        await session.execute(
-                            text("SELECT version_num FROM public.alembic_version LIMIT 1")
+                    rows = (
+                        (
+                            await session.execute(
+                                text("SELECT version_num FROM public.alembic_version")
+                            )
                         )
-                    ).scalar_one_or_none()
+                        .scalars()
+                        .all()
+                    )
+                    applied_revisions = [str(row) for row in rows]
     except (TimeoutError, SQLAlchemyError, OSError) as exc:
         raise ServiceUnavailableError(
             code="database_unavailable",
             message="database dependency is unavailable",
         ) from exc
 
-    actual_revision = str(version_row) if version_row is not None else None
-    if expected_revision is not None and actual_revision != expected_revision:
+    actual_revision = applied_revisions[0] if len(applied_revisions) == 1 else None
+    if expected_revision is None or actual_revision is None or actual_revision != expected_revision:
         raise ServiceUnavailableError(
             code="migration_version_mismatch",
             message="database migration revision does not match required version",
@@ -97,5 +102,5 @@ async def check_readiness(
     return ReadinessStatus(
         status="ready",
         database="ok",
-        migration_revision=actual_revision or "unknown",
+        migration_revision=actual_revision,
     )

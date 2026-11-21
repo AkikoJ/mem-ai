@@ -123,10 +123,7 @@ class FakeMemoryProvider:
             for record in self.records.values()
             if record.user_id == query.user_id
             and (query.scope is None or record.scope == query.scope)
-            and (
-                query.conversation_id is None
-                or record.conversation_id == query.conversation_id
-            )
+            and (query.conversation_id is None or record.conversation_id == query.conversation_id)
         ]
         items.sort(key=lambda r: (r.created_at, r.memory_id), reverse=True)
         sliced = items[: query.limit]
@@ -224,9 +221,7 @@ def empty_pg_settings() -> Iterator[Settings]:
     try:
         with admin_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
             conn.execute(text(f'CREATE DATABASE "{test_db}"'))
-        yield base_settings.model_copy(
-            update={"app_env": "test", "postgres_db": test_db}
-        )
+        yield base_settings.model_copy(update={"app_env": "test", "postgres_db": test_db})
     finally:
         with admin_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
             conn.execute(text(f'DROP DATABASE IF EXISTS "{test_db}" WITH (FORCE)'))

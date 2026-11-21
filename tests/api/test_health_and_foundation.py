@@ -118,42 +118,64 @@ async def test_error_envelopes_for_404_409_422_and_500(
     async def raise_unhandled() -> None:
         raise RuntimeError("sensitive internal traceback detail")
 
-    async with app.router.lifespan_context(app):
-        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            not_found = await client.get("/v1/does-not-exist", headers={"X-Request-Id": "req_404"})
-            assert not_found.status_code == 404
-            assert not_found.json()["error"]["code"] == "not_found"
-            assert not_found.json()["error"]["request_id"] == "req_404"
+    log_buffer = StringIO()
+    handler = logging.StreamHandler(log_buffer)
+    handler.setFormatter(JsonLogFormatter())
+    logger = logging.getLogger("mem_ai")
+    logger.addHandler(handler)
 
-            conflict = await client.get("/_test/conflict", headers={"X-Request-Id": "req_409"})
-            assert conflict.status_code == 409
-            assert conflict.json() == {
-                "error": {
-                    "code": "conversation_generation_conflict",
-                    "message": "conversation already has an active generation",
-                    "request_id": "req_409",
-                    "details": {"conversation_id": "conv_42"},
+    try:
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                not_found = await client.get(
+                    "/v1/does-not-exist", headers={"X-Request-Id": "req_404"}
+                )
+                assert not_found.status_code == 404
+                assert not_found.json()["error"]["code"] == "not_found"
+                assert not_found.json()["error"]["request_id"] == "req_404"
+
+                conflict = await client.get("/_test/conflict", headers={"X-Request-Id": "req_409"})
+                assert conflict.status_code == 409
+                assert conflict.json() == {
+                    "error": {
+                        "code": "conversation_generation_conflict",
+                        "message": "conversation already has an active generation",
+                        "request_id": "req_409",
+                        "details": {"conversation_id": "conv_42"},
+                    }
                 }
-            }
 
-            invalid = await client.get(
-                "/_test/validate",
-                params={"limit": "secret_raw_input"},
-                headers={"X-Request-Id": "req_422"},
-            )
-            assert invalid.status_code == 422
-            invalid_body = invalid.json()
-            assert invalid_body["error"]["code"] == "validation_error"
-            assert invalid_body["error"]["request_id"] == "req_422"
-            assert "secret_raw_input" not in json.dumps(invalid_body)
+                invalid = await client.get(
+                    "/_test/validate",
+                    params={"limit": "secret_raw_input"},
+                    headers={"X-Request-Id": "req_422"},
+                )
+                assert invalid.status_code == 422
+                invalid_body = invalid.json()
+                assert invalid_body["error"]["code"] == "validation_error"
+                assert invalid_body["error"]["request_id"] == "req_422"
+                assert "secret_raw_input" not in json.dumps(invalid_body)
 
-            crash = await client.get("/_test/crash", headers={"X-Request-Id": "req_500"})
-            assert crash.status_code == 500
-            crash_body = crash.json()
-            assert crash_body["error"]["code"] == "internal_server_error"
-            assert crash_body["error"]["request_id"] == "req_500"
-            assert "sensitive internal traceback" not in json.dumps(crash_body)
+                crash = await client.get("/_test/crash", headers={"X-Request-Id": "req_500"})
+                assert crash.status_code == 500
+                assert crash.headers["x-request-id"] == "req_500"
+                crash_body = crash.json()
+                assert crash_body["error"]["code"] == "internal_server_error"
+                assert crash_body["error"]["request_id"] == "req_500"
+                assert "sensitive internal traceback" not in json.dumps(crash_body)
+    finally:
+        logger.removeHandler(handler)
+
+    error_logs = [
+        json.loads(line)
+        for line in log_buffer.getvalue().splitlines()
+        if line.strip() and json.loads(line).get("logger") == "mem_ai.errors"
+    ]
+    assert any(
+        entry.get("request_id") == "req_500" and entry.get("error_code") == "internal_server_error"
+        for entry in error_logs
+    )
 
 
 @pytest.mark.integration

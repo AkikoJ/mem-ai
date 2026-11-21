@@ -197,9 +197,7 @@ def check_source_module_ownership(errors: ArchitectureErrors) -> None:
         if path.is_dir() and not path.name.startswith("_")
     ):
         if module_path.name not in indexed_modules:
-            errors.add(
-                f"源码模块未登记到功能定位索引 {module_path.relative_to(ROOT)}"
-            )
+            errors.add(f"源码模块未登记到功能定位索引 {module_path.relative_to(ROOT)}")
 
 
 def _extract_imports(tree: ast.AST) -> list[tuple[str, int]]:
@@ -217,9 +215,7 @@ def _extract_imports(tree: ast.AST) -> list[tuple[str, int]]:
 
 
 def _matches_prefix(module_name: str, prefixes: tuple[str, ...]) -> bool:
-    return any(
-        module_name == prefix or module_name.startswith(f"{prefix}.") for prefix in prefixes
-    )
+    return any(module_name == prefix or module_name.startswith(f"{prefix}.") for prefix in prefixes)
 
 
 def check_imports_for_source(
@@ -260,9 +256,7 @@ def check_imports_for_source(
             key = (lineno, imported.split(".")[1])
             if key not in reported:
                 reported.add(key)
-                errors.add(
-                    f"core 层禁止反向依赖上层模块 {normalized}:{lineno} -> {imported}"
-                )
+                errors.add(f"core 层禁止反向依赖上层模块 {normalized}:{lineno} -> {imported}")
 
         if normalized.startswith("src/mem_ai/modules/"):
             parts = normalized.split("/")
@@ -287,9 +281,7 @@ def check_imports_for_source(
                 key = (lineno, f"cross_module_{mod_match.group(1)}")
                 if key not in reported:
                     reported.add(key)
-                    errors.add(
-                        f"禁止跨模块直接访问持久化层 {normalized}:{lineno} -> {imported}"
-                    )
+                    errors.add(f"禁止跨模块直接访问持久化层 {normalized}:{lineno} -> {imported}")
 
 
 def check_layered_imports(errors: ArchitectureErrors) -> None:
@@ -424,9 +416,7 @@ def route_literals(path: Path) -> list[tuple[str, str, int]]:
             route = decorator.args[0]
             if isinstance(route, ast.Constant) and isinstance(route.value, str):
                 owner = (
-                    decorator.func.value.id
-                    if isinstance(decorator.func.value, ast.Name)
-                    else ""
+                    decorator.func.value.id if isinstance(decorator.func.value, ast.Name) else ""
                 )
                 prefix = router_prefixes.get(owner, "")
                 routes.append((method.upper(), _join_route(prefix, route.value), decorator.lineno))

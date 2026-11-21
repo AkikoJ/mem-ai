@@ -164,9 +164,9 @@ Service
 | `tools/check_architecture.py` | 已落地 | 校验工程目录、功能索引、文档链接、分层导入、装配例外、重复字面量路由、ticket 依赖图和源码文件规模 |
 | `compose.yaml`、`.env.example`、`pyproject.toml`、`uv.lock`、`.python-version`、`alembic.ini` | 已落地 | 本地依赖（支持 `POSTGRES_DATA_DIR` 自定义数据卷路径）、配置模板、锁定依赖与迁移配置 |
 | `migrations/`、`.github/workflows/checks.yml` | 已落地 | Alembic 同步迁移基线与最小 CI 检查流水线 |
-| `src/mem_ai/main.py`、`src/mem_ai/application.py`、`src/mem_ai/core/`、`src/mem_ai/api/`、`src/mem_ai/db/`、`src/mem_ai/contracts/`、`src/mem_ai/integrations/`、`src/mem_ai/modules/health/` | 已落地 | 01 基础脚手架、应用装配、提供方协议、公共分页、错误处理与健康检查 |
+| `src/mem_ai/main.py`、`src/mem_ai/application.py`、`src/mem_ai/core/config.py`、`src/mem_ai/core/logging.py`、`src/mem_ai/core/exceptions.py`、`src/mem_ai/core/exception_handlers.py`、`src/mem_ai/api/`、`src/mem_ai/db/`、`src/mem_ai/contracts/`、`src/mem_ai/integrations/`、`src/mem_ai/modules/health/` | 已落地 | 01 基础脚手架、应用装配、提供方协议、公共分页、错误处理与健康检查 |
 | `tests/conftest.py`、`tests/unit/`、`tests/api/`、`tests/integration/`、`tests/architecture/` | 已落地（持续扩展） | 01 基础测试 fixture、单元、API、PostgreSQL/迁移与架构测试 |
-| `src/mem_ai/modules/`（业务模块）与 `src/mem_ai/workers/` | 按切片落地 | 先检查实际文件，再沿功能定位索引进入 |
+| `src/mem_ai/core/limits.py`、`src/mem_ai/core/telemetry.py`、`src/mem_ai/modules/`（业务模块）与 `src/mem_ai/workers/` | 按切片落地 | 先检查实际文件，再沿功能定位索引进入 |
 
 ### 3.0.2 功能定位索引
 
@@ -174,7 +174,7 @@ Service
 
 | 业务能力 | 主负责人 | 协作路径 | 首要查找路径 | 相关验证位置 | 相关 ticket |
 | --- | --- | --- | --- | --- | --- |
-| 应用装配、配置、错误和健康检查 | `application` | `core/`、`modules/health/` | `src/mem_ai/application.py`、`src/mem_ai/core/`、`src/mem_ai/modules/health/router.py` | `tests/architecture/`、`tests/api/` | 01、17、18 |
+| 应用装配、配置、错误和健康检查 | `application` | `core/`、`modules/health/` | `src/mem_ai/application.py`、`src/mem_ai/core/`、`src/mem_ai/modules/health/service.py`、`src/mem_ai/modules/health/router.py` | `tests/architecture/`、`tests/api/` | 01、17、18 |
 | 认证上下文和用户状态 | `auth` | `users/` | `src/mem_ai/modules/auth/`、`src/mem_ai/modules/users/` | `tests/api/`、`tests/integration/` | 02、15 |
 | Agent 与人设版本生命周期 | `agents` | `personas/provider.py` | `src/mem_ai/modules/agents/` | `tests/api/`、`tests/integration/` | 03、11 |
 | 同步与流式生成编排 | `conversations` | `models/`、`memories/`、`jobs/` | `src/mem_ai/modules/conversations/service.py`、`generation.py`、`stream.py` | `tests/api/`、`tests/integration/` | 05、07、08、10、12 |
@@ -189,7 +189,7 @@ Service
 
 目录树如下。
 
-下列目录是目标工程结构。设计文档、设计评审、领域文档、技能、ticket、`.env.example`、`compose.yaml`，以及 01 基础切片（`pyproject.toml`、`uv.lock`、`.python-version`、`alembic.ini`、`migrations/`、应用装配、`core/`、`api/`、`db/`、`contracts/`、`integrations/`、`modules/health/`、`tests/` 与 `.github/workflows/checks.yml`）已落地；其余业务模块、Worker、运行手册与容器部署文件随 02–18 切片逐步落地。
+下列目录是目标工程结构。设计文档、设计评审、领域文档、技能、ticket、`.env.example`、`compose.yaml`，以及 01 基础切片（`pyproject.toml`、`uv.lock`、`.python-version`、`alembic.ini`、`migrations/`、应用装配、`core/config.py`、`core/logging.py`、`core/exceptions.py`、`core/exception_handlers.py`、`api/`、`db/`、`contracts/`、`integrations/`、`modules/health/`、`tests/` 与 `.github/workflows/checks.yml`）已落地；`core/limits.py`、`core/telemetry.py` 及其余业务模块、Worker、运行手册与容器部署文件随 02–18 切片逐步落地。
 
 ```text
 mem-ai/                                    # 项目根目录，管理应用、设计和工程工具

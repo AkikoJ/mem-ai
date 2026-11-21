@@ -43,8 +43,10 @@ jobs:
       - name: Sync locked dependencies
         run: uv sync --locked --dev
 
-      - name: Run Ruff lint
-        run: uv run ruff check .
+      - name: Run Ruff lint and format check
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
 
       - name: Run mypy type check
         run: uv run mypy src

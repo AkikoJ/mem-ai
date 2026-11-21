@@ -87,6 +87,10 @@ def test_cursor_rejects_tampered_direction_mismatch_filter_mismatch_and_expiry()
         )
     assert wrong_filter.value.code == "invalid_cursor"
 
+    with pytest.raises(UnprocessableEntityError) as unexpected_filter:
+        decode_cursor(token, expected_direction="asc", expected_filters_hash=None)
+    assert unexpected_filter.value.code == "invalid_cursor"
+
     expired_token = encode_cursor(
         CursorPayload(
             created_at=created_at,

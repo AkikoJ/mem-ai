@@ -57,9 +57,7 @@ class RequestContextMiddleware:
                 status_code = int(message["status"])
                 headers = list(message.get("headers", ()))
                 headers = [
-                    (name, value)
-                    for name, value in headers
-                    if name.lower() != self._header_bytes
+                    (name, value) for name, value in headers if name.lower() != self._header_bytes
                 ]
                 headers.append((self._header_bytes, request_id.encode("latin-1")))
                 message["headers"] = headers

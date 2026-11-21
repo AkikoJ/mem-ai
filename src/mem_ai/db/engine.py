@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from sqlalchemy import Engine, create_engine
-from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -12,11 +11,6 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from mem_ai.core.config import Settings
-
-
-def build_database_url(settings: Settings) -> URL:
-    """Build the SQLAlchemy psycopg 3 connection URL from settings."""
-    return settings.database_url()
 
 
 def _connect_args(settings: Settings) -> dict[str, object]:
@@ -29,7 +23,7 @@ def _connect_args(settings: Settings) -> dict[str, object]:
 def create_async_engine_from_settings(settings: Settings) -> AsyncEngine:
     """Create the runtime asynchronous PostgreSQL engine with bounded pool settings."""
     return create_async_engine(
-        build_database_url(settings),
+        settings.database_url(),
         pool_pre_ping=True,
         pool_size=settings.db_pool_size,
         max_overflow=settings.db_max_overflow,
@@ -51,7 +45,7 @@ def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSessi
 def create_sync_engine_from_settings(settings: Settings) -> Engine:
     """Create a synchronous psycopg 3 engine for Alembic migrations and test setup."""
     return create_engine(
-        build_database_url(settings),
+        settings.database_url(),
         pool_pre_ping=True,
         connect_args=_connect_args(settings),
     )

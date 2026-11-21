@@ -119,11 +119,14 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(Exception)
     async def handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
         request_id = _resolve_request_id(request)
+        settings = getattr(request.app.state, "settings", None)
+        header_name = getattr(settings, "trusted_request_id_header", "X-Request-Id")
         logger.error(
             "unhandled exception during request",
             exc_info=(type(exc), exc, exc.__traceback__),
             extra={
                 "extra_fields": {
+                    "request_id": request_id,
                     "method": request.method,
                     "path": request.url.path,
                     "error_code": "internal_server_error",
@@ -138,4 +141,5 @@ def register_exception_handlers(app: FastAPI) -> None:
                 request_id=request_id,
                 details={},
             ),
+            headers={header_name: request_id},
         )

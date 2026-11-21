@@ -92,7 +92,7 @@ def decode_cursor(
             message="pagination cursor direction does not match request",
         )
 
-    if expected_filters_hash is not None and payload.filters_hash != expected_filters_hash:
+    if payload.filters_hash != expected_filters_hash:
         raise UnprocessableEntityError(
             code="invalid_cursor",
             message="pagination cursor does not match query filters",

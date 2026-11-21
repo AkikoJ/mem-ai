@@ -39,7 +39,7 @@
   - `src/mem_ai/core/exception_handlers.py`：`register_exception_handlers`、`build_error_envelope`（统一嵌套 `error` 信封，422 校验错误过滤原始 `input`）。
 - **数据库、迁移与外部 HTTP 基础设施**：
   - `src/mem_ai/db/base.py`：`Base`、`NAMING_CONVENTION`、`UUIDPrimaryKeyMixin`、`CreatedAtMixin`、`TimestampMixin`。
-  - `src/mem_ai/db/engine.py`：`build_database_url`、`create_async_engine_from_settings`、`create_session_factory`、`create_sync_engine_from_settings`。
+  - `src/mem_ai/db/engine.py`：`create_async_engine_from_settings`、`create_session_factory`、`create_sync_engine_from_settings`。
   - `src/mem_ai/db/model_registry.py`：`load_all_models()`，供后续切片集中显式导入 ORM 模型。
   - `src/mem_ai/integrations/http.py`：`create_http_client(settings)`。
   - `alembic.ini`、`migrations/env.py`、`migrations/script.py.mako`、`migrations/versions/20261121_0001_initial_foundation.py`（基线版本 `20261121_0001`）。
@@ -67,7 +67,7 @@
 - 本地 Docker PostgreSQL 17 已通过 `docker compose up -d --wait` 启动且健康，数据卷已绑定持久化至 `/Users/mac/Documents/docker-volumn/mem-ai-postgres`。
 - `.venv/bin/alembic upgrade head && .venv/bin/alembic check`：通过（升级至 `20261121_0001`，无元数据漂移）。
 - `.venv/bin/pytest`：24 passed（覆盖 unit、api、PostgreSQL integration 与 architecture 测试）。
-- `.venv/bin/ruff check .`：All checks passed。
+- `.venv/bin/ruff check .` 与 `.venv/bin/ruff format --check .`：All checks passed。
 - `.venv/bin/mypy src`：Success: no issues found in 27 source files（strict 模式）。
 - `python3 tools/check_architecture.py`：工程目录、功能索引、文档链接、分层导入、依赖图和已落地源码检查通过。
 - 剩余依赖与后续切片范围：具体业务表、认证上下文（02）、私有 Agent（03）、MemOS 适配器（04）与模型适配器（05/06）将在对应切片按已确立的协议与装配边界接入；GitHub Actions 流水线 `.github/workflows/checks.yml` 需在推送至远程仓库后由 GitHub Runner 首次实际触发运行。
