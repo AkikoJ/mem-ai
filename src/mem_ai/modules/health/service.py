@@ -17,16 +17,9 @@ from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import ServiceUnavailableError
 
 
-class LivenessStatus(BaseModel):
-    """Response payload for `/health/live`."""
-
-    status: str = "ok"
-
-
 class ReadinessStatus(BaseModel):
-    """Response payload for `/health/ready`."""
+    """Diagnostic payload for `/health/ready`."""
 
-    status: str = "ready"
     database: str = "ok"
     migration_revision: str
 
@@ -100,7 +93,6 @@ async def check_readiness(
         )
 
     return ReadinessStatus(
-        status="ready",
         database="ok",
         migration_revision=actual_revision,
     )

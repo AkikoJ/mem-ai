@@ -56,7 +56,7 @@ async def test_health_live_and_ready_with_request_id_and_json_access_log(
                     "success": True,
                     "code": "ok",
                     "message": "ok",
-                    "data": {"status": "ok"},
+                    "data": None,
                     "request_id": live_req_id,
                 }
 
@@ -71,7 +71,6 @@ async def test_health_live_and_ready_with_request_id_and_json_access_log(
                     "code": "ok",
                     "message": "ok",
                     "data": {
-                        "status": "ready",
                         "database": "ok",
                         "migration_revision": "20261121_0001",
                     },
@@ -271,7 +270,10 @@ async def test_shared_async_client_fixture_and_main_asgi_entrypoint(
     body = resp.json()
     assert body["success"] is True
     assert body["code"] == "ok"
-    assert body["data"]["status"] == "ready"
+    assert body["data"] == {
+        "database": "ok",
+        "migration_revision": "20261121_0001",
+    }
 
 
 @pytest.mark.anyio

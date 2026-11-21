@@ -6,15 +6,15 @@ from fastapi import APIRouter
 
 from mem_ai.api.dependencies import SessionFactoryDep, SettingsDep
 from mem_ai.api.responses import ApiResponse, ok_response
-from mem_ai.modules.health.service import LivenessStatus, ReadinessStatus, check_readiness
+from mem_ai.modules.health.service import ReadinessStatus, check_readiness
 
 router = APIRouter(prefix="/health", tags=["health"])
 
 
-@router.get("/live", response_model=ApiResponse[LivenessStatus])
-async def health_live() -> ApiResponse[LivenessStatus]:
+@router.get("/live", response_model=ApiResponse[None])
+async def health_live() -> ApiResponse[None]:
     """Report process liveness without hitting external dependencies."""
-    return ok_response(LivenessStatus())
+    return ok_response(None)
 
 
 @router.get("/ready", response_model=ApiResponse[ReadinessStatus])
