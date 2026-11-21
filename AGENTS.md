@@ -10,6 +10,7 @@
 # Project Skills
 
 - **Backend design and directory maintenance:** Read [.agents/skills/backend-design/SKILL.md](.agents/skills/backend-design/SKILL.md) when designing the backend or adding, updating, moving, renaming, or deleting backend files, configuration, tests, workflows, or design documents. Use it to check whether the annotated engineering directory needs to be synchronized.
+- **Git commit messages and branch names:** Read [.agents/skills/commit-message-helper/SKILL.md](.agents/skills/commit-message-helper/SKILL.md) when generating, reviewing, or rewriting Git commit messages or branch names.
 
 - **Matt Pocock skills:** Browse [.agents/skills/](.agents/skills/) and read the relevant `SKILL.md` when its description matches the task. This collection is from [mattpocock/skills](https://github.com/mattpocock/skills).
 

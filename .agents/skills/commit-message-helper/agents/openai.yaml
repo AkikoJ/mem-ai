@@ -1,0 +1,4 @@
+interface:
+  display_name: "Commit Message Helper"
+  short_description: "Drafts commit messages and branch names"
+  default_prompt: "Use $commit-message-helper to generate a branch name and commit message for my current changes."
