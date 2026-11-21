@@ -19,6 +19,7 @@ from fastapi import FastAPI
 from sqlalchemy import text
 
 from mem_ai.api.dependencies import ProviderRegistry
+from mem_ai.api.pagination import CursorPayload, decode_cursor, encode_cursor, hash_filters
 from mem_ai.application import create_app
 from mem_ai.contracts.memory_provider import (
     MemoryDeleteResult,
@@ -125,6 +126,14 @@ class FakeMemoryProvider:
         return await self.create_memory(item)
 
     async def list_memories(self, query: MemoryListQuery) -> MemoryListPage:
+        filters_hash = hash_filters(
+            {
+                "user_id": str(query.user_id),
+                "provider_id": self.provider_id,
+                "scope": query.scope or "",
+                "conversation_id": str(query.conversation_id) if query.conversation_id else "",
+            }
+        )
         items = [
             record
             for record in self.records.values()
@@ -133,11 +142,33 @@ class FakeMemoryProvider:
             and (query.conversation_id is None or record.conversation_id == query.conversation_id)
         ]
         items.sort(key=lambda r: (r.created_at, r.memory_id), reverse=True)
+        if query.cursor is not None:
+            payload = decode_cursor(
+                query.cursor,
+                expected_direction="desc",
+                expected_filters_hash=filters_hash,
+            )
+            cursor_key = (payload.created_at, str(payload.id))
+            items = [r for r in items if (r.created_at, r.memory_id) < cursor_key]
+
         sliced = items[: query.limit]
+        has_more = len(items) > query.limit
+        next_cursor = (
+            encode_cursor(
+                CursorPayload(
+                    created_at=sliced[-1].created_at,
+                    id=sliced[-1].memory_id,
+                    direction="desc",
+                    filters_hash=filters_hash,
+                )
+            )
+            if has_more and sliced
+            else None
+        )
         return MemoryListPage(
             items=sliced,
-            next_cursor=None,
-            has_more=len(items) > query.limit,
+            next_cursor=next_cursor,
+            has_more=has_more,
         )
 
     async def delete_memory(self, *, user_id: UUID, memory_id: str) -> MemoryDeleteResult:

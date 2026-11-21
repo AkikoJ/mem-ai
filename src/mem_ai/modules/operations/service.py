@@ -1,0 +1,71 @@
+"""Public service entry points for creating and querying asynchronous operations."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+from uuid import UUID
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from mem_ai.core.exceptions import NotFoundError
+from mem_ai.modules.operations import repository
+from mem_ai.modules.operations.schemas import OperationRecord, OperationStatus
+from mem_ai.modules.users import service as users_service
+
+
+async def create_operation_in_session(
+    session: AsyncSession,
+    *,
+    owner_id: UUID | None,
+    operation_type: str,
+    status: OperationStatus,
+    target_type: str | None = None,
+    target_id: str | None = None,
+    job_id: UUID | None = None,
+    progress: dict[str, Any] | None = None,
+    result_summary: dict[str, Any] | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    expires_at: datetime | None = None,
+    completed_at: datetime | None = None,
+) -> OperationRecord:
+    """Create an operation row inside the caller's transaction."""
+    row = await repository.create_operation(
+        session,
+        owner_id=owner_id,
+        operation_type=operation_type,
+        status=status,
+        target_type=target_type,
+        target_id=target_id,
+        job_id=job_id,
+        progress=progress or {},
+        result_summary=result_summary or {},
+        error_code=error_code,
+        error_message=error_message,
+        expires_at=expires_at,
+        completed_at=completed_at,
+    )
+    return OperationRecord.model_validate(row)
+
+
+async def get_operation_for_owner(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    owner_id: UUID,
+    operation_id: UUID,
+) -> OperationRecord:
+    """Return an owned operation after re-verifying active user status; 404 for cross-user."""
+    async with session_factory() as session:
+        await users_service.ensure_user_active_in_session(session, user_id=owner_id)
+        row = await repository.get_operation_for_owner(
+            session,
+            owner_id=owner_id,
+            operation_id=operation_id,
+        )
+        if row is None:
+            raise NotFoundError(
+                code="operation_not_found",
+                message="operation not found",
+            )
+        return OperationRecord.model_validate(row)

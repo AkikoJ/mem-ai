@@ -167,8 +167,9 @@ Service
 | `src/mem_ai/main.py`、`src/mem_ai/application.py`、`src/mem_ai/core/config.py`、`src/mem_ai/core/logging.py`、`src/mem_ai/core/exceptions.py`、`src/mem_ai/core/exception_handlers.py`、`src/mem_ai/api/`、`src/mem_ai/db/`、`src/mem_ai/contracts/`、`src/mem_ai/integrations/`、`src/mem_ai/modules/health/` | 已落地 | 01 基础脚手架、应用装配、提供方协议、公共分页、错误处理与健康检查 |
 | `src/mem_ai/modules/auth/`、`src/mem_ai/modules/users/models.py`、`src/mem_ai/modules/users/schemas.py`、`src/mem_ai/modules/users/repository.py`、`src/mem_ai/modules/users/service.py`、`src/mem_ai/modules/users/router.py` | 已落地 | 02 认证上下文、可替换凭证验证适配器、伪造身份头清理、`users`/`user_identities` 主体映射与 `GET /v1/users/me` |
 | `src/mem_ai/modules/agents/`、`src/mem_ai/modules/personas/provider.py` | 已落地 | 03 私有 Agent 与不可变人设版本快照（`agents`/`persona_versions`）、草稿编辑、原子发布与本地只读 `PersonaProvider` 适配 |
-| `tests/conftest.py`、`tests/unit/`、`tests/api/`、`tests/integration/`、`tests/architecture/` | 已落地（持续扩展） | 01–03 测试 fixture、单元、API、PostgreSQL/迁移、提供方契约与架构测试 |
-| `src/mem_ai/core/limits.py`、`src/mem_ai/core/telemetry.py`、`src/mem_ai/modules/users/cleanup.py`、其余业务模块与 `src/mem_ai/workers/` | 按切片落地 | 先检查实际文件，再沿功能定位索引进入 |
+| `src/mem_ai/modules/jobs/`、`src/mem_ai/modules/operations/`、`src/mem_ai/modules/memories/models.py`、`src/mem_ai/modules/memories/schemas.py`、`src/mem_ai/modules/memories/repository.py`、`src/mem_ai/modules/memories/snapshots.py`、`src/mem_ai/modules/memories/service.py`、`src/mem_ai/modules/memories/router.py`、`src/mem_ai/modules/memories/adapters/memos.py` | 已落地 | 04 统一任务最小写入入口（`jobs`）、异步操作追踪（`operations` 与 `GET /v1/operations/{operationId}`）、记忆范围与分页快照（`memory_scopes`/`memory_list_snapshots`）、`GET/POST /v1/memories` 与可替换 MemOS 适配器 |
+| `tests/conftest.py`、`tests/unit/`、`tests/api/`、`tests/integration/`、`tests/architecture/` | 已落地（持续扩展） | 01–04 测试 fixture、单元、API、PostgreSQL/迁移、提供方契约与架构测试 |
+| `src/mem_ai/core/limits.py`、`src/mem_ai/core/telemetry.py`、`src/mem_ai/modules/users/cleanup.py`、`src/mem_ai/modules/memories/jobs.py`、其余业务模块与 `src/mem_ai/workers/` | 按切片落地 | 先检查实际文件，再沿功能定位索引进入 |
 
 ### 3.0.2 功能定位索引
 
@@ -181,9 +182,9 @@ Service
 | Agent 与人设版本生命周期 | `agents` | `src/mem_ai/modules/personas/provider.py` | `src/mem_ai/modules/agents/` | `tests/api/`、`tests/integration/` | 03、11 |
 | 同步与流式生成编排 | `conversations` | `models/`、`memories/`、`jobs/` | `src/mem_ai/modules/conversations/service.py`、`generation.py`、`stream.py` | `tests/api/`、`tests/integration/` | 05、07、08、10、12 |
 | 模型注册、选择和提供方调用 | `models` | `contracts/model_provider.py`、`models/adapters/` | `src/mem_ai/modules/models/`、`src/mem_ai/contracts/model_provider.py` | `tests/integration/` | 05、06、12 |
-| 记忆范围、召回、写入和删除策略 | `memories` | `contracts/memory_provider.py`、`memories/adapters/`、`memories/jobs.py` | `src/mem_ai/modules/memories/`、`src/mem_ai/contracts/memory_provider.py` | `tests/unit/`、`tests/integration/` | 04、08、09、13、14、15 |
+| 记忆范围、召回、写入和删除策略 | `memories` | `contracts/memory_provider.py`、`memories/adapters/`、`memories/snapshots.py`、`memories/jobs.py` | `src/mem_ai/modules/memories/`、`src/mem_ai/contracts/memory_provider.py` | `tests/unit/`、`tests/api/`、`tests/integration/` | 04、08、09、13、14、15 |
 | 通用任务持久化、领取和重试 | `jobs` | `workers/runner.py` | `src/mem_ai/modules/jobs/`、`src/mem_ai/workers/runner.py` | `tests/integration/` | 04、09、13、16、17 |
-| 删除操作进度和回执 | `operations` | 各资源清理处理器 | `src/mem_ai/modules/operations/` | `tests/api/`、`tests/integration/` | 13、14、15、16 |
+| 异步记忆与删除操作进度和回执 | `operations` | 各资源清理处理器、`memories/` | `src/mem_ai/modules/operations/` | `tests/api/`、`tests/integration/` | 04、13、14、15、16 |
 | 会话数据清理 | `conversations` | `operations/`、`memories/` | `src/mem_ai/modules/conversations/cleanup.py` | `tests/integration/` | 14、16 |
 | 用户数据清理和删除协调 | `users` | `operations/`、各资源清理处理器 | `src/mem_ai/modules/users/cleanup.py` | `tests/integration/` | 15、16 |
 | 保留策略和到期清理 | `retention` | `jobs/`、资源清理处理器 | `src/mem_ai/modules/retention/` | `tests/integration/` | 16、18 |
@@ -191,7 +192,7 @@ Service
 
 目录树如下。
 
-下列目录是目标工程结构。设计文档、设计评审、领域文档、技能、ticket、`.env.example`、`compose.yaml`，01 基础切片（`pyproject.toml`、`uv.lock`、`.python-version`、`alembic.ini`、`migrations/`、应用装配、`core/config.py`、`core/logging.py`、`core/exceptions.py`、`core/exception_handlers.py`、`api/`、`db/`、`contracts/`、`integrations/`、`modules/health/`、`tests/` 与 `.github/workflows/checks.yml`），02 认证与用户主体切片（`modules/auth/` 与 `modules/users/{models,schemas,repository,service,router}.py` 及 `20261121_0002` 迁移），以及 03 私有 Agent 与只读人设切片（`modules/agents/`、`modules/personas/provider.py` 及 `20261121_0003` 迁移）已落地；`core/limits.py`、`core/telemetry.py`、`modules/users/cleanup.py` 及其余业务模块、Worker、运行手册与容器部署文件随 04–18 切片逐步落地。
+下列目录是目标工程结构。设计文档、设计评审、领域文档、技能、ticket、`.env.example`、`compose.yaml`，01 基础切片（`pyproject.toml`、`uv.lock`、`.python-version`、`alembic.ini`、`migrations/`、应用装配、`core/config.py`、`core/logging.py`、`core/exceptions.py`、`core/exception_handlers.py`、`api/`、`db/`、`contracts/`、`integrations/`、`modules/health/`、`tests/` 与 `.github/workflows/checks.yml`），02 认证与用户主体切片（`modules/auth/` 与 `modules/users/{models,schemas,repository,service,router}.py` 及 `20261121_0002` 迁移），03 私有 Agent 与只读人设切片（`modules/agents/`、`modules/personas/provider.py` 及 `20261121_0003` 迁移），以及 04 长期记忆查询与显式添加切片（`modules/jobs/`、`modules/operations/`、`modules/memories/{models,schemas,repository,snapshots,service,router}.py`、`modules/memories/adapters/memos.py` 及 `20261121_0004` 迁移）已落地；`core/limits.py`、`core/telemetry.py`、`modules/users/cleanup.py`、`modules/memories/jobs.py` 及其余业务模块、Worker、运行手册与容器部署文件随 05–18 切片逐步落地。
 
 ```text
 mem-ai/                                    # 项目根目录，管理应用、设计和工程工具
@@ -286,6 +287,7 @@ mem-ai/                                    # 项目根目录，管理应用、�
 │       │   │   ├── stream.py              # SSE 编码、心跳和断连通知，共用生成收敛入口
 │       │   │   └── cleanup.py             # 会话消息、引用及会话记忆清理处理器
 │       │   ├── memories/                  # 记忆访问策略、代次、删除标记与屏障
+│       │   │   ├── snapshots.py           # PostgreSQL 持久化分页快照与多副本游标编解码
 │       │   │   ├── adapters/              # MemOS 等具体记忆实现
 │       │   │   │   └── memos.py           # MemOS HTTP、范围、分页和结果核验映射
 │       │   │   └── jobs.py                # 记忆写入和删除的类型化任务处理器
@@ -358,10 +360,12 @@ modules/<module>/    # 某个业务模块，例如 agents 或 conversations
 | `modules/conversations/service.py` | 同步与流式共用的对话编排 |
 | `modules/conversations/generation.py` | 持久化阶段、生成终态、租约和条件提交 |
 | `modules/conversations/idempotency.py` | 请求语义摘要、首次关联和结果复用 |
-| `modules/memories/` | 统一记忆范围、代次、屏障、分页快照和删除标记策略 |
+| `modules/memories/` | 统一记忆范围、代次、屏障、分页快照、删除标记策略及 `/v1/memories` 路由 |
+| `modules/memories/snapshots.py` | 基于 PostgreSQL `memory_list_snapshots` 表的有界分页快照与稳定游标存储 |
+| `modules/memories/adapters/memos.py` | MemOS Cloud HTTP 适配器，封装鉴权、范围/代次元数据编码、快照分页和错误映射 |
 | `modules/memories/jobs.py` | 记忆任务业务处理，调用统一记忆策略完成核验 |
-| `modules/jobs/` | 全部任务的统一持久化与重试规则 |
-| `modules/operations/` | 删除进度聚合、删除回执权限与独立删除审计归档接缝 |
+| `modules/jobs/` | 全部任务的统一持久化、同步领取登记、条件终态更新与重试规则 |
+| `modules/operations/` | 异步记忆与删除操作进度聚合、归属校验、`/v1/operations/{operationId}` 与回执/审计接缝 |
 | `modules/retention/` | 周期清理规则及批处理 |
 | `workers/main.py`、`workers/runner.py` | 独立进程入口与共享任务执行框架 |
 | `docs/operations/deployment-and-recovery.md` | 生产迁移、故障恢复及轮换操作手册 |

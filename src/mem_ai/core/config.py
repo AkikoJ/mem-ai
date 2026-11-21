@@ -12,6 +12,7 @@ from sqlalchemy.engine import URL
 
 AppEnv = Literal["development", "test", "production"]
 AuthMode = Literal["development", "jwt_hs256", "trusted_gateway"]
+MemoryProviderMode = Literal["disabled", "memos"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 ProxyNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
@@ -126,6 +127,18 @@ class Settings(BaseSettings):
     auth_gateway_actor_header: str = Field(default="X-Auth-Actor-Id", min_length=1)
     auth_gateway_permissions_header: str = Field(default="X-Auth-Permissions", min_length=1)
 
+    # Memory provider (MemOS Cloud)
+    memory_provider_mode: MemoryProviderMode = "disabled"
+    memos_base_url: str = Field(
+        default="https://memos.memtensor.cn/api/openmem/v1",
+        min_length=1,
+    )
+    memos_api_key: SecretStr | None = None
+    memos_request_timeout_seconds: float = Field(default=15.0, gt=0.0)
+    memos_list_page_size: int = Field(default=100, ge=1, le=200)
+    memos_list_max_items: int = Field(default=1000, ge=1, le=5000)
+    memory_list_snapshot_ttl_seconds: int = Field(default=600, ge=10, le=86400)
+
     @model_validator(mode="after")
     def validate_production_boundaries(self) -> Settings:
         password = self.postgres_password.get_secret_value().strip()
@@ -191,6 +204,13 @@ class Settings(BaseSettings):
                 mode_name="trusted_gateway",
                 is_production=is_production,
             )
+
+        if self.memory_provider_mode == "memos":
+            api_key = self.memos_api_key.get_secret_value().strip() if self.memos_api_key else ""
+            if not api_key:
+                raise ValueError("memos_api_key must be set when memory_provider_mode='memos'")
+            if not self.memos_base_url.startswith(("http://", "https://")):
+                raise ValueError("memos_base_url must start with 'http://' or 'https://'")
 
         return self
 

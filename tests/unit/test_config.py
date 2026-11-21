@@ -171,3 +171,32 @@ def test_trusted_gateway_mode_requires_explicit_proxies_issuers_and_secret() -> 
         auth_gateway_shared_secret="gateway-shared-secret-value-at-least-32-chars",
     )
     assert settings.auth_mode == "trusted_gateway"
+
+
+def test_memos_memory_provider_mode_requires_api_key_and_valid_base_url() -> None:
+    with pytest.raises(ValidationError, match="memos_api_key"):
+        Settings(
+            _env_file=None,
+            app_env="test",
+            memory_provider_mode="memos",
+        )
+
+    with pytest.raises(ValidationError, match="memos_base_url"):
+        Settings(
+            _env_file=None,
+            app_env="test",
+            memory_provider_mode="memos",
+            memos_api_key="server-memos-key",
+            memos_base_url="ftp://invalid.example.com",
+        )
+
+    valid = Settings(
+        _env_file=None,
+        app_env="test",
+        memory_provider_mode="memos",
+        memos_api_key="server-memos-key",
+        memos_base_url="https://memos.memtensor.cn/api/openmem/v1",
+    )
+    assert valid.memory_provider_mode == "memos"
+    assert valid.memos_api_key is not None
+    assert valid.memos_api_key.get_secret_value() == "server-memos-key"

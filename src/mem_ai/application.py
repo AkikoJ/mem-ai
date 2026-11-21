@@ -26,6 +26,7 @@ from mem_ai.modules.auth.adapters import (
     StaticTokenAuthAdapter,
     build_credential_verifier,
 )
+from mem_ai.modules.memories.adapters.memos import MemOSMemoryProvider
 from mem_ai.modules.personas.provider import LocalPersonaProvider
 
 _OFFLINE_DOCS_STATIC_DIR = Path(fastapi_offline.__file__).resolve().parent / "static"
@@ -96,14 +97,33 @@ def create_app(
         app.state.http_client = http_client
 
         base_providers = providers if providers is not None else ProviderRegistry()
-        if base_providers.persona_provider is None:
-            app.state.providers = ProviderRegistry(
-                model_provider=base_providers.model_provider,
-                memory_provider=base_providers.memory_provider,
-                persona_provider=LocalPersonaProvider(session_factory=session_factory),
+        resolved_memory_provider = base_providers.memory_provider
+        if (
+            resolved_memory_provider is None
+            and resolved_settings.memory_provider_mode == "memos"
+            and resolved_settings.memos_api_key is not None
+        ):
+            resolved_memory_provider = MemOSMemoryProvider(
+                http_client=http_client,
+                session_factory=session_factory,
+                api_key=resolved_settings.memos_api_key,
+                base_url=resolved_settings.memos_base_url,
+                timeout_seconds=resolved_settings.memos_request_timeout_seconds,
+                list_page_size=resolved_settings.memos_list_page_size,
+                list_max_items=resolved_settings.memos_list_max_items,
+                snapshot_ttl_seconds=resolved_settings.memory_list_snapshot_ttl_seconds,
             )
-        else:
-            app.state.providers = base_providers
+
+        resolved_persona_provider = (
+            base_providers.persona_provider
+            if base_providers.persona_provider is not None
+            else LocalPersonaProvider(session_factory=session_factory)
+        )
+        app.state.providers = ProviderRegistry(
+            model_provider=base_providers.model_provider,
+            memory_provider=resolved_memory_provider,
+            persona_provider=resolved_persona_provider,
+        )
 
         try:
             yield

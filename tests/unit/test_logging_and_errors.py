@@ -58,6 +58,10 @@ def test_json_formatter_includes_correlation_fields_and_redacts_secrets() -> Non
             "authorization": "Bearer secret-token",
             "api_key": "sk-12345",
             "deletion_receipt": "rcpt_secret",
+            "memory_value": "user private memory text",
+            "content": "raw message text",
+            "content_type": "application/json",
+            "content_length": 128,
             "nested": {"password": "pw", "safe": "ok"},
             "status_code": 200,
         }
@@ -72,6 +76,10 @@ def test_json_formatter_includes_correlation_fields_and_redacts_secrets() -> Non
         assert payload["authorization"] == "[REDACTED]"
         assert payload["api_key"] == "[REDACTED]"
         assert payload["deletion_receipt"] == "[REDACTED]"
+        assert payload["memory_value"] == "[REDACTED]"
+        assert payload["content"] == "[REDACTED]"
+        assert payload["content_type"] == "application/json"
+        assert payload["content_length"] == 128
         assert payload["nested"] == {"password": "[REDACTED]", "safe": "ok"}
     finally:
         reset_log_context(tokens)

@@ -37,7 +37,11 @@ _SENSITIVE_KEY_MARKERS = (
     "credential",
     "prompt",
     "message_body",
+    "memory_value",
+    "memory_content",
+    "user_content",
 )
+_SENSITIVE_EXACT_KEYS = frozenset({"content"})
 
 REDACTED_VALUE = "[REDACTED]"
 
@@ -73,6 +77,8 @@ def clear_log_context() -> None:
 
 def _is_sensitive_key(key: str) -> bool:
     lowered = key.lower()
+    if lowered in _SENSITIVE_EXACT_KEYS:
+        return True
     return any(marker in lowered for marker in _SENSITIVE_KEY_MARKERS)
 
 
