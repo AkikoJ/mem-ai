@@ -158,8 +158,45 @@ def check_source_module_ownership(errors: ArchitectureErrors) -> None:
             )
 
 
+def _extract_router_prefixes(tree: ast.AST) -> dict[str, str]:
+    prefixes: dict[str, str] = {}
+    for node in ast.walk(tree):
+        target_name: str | None = None
+        value: ast.expr | None = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            target_name = node.targets[0].id
+            value = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            target_name = node.target.id
+            value = node.value
+
+        if not target_name or not isinstance(value, ast.Call):
+            continue
+        func = value.func
+        func_name = func.id if isinstance(func, ast.Name) else (func.attr if isinstance(func, ast.Attribute) else "")
+        if func_name != "APIRouter":
+            continue
+
+        prefix = ""
+        for kw in value.keywords:
+            if kw.arg == "prefix" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                prefix = kw.value.value
+                break
+        prefixes[target_name] = prefix
+    return prefixes
+
+
+def _join_route(prefix: str, route: str) -> str:
+    if not prefix:
+        return route
+    if not route:
+        return prefix
+    return prefix.rstrip("/") + "/" + route.lstrip("/")
+
+
 def route_literals(path: Path) -> list[tuple[str, str, int]]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    router_prefixes = _extract_router_prefixes(tree)
     routes: list[tuple[str, str, int]] = []
     methods = {"delete", "get", "patch", "post", "put"}
     for node in ast.walk(tree):
@@ -173,7 +210,9 @@ def route_literals(path: Path) -> list[tuple[str, str, int]]:
                 continue
             route = decorator.args[0]
             if isinstance(route, ast.Constant) and isinstance(route.value, str):
-                routes.append((method.upper(), route.value, decorator.lineno))
+                owner = decorator.func.value.id if isinstance(decorator.func.value, ast.Name) else ""
+                prefix = router_prefixes.get(owner, "")
+                routes.append((method.upper(), _join_route(prefix, route.value), decorator.lineno))
     return routes
 
 
