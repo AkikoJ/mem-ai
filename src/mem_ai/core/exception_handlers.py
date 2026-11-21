@@ -46,14 +46,14 @@ def build_error_envelope(
     request_id: str,
     details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Construct the canonical nested error response payload."""
+    """Construct the canonical unified JSON error response payload."""
     return {
-        "error": {
-            "code": code,
-            "message": message,
-            "request_id": request_id,
-            "details": details if details is not None else {},
-        }
+        "success": False,
+        "code": code,
+        "message": message,
+        "data": None,
+        "request_id": request_id,
+        "details": details if details is not None else {},
     }
 
 

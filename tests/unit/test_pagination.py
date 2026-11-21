@@ -110,8 +110,21 @@ def test_cursor_rejects_tampered_direction_mismatch_filter_mismatch_and_expiry()
 
 
 def test_paginated_response_serializes_snake_case_envelope() -> None:
-    response = PaginatedResponse[str](items=["a", "b"], next_cursor="cur_1", has_more=True)
-    assert response.model_dump() == {
+    from mem_ai.api.responses import ok_response
+
+    page = PaginatedResponse[str](items=["a", "b"], next_cursor="cur_1", has_more=True)
+    assert page.model_dump() == {
+        "items": ["a", "b"],
+        "next_cursor": "cur_1",
+        "has_more": True,
+    }
+
+    wrapped = ok_response(page)
+    dumped = wrapped.model_dump()
+    assert dumped["success"] is True
+    assert dumped["code"] == "ok"
+    assert dumped["message"] == "ok"
+    assert dumped["data"] == {
         "items": ["a", "b"],
         "next_cursor": "cur_1",
         "has_more": True,

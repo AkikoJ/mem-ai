@@ -246,13 +246,14 @@ mem-ai/                                    # 项目根目录，管理应用、�
 │       │   ├── config.py                  # 强类型配置和生产安全边界校验
 │       │   ├── logging.py                 # JSON 日志、关联字段及脱敏
 │       │   ├── exceptions.py              # 稳定的业务异常与错误码
-│       │   ├── exception_handlers.py      # 异常到嵌套 error 响应的映射
+│       │   ├── exception_handlers.py      # 异常到统一响应信封的映射
 │       │   ├── limits.py                  # 可替换限流边界、并发和时长限制
 │       │   └── telemetry.py               # 请求、生成、提供方和任务指标，追踪接缝
 │       ├── api/                           # 公共 HTTP 层
 │       │   ├── router.py                  # 聚合业务路由及版本前缀
 │       │   ├── dependencies.py            # 注入 Session 工厂、HTTP 客户端和服务
-│       │   ├── pagination.py              # 稳定游标、limit 参数及统一集合响应
+│       │   ├── responses.py               # 统一 JSON 响应信封 ApiResponse（success/code/message/data/request_id）
+│       │   ├── pagination.py              # 稳定游标、limit 参数及统一集合分页结构
 │       │   └── middleware.py              # 请求 ID、访问日志、CORS 和可信代理处理
 │       ├── db/                            # SQLAlchemy 基础设施
 │       │   ├── base.py                    # ORM Base、公共字段和约束命名
@@ -340,6 +341,7 @@ modules/<module>/    # 某个业务模块，例如 agents 或 conversations
 | `application.py` | 应用工厂、lifespan、路由、异常处理和提供方装配 |
 | `core/config.py` | 定义并校验配置 |
 | `api/dependencies.py` | 获取 Session 工厂、HTTP 客户端和服务实例 |
+| `api/responses.py` | 统一 JSON 响应信封 `ApiResponse`（`success`/`code`/`message`/`data`/`request_id`）及 `ok_response` 辅助函数 |
 | `db/engine.py` | 创建数据库引擎与 Session 工厂 |
 | `db/base.py` | ORM Base、约束命名和公共字段 |
 | `db/model_registry.py` | 显式导入全部 ORM 模型，供迁移加载 |
@@ -518,7 +520,7 @@ Alembic 使用同步 psycopg 引擎，运行时使用异步引擎。`migrations/
 
 ### 8.1 路由和模型
 
-采用 `/v1` 前缀。Python 使用 `snake_case`，聊天及 Agent 等业务资源沿用已有 `camelCase` 别名，通过 Pydantic 显式映射。分页、错误信封和 SSE 字段统一采用本节明确的 `snake_case`，Schema 分别声明，避免全局别名转换破坏契约。
+采用 `/v1` 前缀。Python 使用 `snake_case`，聊天及 Agent 等业务资源沿用已有 `camelCase` 别名，通过 Pydantic 显式映射。统一响应外壳、分页和 SSE 字段采用本节明确的 `snake_case`，Schema 分别声明，避免全局别名转换破坏契约。
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
@@ -543,17 +545,41 @@ Alembic 使用同步 psycopg 引擎，运行时使用异步引擎。`migrations/
 
 ### 8.2 成功响应和分页
 
-创建资源使用 `201`，聊天结果使用 `200`，已确认完成的删除使用 `204`。异步或待核验删除使用 `202`，返回 `operationId`、`status`、`statusUrl` 并设置 `Location`。显式创建记忆（`POST /v1/memories`）在提供方同步确认并返回稳定单条 ID 时返回 `201`；若底层提供方（如异步抽取型适配器）仅返回受理或批次状态而尚未产生单条稳定 ID，返回 `202`、`operationId`、`status`、`statusUrl` 及 `Location`，由统一 `operations` 追踪核验结果。用户删除额外返回一次性明文 `deletionReceipt` 及有效期，服务端持久化摘要。
-
-会话进入 `deleting` 状态后，从会话列表过滤隐藏；详情、消息历史和生成查询统一返回 `404`（与跨用户及已删除资源一致），针对该会话的续聊或新写入返回 `409 conversation_deleting`，删除进度仅通过 `GET /v1/operations/{operationId}` 查询。
-
-Agent、记忆、会话和消息列表统一如下。
+所有 JSON 接口（除 `204 No Content` 无响应体及 `text/event-stream` 流式响应外）统一采用以下响应外壳：
 
 ```json
 {
-  "items": [],
-  "next_cursor": null,
-  "has_more": false
+  "success": true,
+  "code": "ok",
+  "message": "ok",
+  "data": {},
+  "request_id": "req_123"
+}
+```
+
+- `success`：布尔值，成功为 `true`，错误为 `false`。
+- `code`：稳定小写下划线状态码，成功固定为 `"ok"`，失败为对应业务/系统错误码。
+- `message`：可读提示消息，成功默认为 `"ok"`。
+- `data`：业务负载对象或分页对象；失败时为 `null`。
+- `request_id`：请求关联标识，与响应头 `X-Request-Id` 保持一致。
+
+创建资源使用 `201`，聊天结果使用 `200`，已确认完成的删除使用 `204`。异步或待核验删除使用 `202`，`data` 返回 `operationId`、`status`、`statusUrl` 并设置 `Location`。显式创建记忆（`POST /v1/memories`）在提供方同步确认并返回稳定单条 ID 时返回 `201`；若底层提供方（如异步抽取型适配器）仅返回受理或批次状态而尚未产生单条稳定 ID，返回 `202`、`operationId`、`status`、`statusUrl` 及 `Location`，由统一 `operations` 追踪核验结果。用户删除额外返回一次性明文 `deletionReceipt` 及有效期，服务端持久化摘要。
+
+会话进入 `deleting` 状态后，从会话列表过滤隐藏；详情、消息历史和生成查询统一返回 `404`（与跨用户及已删除资源一致），针对该会话的续聊或新写入返回 `409 conversation_deleting`，删除进度仅通过 `GET /v1/operations/{operationId}` 查询。
+
+Agent、记忆、会话和消息列表的分页载荷放入 `data`，结构统一如下：
+
+```json
+{
+  "success": true,
+  "code": "ok",
+  "message": "ok",
+  "data": {
+    "items": [],
+    "next_cursor": null,
+    "has_more": false
+  },
+  "request_id": "req_123"
 }
 ```
 
@@ -561,18 +587,20 @@ Agent、记忆、会话和消息列表统一如下。
 
 记忆适配器输出同样的分页语义。实施前以受控及实际供应商响应验证稳定 ID、时间字段、排序和分页能力；对仅支持页码分页的供应商（如 MemOS `getMemory`），适配器将有界分页快照持久化到 PostgreSQL 的 `memory_list_snapshots` 表（严禁仅存 API 进程内存，以支持多副本负载均衡）。快照游标绑定用户、筛选条件和有效期，过期返回 `422 cursor_expired`。
 
-同步聊天成功包含 `conversationId`、`generationId`、`messageId`、完整 `message`、`modelId` 和 `usage`。重复运行中的请求返回 `202`、原标识、`statusUrl` 与 `Location`。生成查询成功读取时统一 `200`，包含 `status`、关联标识、成功结果或已保存错误对象。使用原幂等键恢复失败及取消结果时复用原 HTTP 错误类别，并在 `error.details` 提供生成标识和终态。`cancelled` 的重试响应使用 `409 generation_cancelled`。
+同步聊天成功时 `data` 包含 `conversationId`、`generationId`、`messageId`、完整 `message`、`modelId` 和 `usage`。重复运行中的请求返回 `202`、原标识、`statusUrl` 与 `Location`。生成查询成功读取时统一 `200`，`data` 包含 `status`、关联标识、成功结果或已保存错误对象。使用原幂等键恢复失败及取消结果时复用原 HTTP 错误类别，并在错误响应 `details` 提供生成标识和终态。`cancelled` 的重试响应使用 `409 generation_cancelled`。
 
 ### 8.3 错误响应
 
+错误响应沿用统一外壳（`success: false`、`data: null`），并附带结构化 `details` 字段，配合规范 HTTP 状态码返回：
+
 ```json
 {
-  "error": {
-    "code": "conversation_generation_conflict",
-    "message": "conversation already has an active generation",
-    "request_id": "req_123",
-    "details": {}
-  }
+  "success": false,
+  "code": "conversation_generation_conflict",
+  "message": "conversation already has an active generation",
+  "data": null,
+  "request_id": "req_123",
+  "details": {}
 }
 ```
 

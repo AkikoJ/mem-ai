@@ -36,7 +36,7 @@
   - `src/mem_ai/core/config.py`：`Settings`（`pydantic-settings` 启动校验、生产弱密码与 `*` CORS 拒绝、`database_url()` 通过 `URL.create("postgresql+psycopg", ...)` 组装）。
   - `src/mem_ai/core/logging.py`：`JsonLogFormatter`、`configure_logging`、`bind_log_context`、`reset_log_context`、`sanitize_log_value`。
   - `src/mem_ai/core/exceptions.py`：`AppError`（校验稳定小写下划线错误码）及 `UnauthorizedError`、`ForbiddenError`、`NotFoundError`、`ConflictError`、`UnprocessableEntityError`、`RateLimitError`、`BadGatewayError`、`ServiceUnavailableError`、`GatewayTimeoutError`。
-  - `src/mem_ai/core/exception_handlers.py`：`register_exception_handlers`、`build_error_envelope`（统一嵌套 `error` 信封，422 校验错误过滤原始 `input`）。
+  - `src/mem_ai/core/exception_handlers.py`：`register_exception_handlers`、`build_error_envelope`（统一 `{success, code, message, data, request_id, details}` 响应信封，422 校验错误过滤原始 `input`）。
 - **数据库、迁移与外部 HTTP 基础设施**：
   - `src/mem_ai/db/base.py`：`Base`、`NAMING_CONVENTION`、`UUIDPrimaryKeyMixin`、`CreatedAtMixin`、`TimestampMixin`。
   - `src/mem_ai/db/engine.py`：`create_async_engine_from_settings`、`create_session_factory`、`create_sync_engine_from_settings`。
@@ -48,7 +48,8 @@
   - `src/mem_ai/contracts/memory_provider.py`：`MemoryProvider`、`MemoryRecord`、`MemoryRecallQuery`、`MemoryRecallItem`、`MemoryWriteInput`、`MemoryWriteResult`、`MemoryListQuery`、`MemoryListPage`、`MemoryDeleteResult`、`MemoryOperationStatus`。
   - `src/mem_ai/contracts/persona_provider.py`：`PersonaProvider`、`PersonaSnapshot`、`MemoryPolicy`。
   - `src/mem_ai/api/dependencies.py`：`ProviderRegistry`、`SettingsDep`、`SessionFactoryDep`、`HttpClientDep`、`ModelProviderDep`、`MemoryProviderDep`、`PersonaProviderDep`（均支持 `app.dependency_overrides` 替换）。
-- **公共 HTTP、分页与健康检查**：
+- **公共 HTTP、统一响应、分页与健康检查**：
+  - `src/mem_ai/api/responses.py`：`ApiResponse`、`ok_response`（统一 `{success, code, message, data, request_id}` 成功响应外壳）。
   - `src/mem_ai/api/pagination.py`：`PaginationParams`、`CursorPayload`、`PaginatedResponse`、`encode_cursor`、`decode_cursor`、`hash_filters`。
   - `src/mem_ai/api/middleware.py`：`RequestContextMiddleware`、`register_middleware`。
   - `src/mem_ai/api/router.py`：`build_api_router()`（挂载健康检查路由与 `/v1` 业务路由前缀）。

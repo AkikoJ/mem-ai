@@ -50,8 +50,15 @@ async def test_health_live_and_ready_with_request_id_and_json_access_log(
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
                 live_resp = await client.get("/health/live")
                 assert live_resp.status_code == 200
-                assert live_resp.json() == {"status": "ok"}
-                assert live_resp.headers["x-request-id"].startswith("req_")
+                live_req_id = live_resp.headers["x-request-id"]
+                assert live_req_id.startswith("req_")
+                assert live_resp.json() == {
+                    "success": True,
+                    "code": "ok",
+                    "message": "ok",
+                    "data": {"status": "ok"},
+                    "request_id": live_req_id,
+                }
 
                 ready_resp = await client.get(
                     "/health/ready",
@@ -59,10 +66,17 @@ async def test_health_live_and_ready_with_request_id_and_json_access_log(
                 )
                 assert ready_resp.status_code == 200
                 assert ready_resp.headers["x-request-id"] == "req_custom_123"
-                body = ready_resp.json()
-                assert body["status"] == "ready"
-                assert body["database"] == "ok"
-                assert body["migration_revision"] == "20261121_0001"
+                assert ready_resp.json() == {
+                    "success": True,
+                    "code": "ok",
+                    "message": "ok",
+                    "data": {
+                        "status": "ready",
+                        "database": "ok",
+                        "migration_revision": "20261121_0001",
+                    },
+                    "request_id": "req_custom_123",
+                }
 
         # Lifespan exit must close outbound HTTP client cleanly.
         assert app.state.http_client.is_closed is True
@@ -91,8 +105,10 @@ async def test_health_ready_returns_503_when_database_not_migrated(
 
     assert resp.status_code == 503
     payload = resp.json()
-    assert payload["error"]["code"] == "migration_version_mismatch"
-    assert payload["error"]["request_id"] == "req_unmigrated"
+    assert payload["success"] is False
+    assert payload["code"] == "migration_version_mismatch"
+    assert payload["data"] is None
+    assert payload["request_id"] == "req_unmigrated"
 
 
 @pytest.mark.integration
@@ -132,18 +148,21 @@ async def test_error_envelopes_for_404_409_422_and_500(
                     "/v1/does-not-exist", headers={"X-Request-Id": "req_404"}
                 )
                 assert not_found.status_code == 404
-                assert not_found.json()["error"]["code"] == "not_found"
-                assert not_found.json()["error"]["request_id"] == "req_404"
+                not_found_body = not_found.json()
+                assert not_found_body["success"] is False
+                assert not_found_body["code"] == "not_found"
+                assert not_found_body["data"] is None
+                assert not_found_body["request_id"] == "req_404"
 
                 conflict = await client.get("/_test/conflict", headers={"X-Request-Id": "req_409"})
                 assert conflict.status_code == 409
                 assert conflict.json() == {
-                    "error": {
-                        "code": "conversation_generation_conflict",
-                        "message": "conversation already has an active generation",
-                        "request_id": "req_409",
-                        "details": {"conversation_id": "conv_42"},
-                    }
+                    "success": False,
+                    "code": "conversation_generation_conflict",
+                    "message": "conversation already has an active generation",
+                    "data": None,
+                    "request_id": "req_409",
+                    "details": {"conversation_id": "conv_42"},
                 }
 
                 invalid = await client.get(
@@ -153,16 +172,20 @@ async def test_error_envelopes_for_404_409_422_and_500(
                 )
                 assert invalid.status_code == 422
                 invalid_body = invalid.json()
-                assert invalid_body["error"]["code"] == "validation_error"
-                assert invalid_body["error"]["request_id"] == "req_422"
+                assert invalid_body["success"] is False
+                assert invalid_body["code"] == "validation_error"
+                assert invalid_body["data"] is None
+                assert invalid_body["request_id"] == "req_422"
                 assert "secret_raw_input" not in json.dumps(invalid_body)
 
                 crash = await client.get("/_test/crash", headers={"X-Request-Id": "req_500"})
                 assert crash.status_code == 500
                 assert crash.headers["x-request-id"] == "req_500"
                 crash_body = crash.json()
-                assert crash_body["error"]["code"] == "internal_server_error"
-                assert crash_body["error"]["request_id"] == "req_500"
+                assert crash_body["success"] is False
+                assert crash_body["code"] == "internal_server_error"
+                assert crash_body["data"] is None
+                assert crash_body["request_id"] == "req_500"
                 assert "sensitive internal traceback" not in json.dumps(crash_body)
     finally:
         logger.removeHandler(handler)
@@ -245,7 +268,10 @@ async def test_shared_async_client_fixture_and_main_asgi_entrypoint(
 
     resp = await async_client.get("/health/ready")
     assert resp.status_code == 200
-    assert resp.json()["status"] == "ready"
+    body = resp.json()
+    assert body["success"] is True
+    assert body["code"] == "ok"
+    assert body["data"]["status"] == "ready"
 
 
 @pytest.mark.anyio
@@ -266,8 +292,10 @@ async def test_health_ready_returns_503_when_database_unreachable() -> None:
 
     assert resp.status_code == 503
     payload = resp.json()
-    assert payload["error"]["code"] == "database_unavailable"
-    assert payload["error"]["request_id"] == "req_down"
+    assert payload["success"] is False
+    assert payload["code"] == "database_unavailable"
+    assert payload["data"] is None
+    assert payload["request_id"] == "req_down"
 
 
 @pytest.mark.anyio

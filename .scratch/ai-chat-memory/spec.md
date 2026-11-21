@@ -210,9 +210,9 @@ started 在标识与用户消息提交后发出，completed 在完整回复、�
 
 ### HTTP, retention and production baseline
 
-业务资源保留 camelCase 字段别名，分页、错误信封和 SSE 显式使用 snake_case。列表参数 limit、cursor，返回 items、next_cursor、has_more，默认 20、上限 100，稳定排序键为 created_at 与 id。对仅支持页码分页的供应商，适配器将有界分页快照持久化到 PostgreSQL 的 `memory_list_snapshots` 表（支持无 Redis 多副本部署），快照游标绑定用户及期限。
+业务资源保留 camelCase 字段别名，统一响应外壳、分页和 SSE 显式使用 snake_case。所有 JSON 响应统一返回 `{success, code, message, data, request_id}`（成功时 `success=true`、`code="ok"`，分页列表 `data` 返回 `items`/`next_cursor`/`has_more`，参数 `limit`/`cursor` 默认 20、上限 100，稳定排序键为 `created_at` 与 `id`）。对仅支持页码分页的供应商，适配器将有界分页快照持久化到 PostgreSQL 的 `memory_list_snapshots` 表（支持无 Redis 多副本部署），快照游标绑定用户及期限。
 
-错误统一为 error 对象，含 code、message、request_id、details，code 为小写下划线。其他用户资源统一 404。错误映射和路由表以 [后端工程设计](../../docs/backend-scaffold-design.md) 为契约。
+错误响应沿用同一外壳（`success=false`、`data=null`）并附带 `details`，`code` 为小写下划线，配合规范 HTTP 状态码返回。其他用户资源统一 404。错误映射和路由表以 [后端工程设计](../../docs/backend-scaffold-design.md) 为契约。
 
 会话和生成默认长期，任务执行日志 30 天，终态幂等 24 小时，分页快照按配置短期过期，历史引用随父会话。Worker 分批执行周期清理，保留活跃工作、未确认删除、外部映射和必要去重记录。
 

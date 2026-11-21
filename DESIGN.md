@@ -336,7 +336,7 @@ Agent 删除表现为停用，已有会话可继续使用固定人设。所有�
 
 ## 8. 错误处理
 
-错误结构统一为嵌套 `error`，包含稳定的小写下划线 `code`、可读 `message`、`request_id` 和对象型 `details`。
+所有 JSON 响应统一采用 `{success, code, message, data, request_id}` 外壳；错误响应中 `success` 为 `false`、`data` 为 `null`，并包含稳定的小写下划线 `code`、可读 `message`、`request_id` 和对象型 `details`。
 
 | 场景 | 行为 |
 | --- | --- |
