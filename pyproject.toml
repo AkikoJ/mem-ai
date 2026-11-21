@@ -1,0 +1,60 @@
+[project]
+name = "mem-ai"
+version = "0.1.0"
+description = "Modular monolith AI chat backend with configurable personas and replaceable memory providers."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "alembic>=1.14.0,<2.0.0",
+    "fastapi>=0.115.0,<1.0.0",
+    "httpx>=0.28.0,<1.0.0",
+    "psycopg[binary]>=3.2.0,<4.0.0",
+    "pydantic>=2.10.0,<3.0.0",
+    "pydantic-settings>=2.7.0,<3.0.0",
+    "sqlalchemy[asyncio]>=2.0.36,<3.0.0",
+    "uvicorn[standard]>=0.34.0,<1.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "anyio>=4.8.0,<5.0.0",
+    "mypy>=1.14.0,<2.0.0",
+    "pytest>=8.3.0,<9.0.0",
+    "ruff>=0.9.0,<1.0.0",
+]
+
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mem_ai"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["src", "tests", "tools", "migrations"]
+extend-exclude = [".agents", ".claude", ".scratch"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["mem_ai", "tests", "tools"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+mypy_path = "src"
+packages = ["mem_ai"]
+plugins = ["pydantic.mypy"]
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers"]
+markers = [
+    "integration: tests that require a live PostgreSQL instance",
+]

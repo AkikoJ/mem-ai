@@ -6,10 +6,16 @@ Basic MemOS AI memory system
 工程目录和功能定位索引位于 [`docs/backend-scaffold-design.md`](docs/backend-scaffold-design.md#3-工程目录)。开始实现前先按索引定位能力负责人和已有入口，完成后运行：
 
 ```bash
+uv sync --locked --dev
+uv run ruff check .
+uv run mypy src
+uv run alembic upgrade head
+uv run alembic check
+uv run pytest
 python3 tools/check_architecture.py
 ```
 
-该检查会校验已落地目录、功能索引重复路径、本地文档链接、重复字面量路由和源码文件规模。
+`tools/check_architecture.py` 会校验已落地目录、功能索引重复路径、本地文档链接、分层导入方向与装配例外、重复字面量路由、ticket 依赖图一致性以及源码文件规模。
 
 ## 本地 PostgreSQL
 
@@ -19,13 +25,13 @@ python3 tools/check_architecture.py
 cp .env.example .env
 ```
 
-编辑 `.env` 中的 `POSTGRES_PASSWORD`，再启动数据库：
+编辑 `.env` 中的 `POSTGRES_PASSWORD`（如需自定义宿主机数据卷路径，可额外设置 `POSTGRES_DATA_DIR=/your/host/path`），再启动数据库：
 
 ```bash
 docker compose up -d
 ```
 
-数据库默认只监听本机的 `127.0.0.1:5432`，数据库名和用户名均为 `mem_ai`。如端口被占用，可修改 `.env` 中的 `POSTGRES_PORT`。数据保存在 Docker 命名卷 `postgres_data` 中，普通的 `docker compose down` 会保留数据。
+数据库默认只监听本机的 `127.0.0.1:5432`，数据库名和用户名均为 `mem_ai`。如端口被占用，可修改 `.env` 中的 `POSTGRES_PORT`。未设置 `POSTGRES_DATA_DIR` 时数据保存在 Docker 命名卷 `postgres_data` 中，设置 `POSTGRES_DATA_DIR` 时直接绑定挂载至指定宿主机目录，普通的 `docker compose down` 均会保留数据。
 
 查看状态与连接数据库：
 

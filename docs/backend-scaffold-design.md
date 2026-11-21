@@ -161,9 +161,12 @@ Service
 | `docs/`、`docs/adr/`、`docs/agents/` | 已落地 | 读取工程契约、决策和任务维护规则 |
 | `.scratch/ai-chat-memory/` | 已落地 | 读取当前规格、依赖和实现边界 |
 | `.agents/skills/` | 已落地 | 按任务读取适用技能，技能文件不作为业务实现入口 |
-| `tools/check_architecture.py` | 已落地 | 校验工程目录、功能索引、文档链接、重复字面量路由和源码文件规模 |
-| `compose.yaml`、`.env.example` | 已落地 | 读取本地依赖和配置模板 |
-| `src/`、`migrations/`、`tests/`、`.github/` | 按切片落地 | 先检查实际文件，再沿功能定位索引进入 |
+| `tools/check_architecture.py` | 已落地 | 校验工程目录、功能索引、文档链接、分层导入、装配例外、重复字面量路由、ticket 依赖图和源码文件规模 |
+| `compose.yaml`、`.env.example`、`pyproject.toml`、`uv.lock`、`.python-version`、`alembic.ini` | 已落地 | 本地依赖（支持 `POSTGRES_DATA_DIR` 自定义数据卷路径）、配置模板、锁定依赖与迁移配置 |
+| `migrations/`、`.github/workflows/checks.yml` | 已落地 | Alembic 同步迁移基线与最小 CI 检查流水线 |
+| `src/mem_ai/main.py`、`src/mem_ai/application.py`、`src/mem_ai/core/`、`src/mem_ai/api/`、`src/mem_ai/db/`、`src/mem_ai/contracts/`、`src/mem_ai/integrations/`、`src/mem_ai/modules/health/` | 已落地 | 01 基础脚手架、应用装配、提供方协议、公共分页、错误处理与健康检查 |
+| `tests/conftest.py`、`tests/unit/`、`tests/api/`、`tests/integration/`、`tests/architecture/` | 已落地（持续扩展） | 01 基础测试 fixture、单元、API、PostgreSQL/迁移与架构测试 |
+| `src/mem_ai/modules/`（业务模块）与 `src/mem_ai/workers/` | 按切片落地 | 先检查实际文件，再沿功能定位索引进入 |
 
 ### 3.0.2 功能定位索引
 
@@ -186,7 +189,7 @@ Service
 
 目录树如下。
 
-下列目录是计划工程结构。现有设计文档、设计评审、领域文档、技能、ticket、`.env.example` 和 `compose.yaml` 已建立。Python 应用、迁移、测试、工作流及部署文件随 18 个实现切片逐步落地，树中 Python 文件表示计划职责。
+下列目录是目标工程结构。设计文档、设计评审、领域文档、技能、ticket、`.env.example`、`compose.yaml`，以及 01 基础切片（`pyproject.toml`、`uv.lock`、`.python-version`、`alembic.ini`、`migrations/`、应用装配、`core/`、`api/`、`db/`、`contracts/`、`integrations/`、`modules/health/`、`tests/` 与 `.github/workflows/checks.yml`）已落地；其余业务模块、Worker、运行手册与容器部署文件随 02–18 切片逐步落地。
 
 ```text
 mem-ai/                                    # 项目根目录，管理应用、设计和工程工具
@@ -228,7 +231,7 @@ mem-ai/                                    # 项目根目录，管理应用、�
 │   └── operations/                        # 生产操作手册，随部署切片建立
 │       └── deployment-and-recovery.md     # 迁移、回滚、恢复、轮换及故障处理步骤
 ├── tools/                                 # 工程检查和开发辅助工具
-│   └── check_architecture.py               # 工程目录、文档和轻量架构约束检查
+│   └── check_architecture.py               # 工程目录、文档、分层导入、依赖图与路由架构检查
 ├── migrations/                            # 数据库版本变更
 │   ├── env.py                             # 加载配置与全部 ORM 元数据，创建同步迁移引擎
 │   ├── script.py.mako                     # 新迁移的脚本模板
@@ -260,6 +263,7 @@ mem-ai/                                    # 项目根目录，管理应用、�
 │       │   └── persona_provider.py        # 只读人设与不可变版本快照契约
 │       ├── modules/                       # 按业务职责划分的模块
 │       │   ├── health/                    # 进程、数据库和迁移版本就绪检查
+│       │   │   ├── service.py             # 有界数据库连通与 Alembic 迁移版本就绪校验
 │       │   │   └── router.py              # /health/live 与 /health/ready
 │       │   ├── auth/                      # 凭证验证与业务用户解析
 │       │   │   ├── context.py             # AuthenticationContext 可信身份和权限
