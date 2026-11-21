@@ -2,7 +2,7 @@
 
 **What to build:** 让部署可限制资源并定位生成、记忆和任务故障，提供可运营的 API 与 Worker。
 
-**Blocked by:** [09 持久化任务并重试记忆写入](09-persist-and-retry-memory-writes.md), [12 流式返回与确认生成终态](12-stream-replies-with-terminal-status.md)
+**Blocked by:** [09 持久化任务并重试记忆写入](09-persist-and-retry-memory-writes.md), [12 流式返回与确认生成终态](12-stream-replies-with-terminal-status.md), [13 删除与清空记忆并阻止旧任务回写](13-delete-memories-with-epoch-barriers.md)
 
 **Status:** ready-for-agent
 

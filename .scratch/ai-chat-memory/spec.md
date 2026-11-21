@@ -156,15 +156,15 @@ FastAPI、PostgreSQL 17、SQLAlchemy 2.x 异步 ORM、psycopg 3、Alembic、Pyda
 
 ### Private Agents and model policy
 
-用户仅管理和使用自己的私有 Agent。发布人设为不可变快照，会话固定创建时最新发布版本。草稿修改及后续发布影响新会话，停用阻止新会话，已有会话继续使用原版本。并发版本发布与停用通过数据库约束和条件更新保护。
+用户仅管理和使用自己的私有 Agent。草稿唯一保存在 `agents` 行上，`persona_versions` 仅保存已发布的不可变快照（含 `defaultModelId` 和 `memoryPolicy`），`PersonaProvider` 收缩为对话内核使用的只读人设快照契约，管理写操作由 `agents` 负责。`PATCH /v1/agents/{agentId}` 更新草稿，`POST /v1/agents/{agentId}/versions` 生成新不可变快照，`POST /v1/agents/{agentId}/publish` 发布并切换当前发布引用。会话固定创建时最新发布版本；草稿修改、后续发布与停用只影响新会话。并发版本发布与停用通过数据库约束和条件更新保护。
 
-模型路由优先级为服务端强制策略、允许的请求 modelId、Agent 默认模型。模型注册和凭据由服务端控制，V1 一次生成固定实际模型，上游失败直接形成该次失败。模型查询只公开可引用标识与能力。
+模型路由优先级为服务端强制策略、允许的请求 modelId、Agent 默认模型。模型配置由服务端通过受控配置在启动或显式同步命令中幂等同步到 PostgreSQL，凭据由服务端控制。V1 一次生成固定实际模型，上游失败直接形成该次失败；若旧会话固定版本引用的默认模型已停用且请求省略 `modelId`，调用前返回 `model_unavailable`，策略允许时调用方可显式传入其他已启用 `modelId` 继续。模型查询只公开可引用标识与能力。
 
 ### Generation, transactions and context
 
-聊天省略 conversationId 时隐式创建会话，续聊校验会话归属及 Agent 一致性。一次请求对应一个生成回合，状态为 running、succeeded、failed 或 cancelled，保存固定人设、实际模型、用户消息、完整回复或错误。
+聊天省略 conversationId 时隐式创建会话，续聊校验会话归属及 Agent 一致性。未命中幂等记录时，先在数据库事务外通过 `PersonaProvider` 只读解析目标人设版本快照，再进入短事务创建会话与生成记录。一次请求对应一个生成回合，状态为 running、succeeded、failed 或 cancelled，保存固定人设、实际模型、用户消息、完整回复或错误。
 
-同一会话使用可续期 PostgreSQL 租约，带期限和唯一所有权令牌。不同会话并行，不同活跃生成争用返回 409。过期恢复器将旧 running 回合收敛为 failed，旧执行者失去提交权限。所有完成和任务提交重新检查租约、用户及会话当前状态。
+同一会话使用可续期 PostgreSQL 租约，带期限和唯一所有权令牌。不同会话并行，未过期活跃生成争用返回 409；若发现旧 `running` 回合租约已过期，新请求在同一短事务内直接将其收敛为 `failed`（`generation_lease_lost`）后接管，不依赖 Worker 存活；Worker 过期恢复器作为无后续新请求时的兜底。同步请求进入模型调用后不因客户端 HTTP 断连而中止，保障提交后可通过原幂等键取回结果。所有完成和任务提交重新检查租约、用户及会话当前状态。
 
 原始用户消息在模型调用前提交，召回在事务外执行，实际注入引用经短事务提交后调用模型。完整回复、生成成功、幂等结果及允许的普通记忆任务在最后一个短事务原子提交。外部 HTTP 及流式传输在事务外执行。
 
@@ -188,13 +188,13 @@ started 在标识与用户消息提交后发出，completed 在完整回复、�
 
 ### Memory and durable jobs
 
-用户和当前会话是 V1 的两个记忆范围。记忆引用关联本次用户消息，仅保存实际注入的提供方 ID、记忆 ID、范围、相关度、位置、代次和删除状态，正文由提供方管理。
+用户（`user`）和当前会话（`conversation`）是 V1 的两个记忆范围。普通对话回合写入范围由固定人设快照中的 `memoryPolicy.writeScope` 控制（默认 `user`，可设为 `conversation`）；显式创建默认 `user`，支持指定 `scope="conversation"` 并校验 `conversationId` 归属。记忆引用关联本次用户消息，仅保存实际注入的提供方 ID、记忆 ID、范围、相关度、位置、代次和删除状态，正文由提供方管理。
 
 统一 jobs 表负责记忆写入、记忆删除、会话与用户清理、生成恢复及周期保留任务，memory_jobs 为筛选普通记忆写入的只读视图。独立 Worker 使用短事务 SKIP LOCKED、可续租约、令牌条件更新、可配置并发、退避抖动和最大尝试，重启及退出均可恢复。
 
-任务至少一次执行，提供方使用稳定任务 ID 幂等或结果核验。已发送但响应丢失时进入 reconciling，未知外部结果保留关联信息并告警。任务执行摘要有限保留，日志过滤敏感内容。
+任务至少一次执行，提供方使用稳定任务 ID 幂等、元数据关联或结果核验。已发送但响应丢失时进入 reconciling，未知外部结果保留关联信息并告警。任务执行摘要有限保留，日志过滤敏感内容。
 
-显式创建先在统一任务中登记最小写入记录，再由请求路径同步执行，未知结果由 Worker 核验。发起登记与清空提升代次使用相同范围锁串行，清空可以枚举旧代次在途调用。显式记忆创建须提供方确认成功后返回 201。单条删除与 confirm=true 清空先持久化操作，确认完成返回 204，待执行或待确认返回 202、operationId 和查询位置。确定失败映射稳定应用错误，操作状态通过 GET /v1/operations/{operationId} 查询。
+显式创建先在统一任务中登记最小写入记录，再由请求路径同步执行，未知结果由 Worker 核验。发起登记与清空提升代次使用相同范围锁串行，清空可以枚举旧代次在途调用。提供方同步确认并返回稳定单条 ID 时返回 201；若提供方（如异步抽取型适配器）仅受理而尚未产出单条稳定 ID，返回 202、operationId 与查询地址，由统一 operations 核验结果。单条删除与 confirm=true 清空先持久化操作，确认完成返回 204，待执行或待确认返回 202、operationId 和查询位置。确定失败映射稳定应用错误，操作状态通过 GET /v1/operations/{operationId} 查询。04 实施前须先完成对 MemOS Cloud 真实接口的能力实测并记录结论。
 
 ### Deletion races and memory epochs
 
@@ -202,23 +202,23 @@ started 在标识与用户消息提交后发出，completed 在完整回复、�
 
 清空原子递增 epoch，建立屏障并取消旧代次排队任务。屏障中召回降级为空，显式创建返回 409 memory_scope_clearing，普通记忆入队暂停。旧生成稍后完成时照常提交回复并抑制旧代次任务。
 
-处理器核验旧普通写入、显式创建及迟到上游执行，确认旧副作用全部收敛后最终清空，再解除屏障。未知结果保持待确认与告警，本地租约约束状态提交，远程副作用依靠核验与最终清空收敛。
+处理器核验旧普通写入、显式创建及迟到上游执行；若提供方具备单次写入状态核验能力，确认旧副作用全部收敛后最终清空并解除屏障；若提供方缺乏单次写入状态查询能力，在途旧写入等待其完成或达到配置的上限收敛窗口（`memory_inflight_settle_timeout`）后，保留 `reconciling` 审计告警并执行最终远程清空与延迟二次补偿清空，确认后解除屏障（避免单次超时永久锁死用户记忆）。最终清空本身结果未知时保持屏障待确认与告警。显式状态转换与时序见 [后端工程设计](../../docs/backend-scaffold-design.md#1131-删除与屏障状态机及清空时序)。
 
-会话删除先阻止续聊，后台分批删除消息、引用、生成、相关幂等和会话范围记忆。用户删除立即停用并清理 Agent、人设、会话、消息、引用、生成、幂等和全部用户记忆。最小操作主体、远程映射和清理任务保留至结果确认。
+会话删除立即置为 `deleting` 阻止续聊（续聊返回 `409 conversation_deleting`，列表隐藏，详情/消息/生成查询返回 `404`），后台分批删除消息、引用、生成、相关幂等和会话范围记忆（提供方不支持按会话批量删除时按筛选出的目标 ID 分批删除并叠加本地删除标记兜底隔离）。用户删除立即将用户置为 `deleting` 阻止业务访问，期间保持 `user_identities` 绑定防止旧凭证静默重建，随后分批清理 Agent、人设、会话、消息、引用、生成、幂等和全部用户与会话记忆；待本地与远程清理全部确认完成后再移除 `user_identities` 与用户业务记录，仅保留脱敏操作摘要和回执至有效期届满。删除任务遇到活跃生成租约时，因状态已置 `deleting` 会阻止续期与提交，失联租约待其过期收敛后继续清理。
 
 用户删除返回随机 deletionReceipt，服务端仅存摘要。Authorization 的 DeletionReceipt 方案仅允许查询指定删除操作，具有配置期限。结果区分本地完成和远程待确认，全部确认后才完成。
 
 ### HTTP, retention and production baseline
 
-业务资源保留 camelCase 字段别名，分页、错误信封和 SSE 显式使用 snake_case。列表参数 limit、cursor，返回 items、next_cursor、has_more，默认 20、上限 100，稳定排序键为 created_at 与 id。供应商分页能力须通过适配器验证，适配器快照游标绑定用户及期限。
+业务资源保留 camelCase 字段别名，分页、错误信封和 SSE 显式使用 snake_case。列表参数 limit、cursor，返回 items、next_cursor、has_more，默认 20、上限 100，稳定排序键为 created_at 与 id。对仅支持页码分页的供应商，适配器将有界分页快照持久化到 PostgreSQL 的 `memory_list_snapshots` 表（支持无 Redis 多副本部署），快照游标绑定用户及期限。
 
 错误统一为 error 对象，含 code、message、request_id、details，code 为小写下划线。其他用户资源统一 404。错误映射和路由表以 [后端工程设计](../../docs/backend-scaffold-design.md) 为契约。
 
-会话和生成默认长期，任务执行日志 30 天，终态幂等 24 小时，历史引用随父会话。Worker 分批执行周期清理，保留活跃工作、未确认删除、外部映射和必要去重记录。
+会话和生成默认长期，任务执行日志 30 天，终态幂等 24 小时，分页快照按配置短期过期，历史引用随父会话。Worker 分批执行周期清理，保留活跃工作、未确认删除、外部映射和必要去重记录。
 
 生产基线包含入口分布式限流、应用可替换限制边界、进程并发和请求体预算、生成与流期限、Worker 限制、CORS/Host/代理白名单、JSON 关联日志、低基数指标、健康及迁移版本检查、密钥轮换与备份恢复。
 
-生产迁移采用 expand、migrate、contract，单发布执行者执行。失败优先前向修复，应用回滚验证结构兼容，数据库恢复为独立操作并明确时间点、数据损失及 RPO/RTO。恢复写入前重放删除与记忆代次记录并核验外部副作用。
+生产迁移采用 expand、migrate、contract，单发布执行者执行。失败优先前向修复，应用回滚验证结构兼容，数据库恢复为独立操作并明确时间点、数据损失及 RPO/RTO。生产恢复支持通过独立删除审计归档接缝重放主库备份点之后的删除与代次记录；未启用独立归档时以 PostgreSQL PITR 为基线并显式标注 RPO 与删除一致性边界。
 
 ## Testing Decisions
 
@@ -273,10 +273,10 @@ MemOS 凭据保持服务端，任何真实供应商的分页、幂等、取消�
 | [11 更新人设版本和停用 Agent](issues/11-publish-persona-versions-and-retire-agents.md) | 让拥有者更新草稿、发布新版本和停用 Agent，旧会话持续使用原版本。 | 05 |
 | [12 流式返回与确认生成终态](issues/12-stream-replies-with-terminal-status.md) | 让聊天通过 SSE 返回增量和确定终态，并可在断连后查询原生成。 | 06、08、09、10、11 |
 | [13 删除与清空记忆并阻止旧任务回写](issues/13-delete-memories-with-epoch-barriers.md) | 让用户删除单条或清空记忆，立即停止相关召回，并通过可查询操作确保旧写入最终收敛。 | 04、08、09 |
-| [14 查询与删除自己的会话](issues/14-query-and-delete-owned-conversations.md) | 让用户查看自己的会话及真实消息历史，并删除会话与相关会话记忆。 | 07、09、13 |
+| [14 查询与删除自己的会话](issues/14-query-and-delete-owned-conversations.md) | 让用户查看自己的会话及真实消息历史，并删除会话与相关会话记忆。 | 07、09、10、13 |
 | [15 删除用户及关联数据](issues/15-delete-user-and-associated-data.md) | 让用户删除自身及关联数据，立即停止业务访问，并通过专用回执持续查询清理进度。 | 11、13、14 |
 | [16 执行数据保留与到期清理](issues/16-apply-data-retention-and-expiry.md) | 让过期幂等和任务执行日志自动清理，同时保留活跃工作及删除恢复必需的数据。 | 10、15 |
-| [17 接入资源限制与运行观测](issues/17-add-resource-limits-and-observability.md) | 让部署可限制资源并定位生成、记忆和任务故障，提供可运营的 API 与 Worker。 | 09、12 |
+| [17 接入资源限制与运行观测](issues/17-add-resource-limits-and-observability.md) | 让部署可限制资源并定位生成、记忆和任务故障，提供可运营的 API 与 Worker。 | 09、12、13 |
 | [18 验证生产部署与恢复流程](issues/18-verify-production-deployment-and-recovery.md) | 让 V1 在生产配置中完成发布、迁移、恢复和故障演练，形成可执行运行手册。 | 16、17 |
 
 依赖图仅包含已确认的直接边。
@@ -323,6 +323,7 @@ graph TD
     T09 --> T13
     T07 --> T14
     T09 --> T14
+    T10 --> T14
     T13 --> T14
     T11 --> T15
     T13 --> T15
@@ -331,6 +332,7 @@ graph TD
     T15 --> T16
     T09 --> T17
     T12 --> T17
+    T13 --> T17
     T16 --> T18
     T17 --> T18
 ```

@@ -98,21 +98,21 @@ Service
 | --- | --- | --- |
 | `auth` | 凭证验证和可信身份上下文 | 通过 `users` 解析本地用户 |
 | `users` | `users`、`user_identities`、用户状态和用户删除协调 | 清理处理器调用资源模块批量清理入口 |
-| `agents` | `agents`、`persona_versions`、草稿、版本分配、发布与停用 | 管理 API 调用生命周期服务，发布快照和当前版本引用同事务更新 |
-| `personas` | `PersonaProvider` 的本地适配 | 委托 `agents` 的同一生命周期服务读取或变更人设 |
-| `conversations/service.py` | Conversation Core 的准备、执行和收敛编排 | 调用生成阶段入口、模型路由、提供方和纯 Prompt 编译 |
-| `conversations/generation.py` | `conversations`、`messages`、`generations`、召回引用的持久化阶段及生成终态 | 统一创建、租约、成功、失败、取消和过期恢复，协作方法参与同一 Session |
+| `agents` | `agents`、`persona_versions`、草稿（存 `agents` 行）、不可变版本快照分配、发布与停用 | 管理 API 唯一写入入口，发布快照和当前版本引用同事务更新 |
+| `personas` | `PersonaProvider` 的本地只读适配 | 委托 `agents` 只读解析最新或固定版本快照，不承担管理写操作 |
+| `conversations/service.py` | Conversation Core 的准备、执行和收敛编排 | 事务外读取人设与召回，调用生成阶段入口、模型路由、提供方和纯 Prompt 编译 |
+| `conversations/generation.py` | `conversations`、`messages`、`generations`、召回引用的持久化阶段及生成终态 | 统一创建、租约（含过期接管）、成功、失败、取消和过期恢复，协作方法参与同一 Session |
 | `conversations/idempotency.py` | `idempotency_records`、业务摘要与原结果解析 | 由生成阶段在所属事务中占位和更新结果 |
-| `models` | `model_configs`、模型选择与 `ModelProvider` 适配 | 对话编排使用模型选择结果和项目协议 |
-| `memories` | `memory_scopes`、`memory_tombstones`、范围、代次、屏障与记忆访问策略 | 对话与清理流程调用同一策略，任务处理器调用 `MemoryProvider` |
+| `models` | `model_configs`、受控配置同步、模型选择与 `ModelProvider` 适配 | 对话编排使用模型选择结果和项目协议 |
+| `memories` | `memory_scopes`、`memory_tombstones`、`memory_list_snapshots`、范围归属、代次、屏障与访问策略 | 对话与清理流程调用同一策略，任务处理器调用 `MemoryProvider` |
 | `jobs` | `jobs`、`job_attempts`、领取、续租、去重、重试和任务状态 | 业务处理器返回执行结果，由执行框架记录状态 |
-| `operations` | `operations`、删除状态转换、阶段进度与回执权限 | 资源清理处理器报告结果，通过统一入口推进操作 |
-| `retention` | 保留期限、扫描批次与清理选择 | 调用资源模块的批量清理入口并复用 `jobs` |
+| `operations` | `operations`、删除状态转换、阶段进度、回执权限与独立删除审计归档接缝 | 资源清理处理器报告结果，通过统一入口推进操作并导出审计记录 |
+| `retention` | 保留期限、扫描批次与清理选择（含幂等、日志及分页快照） | 调用资源模块的批量清理入口并复用 `jobs` |
 | `workers` | 进程生命周期、处理器注册与并发调度 | 装配业务处理器，调用 `jobs` 执行框架 |
 
-`agents` 向 `personas` 提供本地生命周期服务，依赖方向为 `personas` → `agents`。`personas` 按适配职责组织，表定义和版本写入集中在 `agents`。具体适配器仅在装配处绑定到项目协议。
+`agents` 向 `personas` 提供本地只读查询入口，依赖方向为 `personas` → `agents`。`personas` 按只读适配职责组织，表定义与全部写操作集中在 `agents`。具体适配器仅在装配处绑定到项目协议。
 
-记忆检索范围包含用户级和会话级，代次与全量清空屏障按 `(user_id, provider_id)` 管理。会话删除通过会话的 `deleting` 状态和会话范围删除标记隔离写入，记忆策略同时检查用户代次与会话有效性。会话级清理保留用户级记忆。
+记忆检索与写入范围包含用户级（`user`）和会话级（`conversation`）。普通对话回合写入范围由固定人设快照中的 `memoryPolicy.writeScope` 控制（默认 `user`，可配置为 `conversation`）；显式创建默认 `user`，支持显式指定 `scope="conversation"` 并校验 `conversationId` 归属。代次与全量清空屏障按 `(user_id, provider_id)` 管理。会话删除通过会话的 `deleting` 状态和会话范围删除标记隔离写入，记忆策略同时检查用户代次与会话有效性。会话级清理保留用户级记忆。
 
 召回、显式创建、后台写入和删除均经过 `memories` 的公共策略入口，具体 `MemoryProvider` 适配器由这些入口在校验后调用。Conversation Core 使用项目协议接入受策略保护的记忆能力。
 
@@ -157,6 +157,7 @@ Service
 | 路径 | 当前状态 | 查找规则 |
 | --- | --- | --- |
 | `AGENTS.md`、`DESIGN.md`、`GLOSSARY.md` | 已落地 | 读取规则、业务流程和领域词义 |
+| `DESIGN-REVIEW.md` | 已落地 | 读取设计评审发现的待决问题及建议处理切片 |
 | `docs/`、`docs/adr/`、`docs/agents/` | 已落地 | 读取工程契约、决策和任务维护规则 |
 | `.scratch/ai-chat-memory/` | 已落地 | 读取当前规格、依赖和实现边界 |
 | `.agents/skills/` | 已落地 | 按任务读取适用技能，技能文件不作为业务实现入口 |
@@ -185,7 +186,7 @@ Service
 
 目录树如下。
 
-下列目录是计划工程结构。现有设计文档、领域文档、技能、ticket、`.env.example` 和 `compose.yaml` 已建立。Python 应用、迁移、测试、工作流及部署文件随 18 个实现切片逐步落地，树中 Python 文件表示计划职责。
+下列目录是计划工程结构。现有设计文档、设计评审、领域文档、技能、ticket、`.env.example` 和 `compose.yaml` 已建立。Python 应用、迁移、测试、工作流及部署文件随 18 个实现切片逐步落地，树中 Python 文件表示计划职责。
 
 ```text
 mem-ai/                                    # 项目根目录，管理应用、设计和工程工具
@@ -202,6 +203,7 @@ mem-ai/                                    # 项目根目录，管理应用、�
 ├── AGENTS.md                              # 仓库工作规则和技能入口
 ├── DESIGN.md                              # 业务边界、流程和核心一致性规则
 ├── GLOSSARY.md                            # 已确认的领域词汇及含义
+├── DESIGN-REVIEW.md                       # 设计评审问题清单、影响切片和处理建议
 ├── .agents/                               # 仓库级 Agent 工作能力
 │   └── skills/                            # 技能说明和配套资源
 │       └── backend-design/                # 后端设计与目录同步维护技能
@@ -255,7 +257,7 @@ mem-ai/                                    # 项目根目录，管理应用、�
 │       ├── contracts/                     # 项目拥有的提供方协议和类型
 │       │   ├── model_provider.py          # 完整生成、流、取消和用量契约
 │       │   ├── memory_provider.py         # 召回、创建、分页、删除、清空和结果核验
-│       │   └── persona_provider.py        # 人设读取、不可变发布和停用契约
+│       │   └── persona_provider.py        # 只读人设与不可变版本快照契约
 │       ├── modules/                       # 按业务职责划分的模块
 │       │   ├── health/                    # 进程、数据库和迁移版本就绪检查
 │       │   │   └── router.py              # /health/live 与 /health/ready
@@ -266,8 +268,8 @@ mem-ai/                                    # 项目根目录，管理应用、�
 │       │   ├── users/                     # 用户、外部身份映射和用户删除协调
 │       │   │   └── cleanup.py             # 用户数据与远程记忆分批清理处理器
 │       │   ├── agents/                    # Agent 与人设版本的唯一持久化和生命周期入口
-│       │   ├── personas/                  # 委托 Agent 生命周期服务的人设协议适配
-│       │   │   └── provider.py             # PersonaProvider 本地实现和项目类型转换
+│       │   ├── personas/                  # 委托 Agent 只读查询的人设协议适配
+│       │   │   └── provider.py             # PersonaProvider 本地只读实现和项目类型转换
 │       │   ├── conversations/             # 会话、消息、生成、幂等和对话编排
 │       │   │   ├── service.py              # 同步与流式共用的准备、执行和收敛编排
 │       │   │   ├── generation.py          # 持久化阶段、生成终态、租约和条件提交
@@ -340,14 +342,14 @@ modules/<module>/    # 某个业务模块，例如 agents 或 conversations
 | `modules/auth/context.py` | 定义认证主体、本地用户、认证方法和权限 |
 | `integrations/http.py` | 创建共享 HTTPX 客户端 |
 | `modules/agents/` | Agent 与人设版本的生命周期和唯一写入入口 |
-| `modules/personas/provider.py` | 委托 Agent 生命周期实现的人设适配器 |
+| `modules/personas/provider.py` | 委托 Agent 只读查询实现的人设适配器 |
 | `modules/conversations/service.py` | 同步与流式共用的对话编排 |
 | `modules/conversations/generation.py` | 持久化阶段、生成终态、租约和条件提交 |
 | `modules/conversations/idempotency.py` | 请求语义摘要、首次关联和结果复用 |
-| `modules/memories/` | 统一记忆范围、代次、屏障和删除标记策略 |
+| `modules/memories/` | 统一记忆范围、代次、屏障、分页快照和删除标记策略 |
 | `modules/memories/jobs.py` | 记忆任务业务处理，调用统一记忆策略完成核验 |
 | `modules/jobs/` | 全部任务的统一持久化与重试规则 |
-| `modules/operations/` | 删除进度聚合与删除回执权限 |
+| `modules/operations/` | 删除进度聚合、删除回执权限与独立删除审计归档接缝 |
 | `modules/retention/` | 周期清理规则及批处理 |
 | `workers/main.py`、`workers/runner.py` | 独立进程入口与共享任务执行框架 |
 | `docs/operations/deployment-and-recovery.md` | 生产迁移、故障恢复及轮换操作手册 |
@@ -412,16 +414,16 @@ async def create_agent(data, owner_id, session_factory):
 
 ### 5.2 对话事务
 
-1. 验证身份和资源状态，先查询已有幂等记录。
-2. 短事务占位幂等键，按需创建会话，固定人设、实际模型和记忆代次，领取生成租约，写入 `running` 回合及原始用户消息。
+1. 验证身份和资源状态，先查询已有幂等记录；若未命中，在数据库事务外通过 `PersonaProvider` 只读解析目标人设版本快照（新会话取最新已发布版本，续聊取会话固定版本），并校验模型路由可用性，确保未来替换为远程人设适配器时不把外部 HTTP 带入事务。
+2. 短事务占位幂等键，按需创建会话并记录固定人设版本引用，保存实际模型和当前记忆代次，领取生成租约（若旧 `running` 回合租约已过期则同事务先收敛为 `generation_lease_lost` 后接管），写入 `running` 回合及原始用户消息。
 3. 事务外召回和编译，短事务再次校验状态和租约后保存实际注入的引用。
-4. 事务外调用模型，流式请求在 IDs 提交后开始事件传输。
+4. 事务外调用模型，流式请求在 IDs 提交后开始事件传输。同步请求（`stream=false`）一旦进入模型调用，不因客户端 HTTP 连接断开而中止，允许在生成期限内继续完成并提交，以便客户端通过原幂等键取回完整结果；流式请求（`stream=true`）在客户端断连时尝试取消上游并收敛为 `cancelled`。
 5. 最后一个短事务条件校验租约、用户及会话有效状态，原子写入完整回复、生成成功、幂等结果及允许入队的记忆任务，同时释放租约。记忆代次已变化时抑制旧代次写入任务。
 6. 提交后发送完整成功响应或完成事件。
 
-各阶段使用独立短 Session。共享外部调用仅传递已序列化的数据及业务 ID。数据库异常提交失败时整段回滚，随后在可用的短事务中记录失败。进程崩溃遗留状态由租约恢复器收敛。
+各阶段使用独立短 Session。共享外部调用仅传递已序列化的数据及业务 ID。数据库异常提交失败时整段回滚，随后在可用的短事务中记录失败。进程崩溃遗留状态由新请求租约接管或 Worker 租约恢复器收敛。
 
-租约通过 PostgreSQL 条件更新领取，包含有效期及唯一所有权令牌。续期、终态写入和释放同时检查令牌和有效期。租约失效后将原 `running` 回合标为 `failed`，使用稳定原因 `generation_lease_lost`，旧进程后续输出被隔离。
+租约通过 PostgreSQL 条件更新领取，包含有效期及唯一所有权令牌。同一会话中，若存在未过期的 `running` 回合则返回 `409 conversation_generation_conflict`；若已有 `running` 回合租约已过期（`lease_expires_at <= now()`），新请求在领取事务内直接将其条件收敛为 `failed`（原因 `generation_lease_lost`）并接管租约，不依赖 Worker 存活。Worker 恢复器作为无后续新请求时的兜底收敛机制。续期、终态写入和释放同时检查令牌、有效期、用户和会话有效状态，旧进程后续输出被隔离。
 
 `running` 只能条件转换为 `succeeded`、`failed` 或 `cancelled`。超时使用 `generation_timeout`，模型错误使用 `model_upstream_error`，客户端取消使用 `generation_cancelled`。已提交成功优先于之后到达的断连通知。失败及取消的用户消息留在历史，后续 Prompt 仅纳入此前 `succeeded` 回合和当前输入。
 
@@ -471,22 +473,23 @@ async def create_agent(data, owner_id, session_factory):
 
 | 表或视图 | 核心字段与约束 |
 | --- | --- |
-| `users` | `id`、`status`、删除时间，状态含 `active`、`disabled`、`deleting` |
-| `user_identities` | `issuer`、`subject`、`user_id`，签发方与主体组合唯一 |
-| `agents` | `owner_id`、状态、草稿与当前发布版本引用，条件更新保护并发发布及停用 |
-| `persona_versions` | `agent_id`、`version`、内容、发布状态，`(agent_id, version)` 唯一，已发布内容不可变 |
-| `conversations` | 拥有者、Agent、固定版本、状态和消息序号，按用户和创建顺序索引 |
+| `users` | `id`、`status`、删除时间，状态含 `active`、`disabled`、`deleting`；全部清理确认完成后物理移除业务记录，脱敏操作与回执保留至有效期 |
+| `user_identities` | `issuer`、`subject`、`user_id`，签发方与主体组合唯一；用户 `deleting` 期间保留绑定以拒绝访问，直至本地与远程清理全部确认完成后才删除 |
+| `agents` | `owner_id`、状态（`active`/`retired`）、唯一草稿字段集合（`draft_*`）与 `current_published_version_id`，条件更新保护并发发布及停用 |
+| `persona_versions` | `agent_id`、`version`、不可变人设快照（含 `system_prompt`、`behavior_rules`、`tone`、`language`、`default_model_id`、`memory_policy`）与 `published_at`，`(agent_id, version)` 唯一，仅保存不可变发布快照 |
+| `conversations` | 拥有者、Agent、固定版本引用（使用逻辑引用或可独立演进的快照标识，不阻断未来人设拆分）、状态（`active`/`deleting`）和消息序号，按用户和创建顺序索引 |
 | `messages` | `conversation_id`、`generation_id`、角色、内容、`sequence`，会话内序号唯一 |
 | `generations` | 用户消息、完整回复 ID、实际模型、人设版本、记忆代次、状态、错误码、用量、租约令牌和期限 |
 | `idempotency_records` | 用户、方法、规范路由、键、摘要、生成引用、终态和过期时间，范围组合唯一 |
 | `message_recalled_memories` | 用户消息、提供方、记忆 ID、范围、相关度、位置、代次及删除标记 |
-| `model_configs` | 注册 ID、提供方、能力、启用状态、凭据引用 |
+| `model_configs` | 注册 ID、提供方、能力、启用状态、凭据引用；由服务端受控配置在启动或显式同步命令中幂等写入 |
 | `jobs` | 类型、业务 ID、去重键、状态、尝试计数、租约、执行时点和最后错误 |
 | `job_attempts` | 任务 ID、执行时段和脱敏结果摘要，默认保留 30 天 |
 | `memory_jobs` 只读视图 | 从 `jobs` 筛选记忆写入类型，提供领域查询 |
 | `operations` | 拥有者或清理主体、操作类型、状态、分阶段进度、回执摘要和有效期 |
-| `memory_scopes` | `(user_id, provider_id)` 唯一、当前代次、屏障及对应操作 |
-| `memory_tombstones` | 提供方、用户、记忆 ID 或清理范围、操作关联和核验状态 |
+| `memory_scopes` | `(user_id, provider_id)` 唯一、当前代次、`barrier_state`（`idle`/`clearing`/`reconciling`）、屏障操作引用及更新时间 |
+| `memory_tombstones` | 提供方、用户、记忆 ID 或清理范围、操作关联和核验状态（`pending`/`reconciling`/`verified`） |
+| `memory_list_snapshots` | 用户、提供方、筛选条件摘要、有序快照条目及 `expires_at`；供无 Redis 多副本部署下不支持稳定游标的供应商适配器使用，由 `retention` 定期清理 |
 
 生成状态有 CHECK 约束。每个生成的用户消息唯一，完整 Assistant 回复至多一条。租约更新与状态机共享条件约束，防止重复成功和过期执行者提交。会话消息序号在短事务内分配，列表使用 `(created_at, id)` 稳定排序。幂等和任务去重由数据库唯一性兜底。
 
@@ -521,19 +524,23 @@ Alembic 使用同步 psycopg 引擎，运行时使用异步引擎。`migrations/
 | GET | `/v1/conversations/{conversationId}/messages` | 自己的有序消息与生成状态 |
 | GET | `/v1/conversations/{conversationId}/generations/{generationId}` | 生成终态及已提交结果 |
 | DELETE | `/v1/conversations/{conversationId}` | 删除会话并查询清理进度 |
-| POST、GET | `/v1/agents` | 创建、列出私有 Agent |
-| GET、PATCH、DELETE | `/v1/agents/{agentId}` | 查询、编辑和停用 Agent |
-| POST | `/v1/agents/{agentId}/versions`、`/v1/agents/{agentId}/publish` | 创建版本及发布 |
-| GET、POST | `/v1/memories` | 查看及同步显式创建自己的记忆 |
+| POST、GET | `/v1/agents` | 创建（保存初始草稿）、列出私有 Agent |
+| GET、PATCH、DELETE | `/v1/agents/{agentId}` | 查询、更新 `agents` 草稿（不影响已发布版本）和停用 Agent（幂等） |
+| POST | `/v1/agents/{agentId}/versions`、`/v1/agents/{agentId}/publish` | `/versions` 基于当前草稿生成新不可变版本快照（不切换当前发布引用）；`/publish` 发布指定版本（或当前草稿生成并发布）并原子更新 `current_published_version_id` |
+| GET、POST | `/v1/memories` | 查看及显式创建自己的记忆（默认 `scope="user"`，可选 `scope="conversation"` 并校验 `conversationId`） |
 | DELETE | `/v1/memories/{memoryId}`、`/v1/memories?confirm=true` | 单条删除及明确确认清空 |
-| GET | `/v1/operations/{operationId}` | 查询删除操作进度 |
+| GET | `/v1/operations/{operationId}` | 查询删除或异步记忆操作进度 |
 | GET | `/v1/models` | 可用已注册模型及能力 |
 
 请求 Schema 采用 `extra="forbid"`，更新以 `exclude_unset=True` 区分缺省和空值。资源分别定义创建、更新、详情和列表模型，响应只公开必要字段。ORM 转换使用 `from_attributes=True`，依赖使用 `Annotated` 与 `Depends`。
 
+当旧会话固定人设快照引用的 `defaultModelId` 已被服务端停用时，若请求未携带 `modelId` 则在上游调用前返回 `409 model_unavailable`（或对应稳定配置错误码），不执行自动模型故障转移；若服务端策略允许请求指定模型，调用方可显式传入其他已启用 `modelId` 继续该会话。
+
 ### 8.2 成功响应和分页
 
-创建资源使用 `201`，聊天结果使用 `200`，已确认完成的删除使用 `204`。异步或待核验删除使用 `202`，返回 `operationId`、`status`、`statusUrl` 并设置 `Location`。用户删除额外返回一次性明文 `deletionReceipt` 及有效期，服务端持久化摘要。
+创建资源使用 `201`，聊天结果使用 `200`，已确认完成的删除使用 `204`。异步或待核验删除使用 `202`，返回 `operationId`、`status`、`statusUrl` 并设置 `Location`。显式创建记忆（`POST /v1/memories`）在提供方同步确认并返回稳定单条 ID 时返回 `201`；若底层提供方（如异步抽取型适配器）仅返回受理或批次状态而尚未产生单条稳定 ID，返回 `202`、`operationId`、`status`、`statusUrl` 及 `Location`，由统一 `operations` 追踪核验结果。用户删除额外返回一次性明文 `deletionReceipt` 及有效期，服务端持久化摘要。
+
+会话进入 `deleting` 状态后，从会话列表过滤隐藏；详情、消息历史和生成查询统一返回 `404`（与跨用户及已删除资源一致），针对该会话的续聊或新写入返回 `409 conversation_deleting`，删除进度仅通过 `GET /v1/operations/{operationId}` 查询。
 
 Agent、记忆、会话和消息列表统一如下。
 
@@ -547,7 +554,7 @@ Agent、记忆、会话和消息列表统一如下。
 
 参数为 `limit` 和 `cursor`，默认 20 条，上限 100 条。按 `(created_at, id)` 排序，消息使用升序，其他列表使用降序。游标封装排序键、筛选条件与方向并进行校验，资源归属在每次查询时重新验证。游标模式保证相同时间值顺序稳定，分页期间新写入可以通过刷新列表获取。
 
-记忆适配器输出同样的分页语义。实施前以受控及实际供应商响应验证稳定 ID、时间字段、排序和分页能力，必要时在适配器内部维护有界分页快照。快照游标绑定用户、筛选条件和有效期，过期返回 `422 cursor_expired`。
+记忆适配器输出同样的分页语义。实施前以受控及实际供应商响应验证稳定 ID、时间字段、排序和分页能力；对仅支持页码分页的供应商（如 MemOS `getMemory`），适配器将有界分页快照持久化到 PostgreSQL 的 `memory_list_snapshots` 表（严禁仅存 API 进程内存，以支持多副本负载均衡）。快照游标绑定用户、筛选条件和有效期，过期返回 `422 cursor_expired`。
 
 同步聊天成功包含 `conversationId`、`generationId`、`messageId`、完整 `message`、`modelId` 和 `usage`。重复运行中的请求返回 `202`、原标识、`statusUrl` 与 `Location`。生成查询成功读取时统一 `200`，包含 `status`、关联标识、成功结果或已保存错误对象。使用原幂等键恢复失败及取消结果时复用原 HTTP 错误类别，并在 `error.details` 提供生成标识和终态。`cancelled` 的重试响应使用 `409 generation_cancelled`。
 
@@ -603,7 +610,9 @@ V1 增量事件仅当前连接发送，事件 ID用于连接内排序与诊断�
 
 凭证适配器验证签名、时效、受众和签发方等部署协议要求，输出可信主体。用户解析层按已验证 `(issuer, subject)` 查找或创建稳定本地用户，统一提供 `AuthenticationContext(actor_id, user_id, auth_method, permissions)`。
 
-业务资源查询包含拥有者条件。用户状态在入口、生成完成事务及后台任务执行前复查，停用和删除状态立即阻止业务访问。多进程实例通过 PostgreSQL 用户状态获取统一结果。
+业务资源查询包含拥有者条件。用户状态在入口、生成完成事务及后台任务执行前复查，停用（`disabled`）和删除中（`deleting`）状态立即阻止业务访问（`403`）。多进程实例通过 PostgreSQL 用户状态获取统一结果。
+
+用户删除期间保持 `user_identities` 绑定，使同一外部主体未过期的凭证持续命中 `deleting` 状态并被 `403` 拒绝，杜绝本地清理完成前触发静默重建。直到本地数据与远程记忆清理全部确认完成后，最终阶段再删除 `user_identities` 与 `users` 业务记录（仅保留脱敏操作与回执摘要至有效期届满）；彻底删除完成后，同一外部 `(issuer, subject)` 再次访问将创建全新的本地 `user_id`。
 
 ### 9.2 开发与生产装配
 
@@ -628,10 +637,10 @@ V1 认证实现止于上述接缝及部署配置。内置注册、登录、刷�
 | 认证 | 适配器类型、可信签发方与受众、验证材料、网关及代理来源 |
 | 安全 | CORS、Host 白名单、请求体上限、进程并发和可信请求 ID 处理 |
 | 对话 | 输入及上下文预算、生成期限、流时长、心跳间隔、租约期限和续期间隔 |
-| 提供方 | 模型注册、凭据引用、HTTP 超时、并发和取消能力 |
+| 提供方 | 模型注册同步配置（支持启动同步或显式 CLI 同步）、凭据引用、HTTP 超时、并发、取消及记忆在途上限收敛窗口 `memory_inflight_settle_timeout` |
 | Worker | 并发、轮询、租约、重试上限、退避与抖动、周期清理批次 |
-| 保留 | 会话和生成默认长期、任务执行日志 30 天、终态幂等 24 小时、回执期限 |
-| 观测 | 指标端点访问、追踪导出和失败告警配置 |
+| 保留 | 会话和生成默认长期、任务执行日志 30 天、终态幂等 24 小时、分页快照 TTL、回执期限 |
+| 观测与恢复 | 指标端点访问、追踪导出、失败告警配置，以及可选的独立删除审计归档目标（如对象存储或独立只追加审计卷） |
 
 数据库 URL 使用 `URL.create()`，驱动 `postgresql+psycopg`。容器地址为 `postgres:5432`，宿主机使用现有映射端口。密钥来自部署环境或密钥管理服务，日志过滤 Token、消息正文及供应商密钥。租约期限应覆盖续期和调度抖动，生成、流和 HTTP 调用超时相互协调。
 
@@ -649,27 +658,70 @@ V1 认证实现止于上述接缝及部署配置。内置注册、登录、刷�
 
 ### 11.2 外部副作用
 
-提供方调用采用明确的连接、读取和总体期限。稳定任务 ID 作为上游幂等标识，适配器记录外部关联标识，重复执行前核验既有结果。外部请求已发送而响应丢失时进入 `reconciling`，根据供应商支持的状态查询、幂等响应或有界核验决定结果。能力不足时保持待确认并发出人工处置告警。
+提供方调用采用明确的连接、读取和总体期限。稳定任务 ID 作为上游幂等标识或元数据关联标识（例如 MemOS 通过 `info.biz_id` 与 `tags` 编码写入标识、范围 `scope`、会话 ID 与 `memory_epoch`），适配器记录外部关联信息，重复执行前核验既有结果。外部请求已发送而响应丢失时进入 `reconciling`，根据供应商支持的状态查询（如 `get/status`）、幂等响应或有界核验决定结果。
 
-显式创建在 `jobs` 中登记 `memory_explicit_create` 类型，保存稳定写入标识、当前记忆代次和外部关联信息，由请求路径领取并同步执行。结果未知时转 `reconciling`，Worker 核验原调用。04 先建立这部分最小持久记录，09 扩展共享领取和执行框架。
+显式创建在 `jobs` 中登记 `memory_explicit_create` 类型，保存稳定写入标识、当前记忆代次、目标范围和外部关联信息，由请求路径领取并同步执行。若提供方同步确认并返回稳定单条 ID 则返回 `201`；若提供方仅受理异步抽取或未立即返回单条 ID，则返回 `202` 与 `operationId` 由 Worker 追踪核验；超时未知结果转 `reconciling` 由 Worker 核验原调用。04 实施前须先完成对 MemOS Cloud 真实接口的最小能力验证（同步模式响应、状态查询、`tags`/`info` 过滤、删除收敛延迟），将结论记录于 04 的完成记录。
 
 调用前的在途登记与清空提升代次在同一 `memory_scopes` 行上以短事务串行，检查用户、会话、当前代次与屏障后才将写入标记为已发起。外部调用在提交登记后执行，因此清空能枚举全部旧代次在途写入。结果确认后再次检查状态，若清空已开始则等待核验与最终远程清理收敛。
 
 ### 11.3 删除操作和代次屏障
 
-删除操作状态为 `pending`、`running`、`reconciling`、`succeeded` 或 `failed`，状态查询统一 `200`，返回操作 ID、类型、分阶段进度、终态及脱敏错误。已确认的操作终态通过条件更新保护，重复删除关联同一活动操作。
+删除操作状态为 `pending`、`running`、`reconciling`、`succeeded` 或 `failed`，状态查询统一 `200`，返回操作 ID、类型、分阶段进度、终态及脱敏错误。已确认的操作终态通过条件更新保护，重复删除关联同一活动操作。删除操作与 `memory_scopes` 代次变更同步支持通过独立删除审计归档接缝导出（见第 12.4 节）。
 
 单条删除先建立 `operations` 与记忆 tombstone，随后执行或入队外部删除。召回过滤本地待删除标记，历史引用记录删除状态。已确认完成返回 `204`，异步执行或结果未知返回 `202` 及查询地址，确定失败通过稳定应用错误表达。
 
-清空先在短事务锁定用户与提供方范围，增加 `epoch`、建立屏障、取消旧代次排队任务。召回降级为空记忆，显式创建返回 `409 memory_scope_clearing`，新普通记忆任务在屏障期间跳过入队。旧生成捕获旧代次，最终提交时抑制其任务。
+清空先在短事务锁定用户与提供方范围，增加 `epoch`、将 `barrier_state` 置为 `clearing`、取消旧代次排队任务。屏障期间召回降级为空记忆，显式创建返回 `409 memory_scope_clearing`，新普通记忆任务跳过入队。旧生成捕获旧代次，最终提交时抑制其任务。
 
-清理处理器核验所有在途旧写入和迟到请求，待其结果稳定后执行最终远程清空，确认完成再解除屏障。结果未知时保持暂停与告警。已发出的上游副作用由核验和最终清空收敛，本地租约负责状态写入隔离。
+清理处理器核验所有在途旧写入和迟到请求：
+- 若提供方具备单次写入精确状态查询或幂等核验能力，待所有旧在途写入状态稳定后执行最终远程清空，确认完成再解除屏障。
+- 若提供方不具备单次写入状态查询能力（或异步抽取延迟无法精确查询），避免单次网络超时永久锁死该用户记忆：在途写入等待其正常结束或达到可配置的上限收敛窗口（`memory_inflight_settle_timeout`）后，保留该任务的 `reconciling` 审计告警，执行最终远程清空，并按配置窗口执行一次延迟二次补偿清空；确认清空后解除屏障。若最终远程清空本身失败或结果未知，则屏障保持 `reconciling` 并持续告警。
 
-会话删除立即阻止续聊，按会话清理应用数据及会话记忆。用户删除立即停用，清理全部关联资源及用户记忆。两类删除持续检查在途生成和外部写入，全部结果确认后才完成操作。原用户外键清理后仍保留最小操作主体和远程映射供任务使用。
+会话删除立即将状态置为 `deleting` 阻止续聊（续聊返回 `409 conversation_deleting`，详情/消息/生成查询返回 `404`），后台清理消息、引用、生成、相关幂等及该会话范围的记忆。若记忆提供方不支持按会话批量删除（如 MemOS `deleteMemory` 仅支持按 `user_id` 或 `memory_ids`），适配器按该会话已知引用及分页筛选出的目标 `memory_ids` 分批删除，并在召回侧叠加会话 `deleting` 状态与 `memory_tombstones` 兜底隔离。用户级记忆保留。
+
+用户删除立即将用户置为 `deleting`（所有普通业务凭证返回 `403`），保持 `user_identities` 绑定以阻止删除期间静默重建新用户，随后分批清理 Agent、人设版本、会话、消息、引用、生成、幂等数据及全部用户与会话记忆；待本地与远程清理全部确认完成后，最终阶段移除 `user_identities` 与用户业务记录，仅保留最小脱敏操作摘要和回执至有效期届满。
+
+两类删除在清理关联表前遇到仍在有效期内的活跃生成租约时：由于用户或会话已置为 `deleting`，在途生成的续期与最终提交都会在复查状态时立即失败收敛；若旧执行者已失联，清理任务等待其租约自然过期并先按 `generation_lease_lost` 接管收敛，再推进数据清理与最终远程清空。
+
+#### 11.3.1 删除与屏障状态机及清空时序
+
+核心状态转换约定如下（供 13–15 切片共同遵守）：
+
+| 实体 | 允许状态 | 合法转换与触发条件 |
+| --- | --- | --- |
+| `memory_scopes.barrier_state` | `idle`、`clearing`、`reconciling` | `idle -> clearing`（清空锁行并递增 `epoch`）；`clearing -> reconciling`（存在未知外部结果或最终清空待核验）；`clearing/reconciling -> idle`（旧写入收敛或超上限窗口补偿清空确认完成） |
+| `operations.status` | `pending`、`running`、`reconciling`、`succeeded`、`failed` | `pending -> running`（Worker 领取或请求路径执行）；`running -> reconciling`（外部结果未知或等待二次补偿）；`running/reconciling -> succeeded`（本地与远程阶段均确认完成）；`pending/running/reconciling -> failed`（确定性不可恢复失败） |
+| `memory_tombstones.status` | `pending`、`reconciling`、`verified` | `pending -> verified`（远程删除确认完成）；`pending -> reconciling`（远程删除响应丢失/延迟收敛）；`reconciling -> verified`（核验确认已不可召回/已删除）；所有非删除前状态均立即参与召回过滤 |
+
+清空与在途旧写入的竞争收敛时序如下：
+
+```mermaid
+sequenceDiagram
+    participant C as Client / API
+    participant DB as PostgreSQL (memory_scopes / jobs / operations)
+    participant W as Worker (清理处理器)
+    participant P as MemoryProvider (如 MemOS)
+
+    Note over DB: 既有普通写入或显式创建在途（epoch = N）
+    C->>DB: DELETE /v1/memories?confirm=true（锁 memory_scopes 行）
+    DB-->>C: epoch 递增为 N+1，barrier_state=clearing，取消 epoch<=N 排队任务，返回 202 + operationId
+    Note over C,DB: 屏障期间：召回降级为空，显式创建 409，旧生成提交抑制旧代次任务
+    W->>DB: 领取清空任务，枚举 epoch<=N 的在途写入
+    alt 提供方可核验单次写入状态
+        W->>P: 核验在途写入状态直至稳定
+    else 提供方无单次查询能力
+        W->>DB: 等待在途写入完成或达到 memory_inflight_settle_timeout，保留 reconciling 告警
+    end
+    W->>P: 执行最终远程全量清空（必要时延迟二次补偿清空）
+    alt 远程清空确认完成
+        W->>DB: barrier_state=idle，operation=succeeded
+    else 远程清空结果未知
+        W->>DB: barrier_state=reconciling，operation=reconciling，触发告警并重试核验
+    end
+```
 
 ### 11.4 保留清理
 
-任务按配置和游标有限批次扫描。会话与生成默认长期，执行日志保留 30 天，幂等终态保留 24 小时，历史记忆引用随父会话。清理保留活跃工作、待确认操作、必要映射和提供方去重记录，重试和多 Worker 执行具有幂等效果。显式用户及会话删除优先执行。
+任务按配置和游标有限批次扫描。会话与生成默认长期，执行日志保留 30 天，幂等终态保留 24 小时，分页快照（`memory_list_snapshots`）按配置短期过期清理，历史记忆引用随父会话。清理保留活跃工作、待确认操作、必要映射和提供方去重记录，重试和多 Worker 执行具有幂等效果。显式用户及会话删除优先执行。
 
 ## 12. 日志、健康检查和部署
 
@@ -695,7 +747,10 @@ API 与 Worker 独立启动、扩缩和优雅关闭。启动前由单个发布�
 
 最小生产验收包括密钥注入及轮换、TLS 与代理配置、限流和资源预算、迁移前备份、备份可读性及恢复演练、前向修复、兼容性应用回滚、任务失败核验和删除屏障告警。
 
-数据库恢复需记录选定时间点和 RPO/RTO。恢复备份后暂停写入和 Worker，重新应用后续删除与代次屏障，核验外部副作用及任务去重，再恢复服务。删除记录必须有覆盖备份恢复窗口的可恢复副本，避免恢复旧数据后重新生成已删除记忆。
+数据库恢复需记录选定时间点和 RPO/RTO。为兑现“恢复备份后不复活已删除记忆”的一致性边界，系统采用分层恢复机制：
+
+1. **启用独立删除审计归档（推荐生产配置）**：`operations` 删除受理与 `memory_scopes` 代次递增通过独立删除审计归档接缝同步/可靠导出至主库备份之外的持久化载体（如对象存储只追加 JSONL 或独立审计卷，保留期覆盖备份恢复窗口）。恢复主库备份后暂停写入和 Worker，通过恢复工具重放该时间点之后的删除与代次记录，核验外部副作用及任务去重，再恢复服务。
+2. **仅使用 PostgreSQL PITR（最小部署基线）**：若未配置外部独立归档，则以 PostgreSQL WAL 归档时间点恢复作为恢复手段，运行手册必须显式标注 WAL 归档丢失场景下的 RPO 与删除一致性边界，不假定主库内部表可跨回滚留存。
 
 ## 13. 测试和 CI
 
@@ -728,7 +783,7 @@ API 与 Worker 独立启动、扩缩和优雅关闭。启动前由单个发布�
 
 ### 13.4 架构检查的交付顺序
 
-当前阶段先通过 `python3 tools/check_architecture.py` 执行工程目录、功能索引、文档链接、重复字面量路由和源码文件规模检查。源码落地后将同一逻辑接入 `tests/architecture/` 与公共行为测试，补充静态导入分析、跨模块 Repository/ORM 访问限制和装配例外。按照实际落地的模块维护允许依赖及基础设施例外，检查新增文件和模块内部深层导入。
+当前阶段先通过 `python3 tools/check_architecture.py` 执行工程目录、功能索引、文档链接、重复字面量路由（已支持结合 `APIRouter(prefix=...)` 拼接路径判重）和源码文件规模检查。源码落地后将同一逻辑接入 `tests/architecture/` 与公共行为测试，补充静态导入分析、跨模块 Repository/ORM 访问限制和装配例外。按照实际落地的模块维护允许依赖及基础设施例外，检查新增文件和模块内部深层导入。
 
 | 切片 | 增量检查 |
 | --- | --- |
