@@ -17,6 +17,7 @@ class MemoryPolicy(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     enabled: bool = True
+    write_enabled: bool = True
     write_scope: MemoryWriteScope = "user"
     recall_limit: int = Field(default=5, ge=0, le=50)
 

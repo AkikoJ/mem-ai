@@ -26,6 +26,7 @@ from mem_ai.modules.auth.adapters import (
     StaticTokenAuthAdapter,
     build_credential_verifier,
 )
+from mem_ai.modules.personas.provider import LocalPersonaProvider
 
 _OFFLINE_DOCS_STATIC_DIR = Path(fastapi_offline.__file__).resolve().parent / "static"
 _OFFLINE_DOCS_STATIC_PREFIX = "/static/docs"
@@ -93,6 +94,16 @@ def create_app(
         app.state.db_engine = db_engine
         app.state.session_factory = session_factory
         app.state.http_client = http_client
+
+        base_providers = providers if providers is not None else ProviderRegistry()
+        if base_providers.persona_provider is None:
+            app.state.providers = ProviderRegistry(
+                model_provider=base_providers.model_provider,
+                memory_provider=base_providers.memory_provider,
+                persona_provider=LocalPersonaProvider(session_factory=session_factory),
+            )
+        else:
+            app.state.providers = base_providers
 
         try:
             yield

@@ -7,7 +7,23 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import DateTime, MetaData, func
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+_PG_UNIQUE_VIOLATION_SQLSTATE = "23505"
+
+
+def is_unique_violation(exc: IntegrityError, *, constraint_name: str) -> bool:
+    """Check whether `exc` is a PostgreSQL unique violation on `constraint_name`."""
+    orig = exc.orig
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    if sqlstate == _PG_UNIQUE_VIOLATION_SQLSTATE:
+        diag = getattr(orig, "diag", None)
+        constraint = getattr(diag, "constraint_name", None) if diag is not None else None
+        if constraint is None or constraint == constraint_name:
+            return True
+    return constraint_name in str(exc)
+
 
 NAMING_CONVENTION: dict[str, str] = {
     "ix": "ix_%(table_name)s_%(column_0_N_name)s",

@@ -9,22 +9,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mem_ai.core.exceptions import ConflictError, ForbiddenError, NotFoundError
+from mem_ai.db.base import is_unique_violation
 from mem_ai.modules.users import repository
 from mem_ai.modules.users.models import USER_IDENTITY_UNIQUE_CONSTRAINT
 from mem_ai.modules.users.schemas import UserRecord, UserStatus
-
-_PG_UNIQUE_VIOLATION_SQLSTATE = "23505"
-
-
-def _is_identity_unique_violation(exc: IntegrityError) -> bool:
-    orig = exc.orig
-    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
-    if sqlstate == _PG_UNIQUE_VIOLATION_SQLSTATE:
-        diag = getattr(orig, "diag", None)
-        constraint = getattr(diag, "constraint_name", None) if diag is not None else None
-        if constraint is None or constraint == USER_IDENTITY_UNIQUE_CONSTRAINT:
-            return True
-    return USER_IDENTITY_UNIQUE_CONSTRAINT in str(exc)
 
 
 def assert_user_active(user: UserRecord) -> UserRecord:
@@ -88,7 +76,7 @@ async def resolve_or_create_user(
                 )
             return UserRecord.model_validate(created)
         except IntegrityError as exc:
-            if not _is_identity_unique_violation(exc):
+            if not is_unique_violation(exc, constraint_name=USER_IDENTITY_UNIQUE_CONSTRAINT):
                 raise
             conflict_exc = exc
 
