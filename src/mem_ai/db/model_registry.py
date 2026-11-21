@@ -9,4 +9,6 @@ def load_all_models() -> None:
     Subsequent feature slices add explicit imports of their `modules.<name>.models`
     modules here so `alembic check` and autogenerate always see the full schema.
     """
-    return None
+    import mem_ai.modules.users.models as _users_models
+
+    _ = _users_models

@@ -1,0 +1,151 @@
+"""Public use cases and shared user status policy owned by the `users` module."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from uuid import UUID
+
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from mem_ai.core.exceptions import ConflictError, ForbiddenError, NotFoundError
+from mem_ai.modules.users import repository
+from mem_ai.modules.users.models import USER_IDENTITY_UNIQUE_CONSTRAINT
+from mem_ai.modules.users.schemas import UserRecord, UserStatus
+
+_PG_UNIQUE_VIOLATION_SQLSTATE = "23505"
+
+
+def _is_identity_unique_violation(exc: IntegrityError) -> bool:
+    orig = exc.orig
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    if sqlstate == _PG_UNIQUE_VIOLATION_SQLSTATE:
+        diag = getattr(orig, "diag", None)
+        constraint = getattr(diag, "constraint_name", None) if diag is not None else None
+        if constraint is None or constraint == USER_IDENTITY_UNIQUE_CONSTRAINT:
+            return True
+    return USER_IDENTITY_UNIQUE_CONSTRAINT in str(exc)
+
+
+def assert_user_active(user: UserRecord) -> UserRecord:
+    """Enforce the canonical user status rule shared by auth, commits, and background workers."""
+    if user.status == "disabled":
+        raise ForbiddenError(
+            code="user_disabled",
+            message="user is disabled",
+        )
+    if user.status == "deleting":
+        raise ForbiddenError(
+            code="user_deleting",
+            message="user is being deleted",
+        )
+    return user
+
+
+async def ensure_user_active_in_session(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+) -> UserRecord:
+    """Verify inside an existing transaction that a user still exists and is active."""
+    user = await repository.get_user_by_id(session, user_id=user_id)
+    if user is None:
+        raise ForbiddenError(
+            code="user_not_active",
+            message="user is not active",
+        )
+    return assert_user_active(UserRecord.model_validate(user))
+
+
+async def resolve_or_create_user(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    issuer: str,
+    subject: str,
+) -> UserRecord:
+    """Map a verified `(issuer, subject)` to a stable local user, safe under concurrent races."""
+    normalized_issuer = issuer.strip()
+    normalized_subject = subject.strip()
+    if not normalized_issuer or not normalized_subject:
+        raise ValueError("issuer and subject must be non-empty")
+
+    async with session_factory.begin() as session:
+        existing = await repository.get_user_by_identity(
+            session,
+            issuer=normalized_issuer,
+            subject=normalized_subject,
+        )
+        if existing is not None:
+            return UserRecord.model_validate(existing)
+
+        conflict_exc: IntegrityError | None = None
+        try:
+            async with session.begin_nested():
+                created = await repository.create_user_with_identity(
+                    session,
+                    issuer=normalized_issuer,
+                    subject=normalized_subject,
+                )
+            return UserRecord.model_validate(created)
+        except IntegrityError as exc:
+            if not _is_identity_unique_violation(exc):
+                raise
+            conflict_exc = exc
+
+        # Concurrent first-request winner committed the mapping; savepoint rolled back our insert.
+        winner = await repository.get_user_by_identity(
+            session,
+            issuer=normalized_issuer,
+            subject=normalized_subject,
+        )
+        if winner is None:
+            raise ConflictError(
+                code="user_identity_conflict",
+                message="concurrent user identity resolution conflict",
+            ) from conflict_exc
+        return UserRecord.model_validate(winner)
+
+
+async def resolve_active_user(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    issuer: str,
+    subject: str,
+) -> UserRecord:
+    """Resolve `(issuer, subject)` to a local user and reject disabled or deleting users."""
+    user = await resolve_or_create_user(
+        session_factory,
+        issuer=issuer,
+        subject=subject,
+    )
+    return assert_user_active(user)
+
+
+async def get_active_user(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    user_id: UUID,
+) -> UserRecord:
+    """Load a local user in a short read session and verify active status."""
+    async with session_factory() as session:
+        return await ensure_user_active_in_session(session, user_id=user_id)
+
+
+async def set_user_status(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    user_id: UUID,
+    status: UserStatus,
+    deleted_at: datetime | None = None,
+) -> UserRecord:
+    """Transition a local user's lifecycle status in a short transaction."""
+    async with session_factory.begin() as session:
+        updated = await repository.update_user_status(
+            session,
+            user_id=user_id,
+            status=status,
+            deleted_at=deleted_at,
+        )
+        if updated is None:
+            raise NotFoundError(code="user_not_found", message="user not found")
+        return UserRecord.model_validate(updated)

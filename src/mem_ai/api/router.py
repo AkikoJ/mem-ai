@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from mem_ai.modules.health.router import router as health_router
+from mem_ai.modules.users.router import router as users_router
 
 
 def build_api_router() -> APIRouter:
@@ -13,5 +14,6 @@ def build_api_router() -> APIRouter:
     root_router.include_router(health_router)
 
     v1_router = APIRouter(prefix="/v1")
+    v1_router.include_router(users_router)
     root_router.include_router(v1_router)
     return root_router

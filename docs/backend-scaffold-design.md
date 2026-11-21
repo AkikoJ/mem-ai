@@ -165,8 +165,9 @@ Service
 | `compose.yaml`、`.env.example`、`Makefile`、`pyproject.toml`、`uv.lock`、`.python-version`、`alembic.ini` | 已落地 | 本地依赖（支持 `POSTGRES_DATA_DIR` 自定义数据卷路径）、配置模板、快捷命令、锁定依赖与迁移配置 |
 | `migrations/`、`.github/workflows/checks.yml` | 已落地 | Alembic 同步迁移基线与最小 CI 检查流水线 |
 | `src/mem_ai/main.py`、`src/mem_ai/application.py`、`src/mem_ai/core/config.py`、`src/mem_ai/core/logging.py`、`src/mem_ai/core/exceptions.py`、`src/mem_ai/core/exception_handlers.py`、`src/mem_ai/api/`、`src/mem_ai/db/`、`src/mem_ai/contracts/`、`src/mem_ai/integrations/`、`src/mem_ai/modules/health/` | 已落地 | 01 基础脚手架、应用装配、提供方协议、公共分页、错误处理与健康检查 |
-| `tests/conftest.py`、`tests/unit/`、`tests/api/`、`tests/integration/`、`tests/architecture/` | 已落地（持续扩展） | 01 基础测试 fixture、单元、API、PostgreSQL/迁移与架构测试 |
-| `src/mem_ai/core/limits.py`、`src/mem_ai/core/telemetry.py`、`src/mem_ai/modules/`（业务模块）与 `src/mem_ai/workers/` | 按切片落地 | 先检查实际文件，再沿功能定位索引进入 |
+| `src/mem_ai/modules/auth/`、`src/mem_ai/modules/users/models.py`、`src/mem_ai/modules/users/schemas.py`、`src/mem_ai/modules/users/repository.py`、`src/mem_ai/modules/users/service.py`、`src/mem_ai/modules/users/router.py` | 已落地 | 02 认证上下文、可替换凭证验证适配器、伪造身份头清理、`users`/`user_identities` 主体映射与 `GET /v1/users/me` |
+| `tests/conftest.py`、`tests/unit/`、`tests/api/`、`tests/integration/`、`tests/architecture/` | 已落地（持续扩展） | 01–02 测试 fixture、单元、API、PostgreSQL/迁移与架构测试 |
+| `src/mem_ai/core/limits.py`、`src/mem_ai/core/telemetry.py`、`src/mem_ai/modules/users/cleanup.py`、其余业务模块与 `src/mem_ai/workers/` | 按切片落地 | 先检查实际文件，再沿功能定位索引进入 |
 
 ### 3.0.2 功能定位索引
 
@@ -175,7 +176,7 @@ Service
 | 业务能力 | 主负责人 | 协作路径 | 首要查找路径 | 相关验证位置 | 相关 ticket |
 | --- | --- | --- | --- | --- | --- |
 | 应用装配、配置、错误和健康检查 | `application` | `core/`、`modules/health/` | `src/mem_ai/application.py`、`src/mem_ai/core/`、`src/mem_ai/modules/health/service.py`、`src/mem_ai/modules/health/router.py` | `tests/architecture/`、`tests/api/` | 01、17、18 |
-| 认证上下文和用户状态 | `auth` | `users/` | `src/mem_ai/modules/auth/`、`src/mem_ai/modules/users/` | `tests/api/`、`tests/integration/` | 02、15 |
+| 认证上下文和用户状态 | `auth` | `users/` | `src/mem_ai/modules/auth/`、`src/mem_ai/modules/users/` | `tests/unit/`、`tests/api/`、`tests/integration/` | 02、15 |
 | Agent 与人设版本生命周期 | `agents` | `personas/provider.py` | `src/mem_ai/modules/agents/` | `tests/api/`、`tests/integration/` | 03、11 |
 | 同步与流式生成编排 | `conversations` | `models/`、`memories/`、`jobs/` | `src/mem_ai/modules/conversations/service.py`、`generation.py`、`stream.py` | `tests/api/`、`tests/integration/` | 05、07、08、10、12 |
 | 模型注册、选择和提供方调用 | `models` | `contracts/model_provider.py`、`models/adapters/` | `src/mem_ai/modules/models/`、`src/mem_ai/contracts/model_provider.py` | `tests/integration/` | 05、06、12 |
@@ -189,7 +190,7 @@ Service
 
 目录树如下。
 
-下列目录是目标工程结构。设计文档、设计评审、领域文档、技能、ticket、`.env.example`、`compose.yaml`，以及 01 基础切片（`pyproject.toml`、`uv.lock`、`.python-version`、`alembic.ini`、`migrations/`、应用装配、`core/config.py`、`core/logging.py`、`core/exceptions.py`、`core/exception_handlers.py`、`api/`、`db/`、`contracts/`、`integrations/`、`modules/health/`、`tests/` 与 `.github/workflows/checks.yml`）已落地；`core/limits.py`、`core/telemetry.py` 及其余业务模块、Worker、运行手册与容器部署文件随 02–18 切片逐步落地。
+下列目录是目标工程结构。设计文档、设计评审、领域文档、技能、ticket、`.env.example`、`compose.yaml`，01 基础切片（`pyproject.toml`、`uv.lock`、`.python-version`、`alembic.ini`、`migrations/`、应用装配、`core/config.py`、`core/logging.py`、`core/exceptions.py`、`core/exception_handlers.py`、`api/`、`db/`、`contracts/`、`integrations/`、`modules/health/`、`tests/` 与 `.github/workflows/checks.yml`），以及 02 认证与用户主体切片（`modules/auth/` 与 `modules/users/{models,schemas,repository,service,router}.py` 及 `20261121_0002` 迁移）已落地；`core/limits.py`、`core/telemetry.py`、`modules/users/cleanup.py` 及其余业务模块、Worker、运行手册与容器部署文件随 03–18 切片逐步落地。
 
 ```text
 mem-ai/                                    # 项目根目录，管理应用、设计和工程工具
@@ -346,7 +347,10 @@ modules/<module>/    # 某个业务模块，例如 agents 或 conversations
 | `db/base.py` | ORM Base、约束命名和公共字段 |
 | `db/model_registry.py` | 显式导入全部 ORM 模型，供迁移加载 |
 | `contracts/` | 项目自己的提供方接口和相关数据类型 |
-| `modules/auth/context.py` | 定义认证主体、本地用户、认证方法和权限 |
+| `modules/auth/context.py` | 定义可信外部主体 `VerifiedPrincipal` 与已解析请求身份 `AuthenticationContext` |
+| `modules/auth/adapters.py` | 定义 `CredentialVerifier` 协议及开发、测试、HS256 JWT、可信网关适配器与工厂 |
+| `modules/auth/dependencies.py` | 提供 `get_credential_verifier` 与 `AuthContextDep`，串联凭证验证、用户解析与日志 `user_id` 关联 |
+| `modules/users/` | 拥有 `users` 与 `user_identities` 表、并发幂等主体映射、共享用户状态策略及 `/v1/users/me` |
 | `integrations/http.py` | 创建共享 HTTPX 客户端 |
 | `modules/agents/` | Agent 与人设版本的生命周期和唯一写入入口 |
 | `modules/personas/provider.py` | 委托 Agent 只读查询实现的人设适配器 |

@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
@@ -35,6 +40,8 @@ from mem_ai.contracts.model_provider import (
 from mem_ai.contracts.persona_provider import MemoryPolicy, PersonaSnapshot
 from mem_ai.core.config import Settings
 from mem_ai.db.engine import create_sync_engine_from_settings
+from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
+from mem_ai.modules.auth.context import VerifiedPrincipal
 
 
 class FakeModelProvider:
@@ -233,6 +240,59 @@ def migrated_pg_settings(empty_pg_settings: Settings) -> Settings:
     """Provide an isolated PostgreSQL database upgraded to Alembic head."""
     command.upgrade(make_alembic_config(empty_pg_settings), "head")
     return empty_pg_settings
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def sign_hs256_jwt(
+    payload: dict[str, Any],
+    *,
+    secret: str,
+    header: dict[str, Any] | None = None,
+) -> str:
+    """Sign an HS256 JWT token for auth unit and API tests."""
+    header_obj = header if header is not None else {"alg": "HS256", "typ": "JWT"}
+    header_seg = _b64url(json.dumps(header_obj, separators=(",", ":")).encode("utf-8"))
+    payload_seg = _b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    signing_input = f"{header_seg}.{payload_seg}".encode("ascii")
+    sig = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    return f"{header_seg}.{payload_seg}.{_b64url(sig)}"
+
+
+def make_test_principal(
+    subject: str = "test-user",
+    *,
+    issuer: str = "https://test.mem-ai.local",
+    actor_id: str | None = None,
+    auth_method: str = "test_token",
+    permissions: tuple[str, ...] = (
+        "chat:use",
+        "agents:manage",
+        "memories:manage",
+        "users:self",
+    ),
+) -> VerifiedPrincipal:
+    """Build a deterministic verified principal for API and integration tests."""
+    return VerifiedPrincipal(
+        issuer=issuer,
+        subject=subject,
+        actor_id=actor_id if actor_id is not None else f"{issuer}:{subject}",
+        auth_method=auth_method,
+        permissions=frozenset(permissions),
+    )
+
+
+@pytest.fixture
+def test_auth_adapter() -> StaticTokenAuthAdapter:
+    """Provide a two-subject Bearer token adapter (`token-alice`, `token-bob`) for tests."""
+    return StaticTokenAuthAdapter(
+        {
+            "token-alice": make_test_principal("alice"),
+            "token-bob": make_test_principal("bob"),
+        }
+    )
 
 
 @pytest.fixture

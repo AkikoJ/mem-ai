@@ -72,7 +72,7 @@ async def test_health_live_and_ready_with_request_id_and_json_access_log(
                     "message": "ok",
                     "data": {
                         "database": "ok",
-                        "migration_revision": "20261121_0001",
+                        "migration_revision": "20261121_0002",
                     },
                     "request_id": "req_custom_123",
                 }
@@ -272,7 +272,7 @@ async def test_shared_async_client_fixture_and_main_asgi_entrypoint(
     assert body["code"] == "ok"
     assert body["data"] == {
         "database": "ok",
-        "migration_revision": "20261121_0001",
+        "migration_revision": "20261121_0002",
     }
 
 
@@ -338,6 +338,10 @@ async def test_api_docs_are_disabled_in_production() -> None:
         _env_file=None,
         app_env="production",
         postgres_password="strong-prod-password-123",
+        auth_mode="jwt_hs256",
+        auth_jwt_hs256_secret="super-secret-jwt-signing-key-at-least-32-chars",
+        auth_trusted_issuers=["https://idp.example.com"],
+        auth_trusted_audience="mem-ai-api",
     )
     app = create_app(prod_settings)
     transport = httpx.ASGITransport(app=app)
