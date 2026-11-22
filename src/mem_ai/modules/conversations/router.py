@@ -17,7 +17,10 @@ from mem_ai.core.exceptions import UnprocessableEntityError
 from mem_ai.modules.auth.dependencies import AuthContextDep
 from mem_ai.modules.conversations import service as conversations_service
 from mem_ai.modules.conversations.schemas import ChatRequest, ChatResponse
-from mem_ai.modules.conversations.service import SyncChatOptions, SyncGenerationTaskRegistry
+from mem_ai.modules.conversations.service import (
+    SyncGenerationTaskRegistry,
+    sync_chat_options_from_settings,
+)
 
 router = APIRouter(tags=["chat"])
 
@@ -62,11 +65,9 @@ async def post_chat(
         conversation_id=payload.conversation_id,
         user_message=payload.message,
         requested_model_id=payload.model_id,
-        options=SyncChatOptions(
-            server_fallback_model_id=settings.model_default_id,
-            history_limit=settings.chat_history_message_limit,
-            lease_ttl_seconds=settings.chat_lease_ttl_seconds,
-            timeout_seconds=settings.chat_generation_timeout_seconds,
+        options=sync_chat_options_from_settings(
+            settings,
+            user_permissions=auth.permissions,
             task_registry=task_registry,
         ),
     )

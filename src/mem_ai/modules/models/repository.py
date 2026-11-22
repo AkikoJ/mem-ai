@@ -21,6 +21,24 @@ async def get_model_config_by_model_id(
     return result.scalar_one_or_none()
 
 
+async def list_enabled_model_configs(session: AsyncSession) -> list[ModelConfig]:
+    """Return all enabled `model_configs` rows ordered deterministically by `model_id`."""
+    stmt = (
+        select(ModelConfig)
+        .where(ModelConfig.enabled.is_(True))
+        .order_by(ModelConfig.model_id.asc())
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def has_any_model_config(session: AsyncSession) -> bool:
+    """Return True when at least one model configuration row has been synced."""
+    stmt = select(ModelConfig.id).limit(1)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none() is not None
+
+
 async def upsert_model_config(
     session: AsyncSession,
     *,

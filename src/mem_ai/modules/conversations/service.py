@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from mem_ai.contracts.memory_provider import MemoryRecallItem
 from mem_ai.contracts.model_provider import ModelProvider, ModelRequest, ModelResponse
 from mem_ai.contracts.persona_provider import PersonaProvider
+from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import (
     AppError,
     BadGatewayError,
@@ -43,6 +44,7 @@ from mem_ai.modules.conversations.schemas import (
     PreparedGeneration,
 )
 from mem_ai.modules.models import service as models_service
+from mem_ai.modules.models.schemas import ModelRoutingPolicy
 from mem_ai.modules.users import service as users_service
 
 logger = logging.getLogger("mem_ai.conversations")
@@ -58,14 +60,36 @@ def _consume_detached_task_exception(done_task: asyncio.Task[Any]) -> None:
 
 @dataclass(frozen=True, slots=True)
 class SyncChatOptions:
-    """Bundled runtime budgets and hooks for synchronous chat execution."""
+    """Bundled runtime budgets, model routing policy, and hooks for chat execution."""
 
-    server_fallback_model_id: str | None = None
+    model_policy: ModelRoutingPolicy | None = None
+    user_permissions: frozenset[str] = frozenset()
+    require_streaming: bool = False
+    required_capabilities: frozenset[str] = frozenset()
     history_limit: int = 20
     lease_ttl_seconds: int = 60
     timeout_seconds: float | None = None
     task_registry: SyncGenerationTaskRegistry | None = None
     before_commit_hook: BeforeCommitHook | None = None
+
+
+def sync_chat_options_from_settings(
+    settings: Settings,
+    *,
+    user_permissions: frozenset[str] = frozenset(),
+    require_streaming: bool = False,
+    task_registry: SyncGenerationTaskRegistry | None = None,
+) -> SyncChatOptions:
+    """Construct `SyncChatOptions` with the shared server `ModelRoutingPolicy`."""
+    return SyncChatOptions(
+        model_policy=models_service.model_routing_policy_from_settings(settings),
+        user_permissions=user_permissions,
+        require_streaming=require_streaming,
+        history_limit=settings.chat_history_message_limit,
+        lease_ttl_seconds=settings.chat_lease_ttl_seconds,
+        timeout_seconds=settings.chat_generation_timeout_seconds,
+        task_registry=task_registry,
+    )
 
 
 class SyncGenerationTaskRegistry:
@@ -164,7 +188,10 @@ async def prepare_generation(
         session_factory,
         agent_default_model_id=persona.default_model_id,
         requested_model_id=requested_model_id,
-        server_fallback_model_id=resolved_options.server_fallback_model_id,
+        user_permissions=resolved_options.user_permissions,
+        require_streaming=resolved_options.require_streaming,
+        required_capabilities=resolved_options.required_capabilities,
+        policy=resolved_options.model_policy,
     )
 
     return await generation_store.prepare_generation_phase(

@@ -168,8 +168,8 @@ Service
 | `src/mem_ai/modules/auth/`、`src/mem_ai/modules/users/models.py`、`src/mem_ai/modules/users/schemas.py`、`src/mem_ai/modules/users/repository.py`、`src/mem_ai/modules/users/service.py`、`src/mem_ai/modules/users/router.py` | 已落地 | 02 认证上下文、可替换凭证验证适配器、伪造身份头清理、`users`/`user_identities` 主体映射与 `GET /v1/users/me` |
 | `src/mem_ai/modules/agents/`、`src/mem_ai/modules/personas/provider.py` | 已落地 | 03 私有 Agent 与不可变人设版本快照（`agents`/`persona_versions`）、草稿编辑、原子发布与本地只读 `PersonaProvider` 适配 |
 | `src/mem_ai/modules/jobs/`、`src/mem_ai/modules/operations/`、`src/mem_ai/modules/memories/models.py`、`src/mem_ai/modules/memories/schemas.py`、`src/mem_ai/modules/memories/repository.py`、`src/mem_ai/modules/memories/snapshots.py`、`src/mem_ai/modules/memories/service.py`、`src/mem_ai/modules/memories/router.py`、`src/mem_ai/modules/memories/adapters/memos.py` | 已落地 | 04 统一任务最小写入入口（`jobs`）、异步操作追踪（`operations` 与 `GET /v1/operations/{operationId}`）、记忆范围与分页快照（`memory_scopes`/`memory_list_snapshots`）、`GET/POST /v1/memories` 与可替换 MemOS 适配器 |
-| `src/mem_ai/modules/models/models.py`、`src/mem_ai/modules/models/schemas.py`、`src/mem_ai/modules/models/repository.py`、`src/mem_ai/modules/models/service.py`、`src/mem_ai/modules/models/adapters/openai_compatible.py`、`src/mem_ai/modules/conversations/models.py`、`src/mem_ai/modules/conversations/schemas.py`、`src/mem_ai/modules/conversations/repository.py`、`src/mem_ai/modules/conversations/prompt.py`、`src/mem_ai/modules/conversations/generation.py`、`src/mem_ai/modules/conversations/service.py`、`src/mem_ai/modules/conversations/router.py` | 已落地 | 05 模型注册同步与解析（`model_configs`）、OpenAI 兼容 `ModelProvider` 适配器、共享生成生命周期与持久化阶段（`conversations`/`generations`/`messages`）、纯 Prompt 编译、客户端断连隔离同步对话与 `POST /v1/chat` |
-| `tests/conftest.py`、`tests/unit/`、`tests/api/`、`tests/integration/`、`tests/architecture/` | 已落地（持续扩展） | 01–05 测试 fixture、单元、API、PostgreSQL/迁移、提供方契约与架构测试 |
+| `src/mem_ai/modules/models/models.py`、`src/mem_ai/modules/models/schemas.py`、`src/mem_ai/modules/models/repository.py`、`src/mem_ai/modules/models/service.py`、`src/mem_ai/modules/models/router.py`、`src/mem_ai/modules/models/sync.py`、`src/mem_ai/modules/models/adapters/openai_compatible.py`、`src/mem_ai/modules/conversations/models.py`、`src/mem_ai/modules/conversations/schemas.py`、`src/mem_ai/modules/conversations/repository.py`、`src/mem_ai/modules/conversations/prompt.py`、`src/mem_ai/modules/conversations/generation.py`、`src/mem_ai/modules/conversations/service.py`、`src/mem_ai/modules/conversations/router.py` | 已落地 | 05–06 模型注册启动与显式 CLI 幂等同步（`model_configs`）、`GET /v1/models` 发现、服务端强制/覆盖/权限/能力路由策略、OpenAI 兼容 `ModelProvider` 适配器、共享生成生命周期与持久化阶段（`conversations`/`generations`/`messages`）、纯 Prompt 编译、客户端断连隔离同步对话与 `POST /v1/chat` |
+| `tests/conftest.py`、`tests/unit/`、`tests/api/`、`tests/integration/`、`tests/architecture/` | 已落地（持续扩展） | 01–06 测试 fixture、单元、API、PostgreSQL/迁移、提供方契约与架构测试 |
 | `src/mem_ai/core/limits.py`、`src/mem_ai/core/telemetry.py`、`src/mem_ai/modules/users/cleanup.py`、`src/mem_ai/modules/memories/jobs.py`、`src/mem_ai/modules/conversations/idempotency.py`、`src/mem_ai/modules/conversations/stream.py`、`src/mem_ai/modules/conversations/cleanup.py`、其余业务模块与 `src/mem_ai/workers/` | 按切片落地 | 先检查实际文件，再沿功能定位索引进入 |
 
 ### 3.0.2 功能定位索引
@@ -182,7 +182,7 @@ Service
 | 认证上下文和用户状态 | `auth` | `users/` | `src/mem_ai/modules/auth/`、`src/mem_ai/modules/users/` | `tests/unit/`、`tests/api/`、`tests/integration/` | 02、15 |
 | Agent 与人设版本生命周期 | `agents` | `src/mem_ai/modules/personas/provider.py` | `src/mem_ai/modules/agents/` | `tests/api/`、`tests/integration/` | 03、11 |
 | 同步与流式生成编排 | `conversations` | `models/`、`memories/`、`jobs/` | `src/mem_ai/modules/conversations/service.py`、`generation.py`、`stream.py` | `tests/api/`、`tests/integration/` | 05、07、08、10、12 |
-| 模型注册、选择和提供方调用 | `models` | `contracts/model_provider.py`、`models/adapters/` | `src/mem_ai/modules/models/`、`src/mem_ai/contracts/model_provider.py` | `tests/integration/` | 05、06、12 |
+| 模型注册、选择和提供方调用 | `models` | `contracts/model_provider.py`、`models/adapters/` | `src/mem_ai/modules/models/`、`src/mem_ai/contracts/model_provider.py` | `tests/unit/`、`tests/api/`、`tests/integration/` | 05、06、12 |
 | 记忆范围、召回、写入和删除策略 | `memories` | `contracts/memory_provider.py`、`memories/adapters/`、`memories/snapshots.py`、`memories/jobs.py` | `src/mem_ai/modules/memories/`、`src/mem_ai/contracts/memory_provider.py` | `tests/unit/`、`tests/api/`、`tests/integration/` | 04、08、09、13、14、15 |
 | 通用任务持久化、领取和重试 | `jobs` | `workers/runner.py` | `src/mem_ai/modules/jobs/`、`src/mem_ai/workers/runner.py` | `tests/integration/` | 04、09、13、16、17 |
 | 异步记忆与删除操作进度和回执 | `operations` | 各资源清理处理器、`memories/` | `src/mem_ai/modules/operations/` | `tests/api/`、`tests/integration/` | 04、13、14、15、16 |
@@ -193,7 +193,7 @@ Service
 
 目录树如下。
 
-下列目录是目标工程结构。设计文档、设计评审、领域文档、技能、ticket、`.env.example`、`compose.yaml`，01 基础切片（`pyproject.toml`、`uv.lock`、`.python-version`、`alembic.ini`、`migrations/`、应用装配、`core/config.py`、`core/logging.py`、`core/exceptions.py`、`core/exception_handlers.py`、`api/`、`db/`、`contracts/`、`integrations/`、`modules/health/`、`tests/` 与 `.github/workflows/checks.yml`），02 认证与用户主体切片（`modules/auth/` 与 `modules/users/{models,schemas,repository,service,router}.py` 及 `20261121_0002` 迁移），03 私有 Agent 与只读人设切片（`modules/agents/`、`modules/personas/provider.py` 及 `20261121_0003` 迁移），04 长期记忆查询与显式添加切片（`modules/jobs/`、`modules/operations/`、`modules/memories/{models,schemas,repository,snapshots,service,router}.py`、`modules/memories/adapters/memos.py` 及 `20261121_0004` 迁移），以及 05 同步对话切片（`modules/models/{models,schemas,repository,service}.py`、`modules/models/adapters/openai_compatible.py`、`modules/conversations/{models,schemas,repository,prompt,generation,service,router}.py` 及 `20261122_0005` 迁移）已落地；`core/limits.py`、`core/telemetry.py`、`modules/users/cleanup.py`、`modules/memories/jobs.py`、`modules/conversations/{idempotency,stream,cleanup}.py`、`modules/models/router.py` 及其余业务模块、Worker、运行手册与容器部署文件随 06–18 切片逐步落地。
+下列目录是目标工程结构。设计文档、设计评审、领域文档、技能、ticket、`.env.example`、`compose.yaml`，01 基础切片（`pyproject.toml`、`uv.lock`、`.python-version`、`alembic.ini`、`migrations/`、应用装配、`core/config.py`、`core/logging.py`、`core/exceptions.py`、`core/exception_handlers.py`、`api/`、`db/`、`contracts/`、`integrations/`、`modules/health/`、`tests/` 与 `.github/workflows/checks.yml`），02 认证与用户主体切片（`modules/auth/` 与 `modules/users/{models,schemas,repository,service,router}.py` 及 `20261121_0002` 迁移），03 私有 Agent 与只读人设切片（`modules/agents/`、`modules/personas/provider.py` 及 `20261121_0003` 迁移），04 长期记忆查询与显式添加切片（`modules/jobs/`、`modules/operations/`、`modules/memories/{models,schemas,repository,snapshots,service,router}.py`、`modules/memories/adapters/memos.py` 及 `20261121_0004` 迁移），05 同步对话切片（`modules/models/{models,schemas,repository,service}.py`、`modules/models/adapters/openai_compatible.py`、`modules/conversations/{models,schemas,repository,prompt,generation,service,router}.py` 及 `20261122_0005` 迁移），以及 06 模型查询与路由选择切片（`modules/models/{router,sync}.py` 与共享路由/权限/能力策略）已落地；`core/limits.py`、`core/telemetry.py`、`modules/users/cleanup.py`、`modules/memories/jobs.py`、`modules/conversations/{idempotency,stream,cleanup}.py` 及其余业务模块、Worker、运行手册与容器部署文件随 07–18 切片逐步落地。
 
 ```text
 mem-ai/                                    # 项目根目录，管理应用、设计和工程工具
@@ -293,6 +293,7 @@ mem-ai/                                    # 项目根目录，管理应用、�
 │       │   │   │   └── memos.py           # MemOS HTTP、范围、分页和结果核验映射
 │       │   │   └── jobs.py                # 记忆写入和删除的类型化任务处理器
 │       │   ├── models/                    # 模型注册、路由和 ModelProvider 适配器
+│       │   │   ├── sync.py                # 服务端受控模型配置的显式幂等同步 CLI 入口
 │       │   │   └── adapters/              # 外部模型调用实现
 │       │   │       └── openai_compatible.py # 服务端注册的兼容接口模型适配器
 │       │   ├── jobs/                      # 统一任务存储、领取、租约和重试规则
@@ -362,7 +363,8 @@ modules/<module>/    # 某个业务模块，例如 agents 或 conversations
 | `modules/conversations/generation.py` | `conversations`/`generations`/`messages` 持久化阶段、生成终态、租约与条件原子提交 |
 | `modules/conversations/prompt.py` | 纯项目数据 Prompt 编译（平台规则、固定人设、相关记忆占位、成功历史与当前输入） |
 | `modules/conversations/idempotency.py` | 请求语义摘要、首次关联和结果复用 |
-| `modules/models/` | 拥有 `model_configs` 表、受控配置同步与模型选择规则，供对话编排与 `/v1/models` 复用 |
+| `modules/models/` | 拥有 `model_configs` 表、受控配置同步、共享启用/权限/能力/强制/覆盖路由策略与 `GET /v1/models` 路由 |
+| `modules/models/sync.py` | 服务端受控模型配置的显式幂等同步命令入口（`python -m mem_ai.modules.models.sync`），缺失配置返回稳定错误 |
 | `modules/models/adapters/openai_compatible.py` | OpenAI Chat Completions 兼容 `ModelProvider` 适配器，封装服务端鉴权、用量与超时/上游错误映射 |
 | `modules/memories/` | 统一记忆范围、代次、屏障、分页快照、删除标记策略及 `/v1/memories` 路由 |
 | `modules/memories/snapshots.py` | 基于 PostgreSQL `memory_list_snapshots` 表的有界分页快照与稳定游标存储 |

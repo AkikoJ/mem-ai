@@ -249,3 +249,70 @@ def test_openai_compatible_model_provider_mode_requires_api_key_and_valid_base_u
                 {"model_id": "dup-model"},
             ],
         )
+
+
+def test_model_routing_policy_and_registry_entry_validation() -> None:
+    defaults = Settings(_env_file=None, app_env="test")
+    assert defaults.model_forced_id is None
+    assert defaults.model_allow_request_override is False
+    assert defaults.model_sync_on_startup is True
+
+    configured = Settings(
+        _env_file=None,
+        app_env="test",
+        model_default_id="gpt-4o-mini",
+        model_forced_id="gpt-4o-forced",
+        model_allow_request_override=True,
+        model_sync_on_startup=False,
+        model_registry_entries=[
+            {
+                "model_id": "gpt-4o-mini",
+                "provider_id": "openai_compatible",
+                "upstream_model": "vendor-gpt-4o-mini",
+                "display_name": "GPT-4o Mini",
+                "enabled": True,
+                "supports_streaming": True,
+                "max_context_tokens": 128000,
+                "max_output_tokens": 4096,
+                "required_permission": "models:standard",
+                "credential_ref": "OPENAI_COMPAT_API_KEY",
+                "capabilities_json": {"json_mode": True},
+            }
+        ],
+    )
+    assert configured.model_forced_id == "gpt-4o-forced"
+    assert configured.model_allow_request_override is True
+    assert configured.model_sync_on_startup is False
+
+    with pytest.raises(ValidationError, match="model_default_id"):
+        Settings(_env_file=None, app_env="test", model_default_id="   ")
+
+    with pytest.raises(ValidationError, match="model_forced_id"):
+        Settings(_env_file=None, app_env="test", model_forced_id="   ")
+
+    with pytest.raises(ValidationError, match="unsupported keys"):
+        Settings(
+            _env_file=None,
+            app_env="test",
+            model_registry_entries=[
+                {"model_id": "bad-entry", "api_key": "sk-never-here", "base_url": "https://x"}
+            ],
+        )
+
+    with pytest.raises(ValidationError, match="supports_streaming"):
+        Settings(
+            _env_file=None,
+            app_env="test",
+            model_registry_entries=[
+                {"model_id": "bad-bool", "supports_streaming": "yes"},
+            ],
+        )
+
+    with pytest.raises(ValidationError, match="max_output_tokens"):
+        Settings(
+            _env_file=None,
+            app_env="test",
+            model_registry_entries=[
+                {"model_id": "bad-int", "max_output_tokens": 0},
+            ],
+        )

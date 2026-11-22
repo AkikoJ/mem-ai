@@ -112,7 +112,7 @@ def create_app(
             ModelConfigSeed.model_validate(entry)
             for entry in resolved_settings.model_registry_entries
         ]
-        if model_seeds:
+        if resolved_settings.model_sync_on_startup and model_seeds:
             await models_service.sync_model_configs(session_factory, seeds=model_seeds)
 
         base_providers = providers if providers is not None else ProviderRegistry()

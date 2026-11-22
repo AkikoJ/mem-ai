@@ -79,9 +79,32 @@ def _validate_http_provider_settings(
         raise ValueError(f"{base_url_field} must start with 'http://' or 'https://'")
 
 
+_ALLOWED_MODEL_REGISTRY_KEYS = frozenset(
+    {
+        "model_id",
+        "provider_id",
+        "upstream_model",
+        "display_name",
+        "enabled",
+        "supports_streaming",
+        "max_context_tokens",
+        "max_output_tokens",
+        "required_permission",
+        "credential_ref",
+        "capabilities_json",
+    }
+)
+
+
 def _validate_model_registry_entries(entries: list[dict[str, Any]]) -> None:
     seen_ids: set[str] = set()
     for idx, entry in enumerate(entries):
+        unknown_keys = sorted(set(entry.keys()) - _ALLOWED_MODEL_REGISTRY_KEYS)
+        if unknown_keys:
+            raise ValueError(
+                f"model_registry_entries[{idx}] contains unsupported keys: {unknown_keys}"
+            )
+
         model_id = entry.get("model_id")
         if not isinstance(model_id, str) or not model_id.strip():
             raise ValueError(f"model_registry_entries[{idx}].model_id must be a non-empty string")
@@ -91,12 +114,39 @@ def _validate_model_registry_entries(entries: list[dict[str, Any]]) -> None:
                 f"model_registry_entries contains duplicate model_id {normalized_id!r}"
             )
         seen_ids.add(normalized_id)
-        for optional_str in ("provider_id", "upstream_model", "display_name"):
+
+        for optional_str in (
+            "provider_id",
+            "upstream_model",
+            "display_name",
+            "required_permission",
+            "credential_ref",
+        ):
             value = entry.get(optional_str)
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise ValueError(
                     f"model_registry_entries[{idx}].{optional_str} must be a non-empty string"
                 )
+
+        for optional_bool in ("enabled", "supports_streaming"):
+            value = entry.get(optional_bool)
+            if value is not None and not isinstance(value, bool):
+                raise ValueError(f"model_registry_entries[{idx}].{optional_bool} must be a boolean")
+
+        for optional_int in ("max_context_tokens", "max_output_tokens"):
+            value = entry.get(optional_int)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 1
+            ):
+                raise ValueError(
+                    f"model_registry_entries[{idx}].{optional_int} must be a positive integer"
+                )
+
+        capabilities = entry.get("capabilities_json")
+        if capabilities is not None and not isinstance(capabilities, dict):
+            raise ValueError(
+                f"model_registry_entries[{idx}].capabilities_json must be a JSON object"
+            )
 
 
 class Settings(BaseSettings):
@@ -182,6 +232,9 @@ class Settings(BaseSettings):
     openai_compat_api_key: SecretStr | None = None
     openai_compat_request_timeout_seconds: float = Field(default=60.0, gt=0.0)
     model_default_id: str | None = None
+    model_forced_id: str | None = None
+    model_allow_request_override: bool = False
+    model_sync_on_startup: bool = True
     model_registry_entries: list[dict[str, Any]] = Field(default_factory=list)
     chat_generation_timeout_seconds: float = Field(default=60.0, gt=0.0)
     chat_history_message_limit: int = Field(default=20, ge=0, le=200)
@@ -272,6 +325,11 @@ class Settings(BaseSettings):
                 mode_field="model_provider_mode",
                 mode_value="openai_compatible",
             )
+
+        if self.model_default_id is not None and not self.model_default_id.strip():
+            raise ValueError("model_default_id must not be blank when set")
+        if self.model_forced_id is not None and not self.model_forced_id.strip():
+            raise ValueError("model_forced_id must not be blank when set")
 
         _validate_model_registry_entries(self.model_registry_entries)
 
