@@ -26,7 +26,14 @@ from mem_ai.modules.auth.adapters import (
     StaticTokenAuthAdapter,
     build_credential_verifier,
 )
+from mem_ai.modules.conversations.service import (
+    DatabaseConversationAccessChecker,
+    SyncGenerationTaskRegistry,
+)
 from mem_ai.modules.memories.adapters.memos import MemOSMemoryProvider
+from mem_ai.modules.models import service as models_service
+from mem_ai.modules.models.adapters.openai_compatible import OpenAICompatibleModelProvider
+from mem_ai.modules.models.schemas import ModelConfigSeed
 from mem_ai.modules.personas.provider import LocalPersonaProvider
 
 _OFFLINE_DOCS_STATIC_DIR = Path(fastapi_offline.__file__).resolve().parent / "static"
@@ -91,12 +98,41 @@ def create_app(
         db_engine = create_async_engine_from_settings(resolved_settings)
         session_factory = create_session_factory(db_engine)
         http_client = create_http_client(resolved_settings)
+        sync_task_registry = SyncGenerationTaskRegistry()
 
         app.state.db_engine = db_engine
         app.state.session_factory = session_factory
         app.state.http_client = http_client
+        app.state.sync_generation_tasks = sync_task_registry
+        app.state.conversation_access_checker = DatabaseConversationAccessChecker(
+            session_factory=session_factory
+        )
+
+        model_seeds = [
+            ModelConfigSeed.model_validate(entry)
+            for entry in resolved_settings.model_registry_entries
+        ]
+        if model_seeds:
+            await models_service.sync_model_configs(session_factory, seeds=model_seeds)
 
         base_providers = providers if providers is not None else ProviderRegistry()
+        resolved_model_provider = base_providers.model_provider
+        if (
+            resolved_model_provider is None
+            and resolved_settings.model_provider_mode == "openai_compatible"
+            and resolved_settings.openai_compat_api_key is not None
+        ):
+            upstream_model_map = {
+                seed.model_id: seed.resolved_upstream_model() for seed in model_seeds
+            }
+            resolved_model_provider = OpenAICompatibleModelProvider(
+                http_client=http_client,
+                base_url=resolved_settings.openai_compat_base_url,
+                api_key=resolved_settings.openai_compat_api_key,
+                timeout_seconds=resolved_settings.openai_compat_request_timeout_seconds,
+                upstream_model_map=upstream_model_map,
+            )
+
         resolved_memory_provider = base_providers.memory_provider
         if (
             resolved_memory_provider is None
@@ -120,7 +156,7 @@ def create_app(
             else LocalPersonaProvider(session_factory=session_factory)
         )
         app.state.providers = ProviderRegistry(
-            model_provider=base_providers.model_provider,
+            model_provider=resolved_model_provider,
             memory_provider=resolved_memory_provider,
             persona_provider=resolved_persona_provider,
         )
@@ -128,6 +164,9 @@ def create_app(
         try:
             yield
         finally:
+            await sync_task_registry.drain(
+                timeout_seconds=min(resolved_settings.chat_generation_timeout_seconds, 10.0)
+            )
             await http_client.aclose()
             await db_engine.dispose()
 

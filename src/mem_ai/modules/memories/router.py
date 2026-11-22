@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Response, status
+from fastapi import APIRouter, Depends, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 
 from mem_ai.api.dependencies import MemoryProviderDep, SessionFactoryDep
@@ -30,8 +30,11 @@ router = APIRouter(prefix="/memories", tags=["memories"])
 _DEFAULT_CONVERSATION_ACCESS_CHECKER = DefaultConversationAccessChecker()
 
 
-def get_conversation_access_checker() -> ConversationAccessChecker:
-    """Return the conversation ownership checker (overridable by future slices or tests)."""
+def get_conversation_access_checker(request: Request) -> ConversationAccessChecker:
+    """Return the assembled conversation ownership checker (overridable in tests)."""
+    configured = getattr(request.app.state, "conversation_access_checker", None)
+    if isinstance(configured, ConversationAccessChecker):
+        return configured
     return _DEFAULT_CONVERSATION_ACCESS_CHECKER
 
 

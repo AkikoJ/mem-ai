@@ -1,0 +1,387 @@
+"""Conversation Core orchestration for synchronous and future streaming chat flows.
+
+Implements the orchestration half of Engineering Design §5.4 (Shared Generation Lifecycle):
+- `prepare_generation`: validates user/conversation, resolves read-only `PersonaSnapshot`
+  strictly outside DB write transactions, resolves server-registered model, then commits Tx 1.
+- `prepare_context`: pure prompt compilation seam (Ticket 08 extends with scoped memory recall).
+- `execute_model_completion`: invokes `ModelProvider.generate` outside any DB transaction under
+  an overall generation deadline.
+- `complete_prepared_sync_generation`: executes context -> model -> atomic Tx 2 or failure
+  convergence; wrapped in a shielded task by `run_sync_chat` so client HTTP disconnects do not
+  abort an already-started synchronous model call (ADR 0004).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+from collections.abc import Coroutine, Sequence
+from dataclasses import dataclass
+from typing import Any, TypeVar
+from uuid import UUID
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from mem_ai.contracts.memory_provider import MemoryRecallItem
+from mem_ai.contracts.model_provider import ModelProvider, ModelRequest, ModelResponse
+from mem_ai.contracts.persona_provider import PersonaProvider
+from mem_ai.core.exceptions import (
+    AppError,
+    BadGatewayError,
+    GatewayTimeoutError,
+    NotFoundError,
+    ServiceUnavailableError,
+)
+from mem_ai.core.logging import bind_log_context, reset_log_context
+from mem_ai.modules.conversations import generation as generation_store
+from mem_ai.modules.conversations.generation import BeforeCommitHook
+from mem_ai.modules.conversations.prompt import compile_chat_prompt
+from mem_ai.modules.conversations.schemas import (
+    CommittedChatResult,
+    PreparedContext,
+    PreparedGeneration,
+)
+from mem_ai.modules.models import service as models_service
+from mem_ai.modules.users import service as users_service
+
+logger = logging.getLogger("mem_ai.conversations")
+
+_ResultT = TypeVar("_ResultT")
+
+
+def _consume_detached_task_exception(done_task: asyncio.Task[Any]) -> None:
+    if not done_task.cancelled():
+        with contextlib.suppress(Exception):
+            done_task.exception()
+
+
+@dataclass(frozen=True, slots=True)
+class SyncChatOptions:
+    """Bundled runtime budgets and hooks for synchronous chat execution."""
+
+    server_fallback_model_id: str | None = None
+    history_limit: int = 20
+    lease_ttl_seconds: int = 60
+    timeout_seconds: float | None = None
+    task_registry: SyncGenerationTaskRegistry | None = None
+    before_commit_hook: BeforeCommitHook | None = None
+
+
+class SyncGenerationTaskRegistry:
+    """Tracks in-flight shielded sync generation tasks for graceful shutdown draining."""
+
+    def __init__(self) -> None:
+        self._tasks: set[asyncio.Task[Any]] = set()
+
+    def spawn(self, coro: Coroutine[Any, Any, _ResultT]) -> asyncio.Task[_ResultT]:
+        task: asyncio.Task[_ResultT] = asyncio.create_task(coro)
+        self._tasks.add(task)
+
+        def _on_done(done_task: asyncio.Task[_ResultT]) -> None:
+            self._tasks.discard(done_task)
+            _consume_detached_task_exception(done_task)
+
+        task.add_done_callback(_on_done)
+        return task
+
+    async def drain(self, *, timeout_seconds: float = 10.0) -> None:
+        """Wait bounded time for in-flight shielded sync tasks to finish on app shutdown."""
+        if not self._tasks:
+            return
+        pending = list(self._tasks)
+        _, still_pending = await asyncio.wait(pending, timeout=timeout_seconds)
+        for task in still_pending:
+            task.cancel()
+        if still_pending:
+            await asyncio.gather(*still_pending, return_exceptions=True)
+
+
+class DatabaseConversationAccessChecker:
+    """Real `ConversationAccessChecker` backed by `conversations.generation`."""
+
+    def __init__(self, *, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def ensure_conversation_accessible(
+        self,
+        *,
+        owner_id: UUID,
+        conversation_id: UUID,
+    ) -> None:
+        await generation_store.ensure_conversation_accessible(
+            self._session_factory,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+        )
+
+
+async def prepare_generation(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    persona_provider: PersonaProvider,
+    owner_id: UUID,
+    agent_id: UUID,
+    conversation_id: UUID | None,
+    user_message: str,
+    requested_model_id: str | None = None,
+    options: SyncChatOptions | None = None,
+) -> PreparedGeneration:
+    """Resolve persona outside DB write tx, validate model, and commit Tx 1 preparation."""
+    resolved_options = options if options is not None else SyncChatOptions()
+    await users_service.get_active_user(session_factory, user_id=owner_id)
+
+    # Read existing conversation (if any) in a short read session before calling PersonaProvider.
+    if conversation_id is None:
+        persona = await persona_provider.get_latest_published(
+            owner_id=owner_id,
+            agent_id=agent_id,
+        )
+        if persona is None:
+            raise NotFoundError(
+                code="agent_persona_not_found",
+                message="published agent persona not found",
+            )
+    else:
+        existing_conversation = await generation_store.load_conversation_for_continuation(
+            session_factory,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            expected_agent_id=agent_id,
+        )
+        persona = await persona_provider.get_version(
+            owner_id=owner_id,
+            agent_id=agent_id,
+            version_id=existing_conversation.persona_version_id,
+        )
+        if persona is None:
+            raise NotFoundError(
+                code="persona_version_not_found",
+                message="pinned persona version not found",
+            )
+
+    selected_model = await models_service.resolve_model_for_chat(
+        session_factory,
+        agent_default_model_id=persona.default_model_id,
+        requested_model_id=requested_model_id,
+        server_fallback_model_id=resolved_options.server_fallback_model_id,
+    )
+
+    return await generation_store.prepare_generation_phase(
+        session_factory,
+        owner_id=owner_id,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        persona=persona,
+        model_id=selected_model.model_id,
+        upstream_model=selected_model.upstream_model,
+        user_message_content=user_message,
+        max_output_tokens=selected_model.max_output_tokens,
+        memory_epoch=0,
+        history_limit=resolved_options.history_limit,
+        lease_ttl_seconds=resolved_options.lease_ttl_seconds,
+    )
+
+
+def prepare_context(
+    *,
+    prepared: PreparedGeneration,
+    recalled_memories: Sequence[MemoryRecallItem] = (),
+    max_history_messages: int | None = 20,
+) -> PreparedContext:
+    """Compile pure domain data into ordered model prompt messages (extended in Ticket 08)."""
+    compiled = compile_chat_prompt(
+        persona=prepared.persona,
+        history_messages=prepared.history_messages,
+        current_input=prepared.user_message_content,
+        recalled_memories=recalled_memories,
+        max_history_messages=max_history_messages,
+    )
+    return PreparedContext(
+        prepared=prepared,
+        compiled_messages=tuple(compiled),
+        recalled_memories=tuple(recalled_memories),
+    )
+
+
+async def execute_model_completion(
+    *,
+    model_provider: ModelProvider,
+    context: PreparedContext,
+    timeout_seconds: float | None = None,
+) -> ModelResponse:
+    """Invoke `ModelProvider.generate` outside any DB transaction under an overall deadline."""
+    request = ModelRequest(
+        model_id=context.prepared.model_id,
+        upstream_model=context.prepared.upstream_model,
+        messages=list(context.compiled_messages),
+        max_output_tokens=context.prepared.max_output_tokens,
+        timeout_seconds=timeout_seconds,
+    )
+    if timeout_seconds is None:
+        return await model_provider.generate(request)
+
+    try:
+        return await asyncio.wait_for(
+            model_provider.generate(request),
+            timeout=timeout_seconds,
+        )
+    except TimeoutError:
+        raise GatewayTimeoutError(
+            code="generation_timeout",
+            message="model generation timed out",
+        ) from None
+
+
+async def _safe_converge_failure(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    prepared: PreparedGeneration,
+    error_code: str,
+    error_message: str,
+) -> None:
+    try:
+        await generation_store.converge_generation_failure_phase(
+            session_factory,
+            generation_id=prepared.generation_id,
+            lease_token=prepared.lease_token,
+            target_status="failed",
+            error_code=error_code,
+            error_message=error_message,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to converge generation to failed state",
+            extra={
+                "extra_fields": {
+                    "error_code": error_code,
+                }
+            },
+        )
+
+
+async def complete_prepared_sync_generation(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    model_provider: ModelProvider,
+    prepared: PreparedGeneration,
+    timeout_seconds: float | None = None,
+    max_history_messages: int | None = 20,
+    before_commit_hook: BeforeCommitHook | None = None,
+) -> CommittedChatResult:
+    """Run context compilation, external model completion, and atomic Tx 2 commit/convergence."""
+    log_tokens = bind_log_context(
+        conversation_id=str(prepared.conversation_id),
+        generation_id=str(prepared.generation_id),
+    )
+    try:
+        try:
+            context = prepare_context(
+                prepared=prepared,
+                max_history_messages=max_history_messages,
+            )
+            model_response = await execute_model_completion(
+                model_provider=model_provider,
+                context=context,
+                timeout_seconds=timeout_seconds,
+            )
+        except AppError as exc:
+            await _safe_converge_failure(
+                session_factory,
+                prepared=prepared,
+                error_code=exc.code,
+                error_message=exc.message,
+            )
+            raise
+        except Exception:
+            logger.exception(
+                "Unexpected exception during context preparation or model completion",
+                extra={"extra_fields": {"model_id": prepared.model_id}},
+            )
+            await _safe_converge_failure(
+                session_factory,
+                prepared=prepared,
+                error_code="model_upstream_error",
+                error_message="model generation failed",
+            )
+            raise BadGatewayError(
+                code="model_upstream_error",
+                message="model generation failed",
+            ) from None
+
+        try:
+            return await generation_store.commit_generation_success_phase(
+                session_factory,
+                prepared=prepared,
+                assistant_content=model_response.content,
+                usage=model_response.usage,
+                finish_reason=model_response.finish_reason,
+                before_commit_hook=before_commit_hook,
+            )
+        except AppError as exc:
+            await _safe_converge_failure(
+                session_factory,
+                prepared=prepared,
+                error_code=exc.code,
+                error_message=exc.message,
+            )
+            raise
+        except Exception:
+            logger.exception(
+                "Failed to commit completed generation atomically",
+                extra={"extra_fields": {"model_id": prepared.model_id}},
+            )
+            await _safe_converge_failure(
+                session_factory,
+                prepared=prepared,
+                error_code="generation_commit_failed",
+                error_message="failed to commit generation result",
+            )
+            raise ServiceUnavailableError(
+                code="generation_commit_failed",
+                message="failed to commit generation result",
+            ) from None
+    finally:
+        reset_log_context(log_tokens)
+
+
+async def run_sync_chat(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    persona_provider: PersonaProvider,
+    model_provider: ModelProvider,
+    owner_id: UUID,
+    agent_id: UUID,
+    conversation_id: UUID | None,
+    user_message: str,
+    requested_model_id: str | None = None,
+    options: SyncChatOptions | None = None,
+) -> CommittedChatResult:
+    """Execute a full synchronous chat turn shielded from client HTTP disconnects."""
+    resolved_options = options if options is not None else SyncChatOptions()
+    prepared = await prepare_generation(
+        session_factory,
+        persona_provider=persona_provider,
+        owner_id=owner_id,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        user_message=user_message,
+        requested_model_id=requested_model_id,
+        options=resolved_options,
+    )
+
+    coro = complete_prepared_sync_generation(
+        session_factory,
+        model_provider=model_provider,
+        prepared=prepared,
+        timeout_seconds=resolved_options.timeout_seconds,
+        max_history_messages=resolved_options.history_limit,
+        before_commit_hook=resolved_options.before_commit_hook,
+    )
+    if resolved_options.task_registry is not None:
+        task = resolved_options.task_registry.spawn(coro)
+    else:
+        task = asyncio.create_task(coro)
+        task.add_done_callback(_consume_detached_task_exception)
+
+    return await asyncio.shield(task)

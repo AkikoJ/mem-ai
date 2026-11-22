@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -13,6 +13,7 @@ from sqlalchemy.engine import URL
 AppEnv = Literal["development", "test", "production"]
 AuthMode = Literal["development", "jwt_hs256", "trusted_gateway"]
 MemoryProviderMode = Literal["disabled", "memos"]
+ModelProviderMode = Literal["disabled", "openai_compatible"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 ProxyNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
@@ -60,6 +61,42 @@ def _validate_required_secret(
             f"{field_name} must be at least "
             f"{_MIN_PRODUCTION_SECRET_LENGTH} characters in production"
         )
+
+
+def _validate_http_provider_settings(
+    *,
+    api_key: SecretStr | None,
+    base_url: str,
+    api_key_field: str,
+    base_url_field: str,
+    mode_field: str,
+    mode_value: str,
+) -> None:
+    secret = api_key.get_secret_value().strip() if api_key is not None else ""
+    if not secret:
+        raise ValueError(f"{api_key_field} must be set when {mode_field}={mode_value!r}")
+    if not base_url.startswith(("http://", "https://")):
+        raise ValueError(f"{base_url_field} must start with 'http://' or 'https://'")
+
+
+def _validate_model_registry_entries(entries: list[dict[str, Any]]) -> None:
+    seen_ids: set[str] = set()
+    for idx, entry in enumerate(entries):
+        model_id = entry.get("model_id")
+        if not isinstance(model_id, str) or not model_id.strip():
+            raise ValueError(f"model_registry_entries[{idx}].model_id must be a non-empty string")
+        normalized_id = model_id.strip()
+        if normalized_id in seen_ids:
+            raise ValueError(
+                f"model_registry_entries contains duplicate model_id {normalized_id!r}"
+            )
+        seen_ids.add(normalized_id)
+        for optional_str in ("provider_id", "upstream_model", "display_name"):
+            value = entry.get(optional_str)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(
+                    f"model_registry_entries[{idx}].{optional_str} must be a non-empty string"
+                )
 
 
 class Settings(BaseSettings):
@@ -139,6 +176,17 @@ class Settings(BaseSettings):
     memos_list_max_items: int = Field(default=1000, ge=1, le=5000)
     memory_list_snapshot_ttl_seconds: int = Field(default=600, ge=10, le=86400)
 
+    # Model provider (OpenAI-compatible) and chat generation budgets
+    model_provider_mode: ModelProviderMode = "disabled"
+    openai_compat_base_url: str = Field(default="https://api.openai.com/v1", min_length=1)
+    openai_compat_api_key: SecretStr | None = None
+    openai_compat_request_timeout_seconds: float = Field(default=60.0, gt=0.0)
+    model_default_id: str | None = None
+    model_registry_entries: list[dict[str, Any]] = Field(default_factory=list)
+    chat_generation_timeout_seconds: float = Field(default=60.0, gt=0.0)
+    chat_history_message_limit: int = Field(default=20, ge=0, le=200)
+    chat_lease_ttl_seconds: int = Field(default=60, ge=5, le=600)
+
     @model_validator(mode="after")
     def validate_production_boundaries(self) -> Settings:
         password = self.postgres_password.get_secret_value().strip()
@@ -206,11 +254,26 @@ class Settings(BaseSettings):
             )
 
         if self.memory_provider_mode == "memos":
-            api_key = self.memos_api_key.get_secret_value().strip() if self.memos_api_key else ""
-            if not api_key:
-                raise ValueError("memos_api_key must be set when memory_provider_mode='memos'")
-            if not self.memos_base_url.startswith(("http://", "https://")):
-                raise ValueError("memos_base_url must start with 'http://' or 'https://'")
+            _validate_http_provider_settings(
+                api_key=self.memos_api_key,
+                base_url=self.memos_base_url,
+                api_key_field="memos_api_key",
+                base_url_field="memos_base_url",
+                mode_field="memory_provider_mode",
+                mode_value="memos",
+            )
+
+        if self.model_provider_mode == "openai_compatible":
+            _validate_http_provider_settings(
+                api_key=self.openai_compat_api_key,
+                base_url=self.openai_compat_base_url,
+                api_key_field="openai_compat_api_key",
+                base_url_field="openai_compat_base_url",
+                mode_field="model_provider_mode",
+                mode_value="openai_compatible",
+            )
+
+        _validate_model_registry_entries(self.model_registry_entries)
 
         return self
 

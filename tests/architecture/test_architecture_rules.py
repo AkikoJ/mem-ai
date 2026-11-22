@@ -48,6 +48,7 @@ def test_assembled_fastapi_app_has_unique_method_and_canonical_routes() -> None:
     assert ("GET", "/health/live") in seen
     assert ("GET", "/health/ready") in seen
     assert ("GET", "/v1/users/me") in seen
+    assert ("POST", "/v1/chat") in seen
 
 
 def test_layered_import_rule_rejects_forbidden_contract_and_router_dependencies() -> None:

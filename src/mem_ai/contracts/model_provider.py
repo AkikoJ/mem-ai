@@ -35,6 +35,7 @@ class ModelRequest(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     model_id: str = Field(min_length=1)
+    upstream_model: str | None = Field(default=None, min_length=1)
     messages: list[ModelMessage] = Field(min_length=1)
     max_output_tokens: int | None = Field(default=None, ge=1)
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)

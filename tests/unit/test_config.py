@@ -200,3 +200,52 @@ def test_memos_memory_provider_mode_requires_api_key_and_valid_base_url() -> Non
     assert valid.memory_provider_mode == "memos"
     assert valid.memos_api_key is not None
     assert valid.memos_api_key.get_secret_value() == "server-memos-key"
+
+
+def test_openai_compatible_model_provider_mode_requires_api_key_and_valid_base_url() -> None:
+    with pytest.raises(ValidationError, match="openai_compat_api_key"):
+        Settings(
+            _env_file=None,
+            app_env="test",
+            model_provider_mode="openai_compatible",
+        )
+
+    with pytest.raises(ValidationError, match="openai_compat_base_url"):
+        Settings(
+            _env_file=None,
+            app_env="test",
+            model_provider_mode="openai_compatible",
+            openai_compat_api_key="server-model-key",
+            openai_compat_base_url="ftp://invalid.example.com",
+        )
+
+    valid = Settings(
+        _env_file=None,
+        app_env="test",
+        model_provider_mode="openai_compatible",
+        openai_compat_api_key="server-model-key",
+        openai_compat_base_url="https://llm.example.com/v1",
+        model_registry_entries=[
+            {"model_id": "gpt-4o-mini", "upstream_model": "vendor-gpt-4o-mini"}
+        ],
+    )
+    assert valid.model_provider_mode == "openai_compatible"
+    assert valid.openai_compat_api_key is not None
+    assert valid.openai_compat_api_key.get_secret_value() == "server-model-key"
+
+    with pytest.raises(ValidationError, match="model_registry_entries"):
+        Settings(
+            _env_file=None,
+            app_env="test",
+            model_registry_entries=[{"model_id": "   "}],
+        )
+
+    with pytest.raises(ValidationError, match="duplicate model_id"):
+        Settings(
+            _env_file=None,
+            app_env="test",
+            model_registry_entries=[
+                {"model_id": "dup-model"},
+                {"model_id": "dup-model"},
+            ],
+        )
