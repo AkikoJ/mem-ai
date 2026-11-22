@@ -31,6 +31,8 @@ MESSAGE_SEQUENCE_UNIQUE_CONSTRAINT = "uq_messages_conversation_id_sequence"
 MESSAGE_GENERATION_ROLE_UNIQUE_CONSTRAINT = "uq_messages_generation_id_role"
 GENERATION_USER_MESSAGE_FK = "fk_generations_user_message_id_messages"
 GENERATION_ASSISTANT_MESSAGE_FK = "fk_generations_assistant_message_id_messages"
+GENERATION_ACTIVE_CONVERSATION_UNIQUE_INDEX = "uq_generations_active_conversation"
+GENERATION_RUNNING_LEASE_EXPIRES_INDEX = "ix_generations_running_lease_expires_at"
 
 
 class Conversation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -83,6 +85,11 @@ class Generation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             name="status_valid",
         ),
         CheckConstraint("memory_epoch >= 0", name="memory_epoch_non_negative"),
+        CheckConstraint(
+            "(status = 'running' AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL) "
+            "OR (status <> 'running' AND lease_token IS NULL AND lease_expires_at IS NULL)",
+            name="lease_state_valid",
+        ),
         ForeignKeyConstraint(
             ["user_message_id"],
             ["messages.id"],
@@ -105,6 +112,17 @@ class Generation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ),
         Index("ix_generations_conversation_id_status", "conversation_id", "status"),
         Index("ix_generations_owner_id_created_at_id", "owner_id", "created_at", "id"),
+        Index(
+            GENERATION_ACTIVE_CONVERSATION_UNIQUE_INDEX,
+            "conversation_id",
+            unique=True,
+            postgresql_where=text("status = 'running'"),
+        ),
+        Index(
+            GENERATION_RUNNING_LEASE_EXPIRES_INDEX,
+            "lease_expires_at",
+            postgresql_where=text("status = 'running'"),
+        ),
     )
 
     conversation_id: Mapped[UUID] = mapped_column(

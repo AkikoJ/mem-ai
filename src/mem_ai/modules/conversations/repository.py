@@ -2,16 +2,51 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Literal
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import ColumnElement, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from mem_ai.contracts.model_provider import ModelUsage
 from mem_ai.modules.conversations.models import Conversation, Generation, Message
 from mem_ai.modules.conversations.schemas import MessageRole
+
+
+def normalize_utc(value: datetime) -> datetime:
+    """Normalize a datetime to timezone-aware UTC."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+async def get_database_now(session: AsyncSession) -> datetime:
+    """Return PostgreSQL's authoritative UTC transaction timestamp (`SELECT now()`)."""
+    db_now = await session.scalar(select(func.now()))
+    if not isinstance(db_now, datetime):
+        return datetime.now(UTC)
+    return normalize_utc(db_now)
+
+
+def _active_lease_conditions(
+    *,
+    generation_id: UUID,
+    conversation_id: UUID,
+    owner_id: UUID,
+    lease_token: str,
+    current_time: datetime,
+) -> tuple[ColumnElement[bool], ...]:
+    """Canonical SQL predicates guarding an active, unexpired generation lease."""
+    return (
+        Generation.id == generation_id,
+        Generation.conversation_id == conversation_id,
+        Generation.owner_id == owner_id,
+        Generation.status == "running",
+        Generation.lease_token == lease_token,
+        Generation.lease_expires_at.is_not(None),
+        Generation.lease_expires_at > current_time,
+    )
 
 
 async def get_conversation_for_owner(
@@ -24,6 +59,25 @@ async def get_conversation_for_owner(
     stmt = select(Conversation).where(
         Conversation.id == conversation_id,
         Conversation.owner_id == owner_id,
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def get_conversation_for_share(
+    session: AsyncSession,
+    *,
+    owner_id: UUID,
+    conversation_id: UUID,
+) -> Conversation | None:
+    """Fetch and shared-lock an owned conversation row (`FOR SHARE`)."""
+    stmt = (
+        select(Conversation)
+        .where(
+            Conversation.id == conversation_id,
+            Conversation.owner_id == owner_id,
+        )
+        .with_for_update(read=True)
     )
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
@@ -203,23 +257,103 @@ async def get_generation_for_owner(
     return result.scalar_one_or_none()
 
 
+async def get_running_generation_for_conversation(
+    session: AsyncSession,
+    *,
+    conversation_id: UUID,
+    for_update: bool = False,
+) -> Generation | None:
+    """Fetch the active `running` generation for `conversation_id`, if any."""
+    stmt = select(Generation).where(
+        Generation.conversation_id == conversation_id,
+        Generation.status == "running",
+    )
+    if for_update:
+        stmt = stmt.with_for_update()
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def list_expired_running_generations_for_update(
+    session: AsyncSession,
+    *,
+    current_time: datetime,
+    limit: int,
+) -> list[Generation]:
+    """Claim a bounded batch of expired `running` generations with `FOR UPDATE SKIP LOCKED`."""
+    stmt = (
+        select(Generation)
+        .where(
+            Generation.status == "running",
+            Generation.lease_expires_at.is_not(None),
+            Generation.lease_expires_at <= current_time,
+        )
+        .order_by(Generation.lease_expires_at.asc(), Generation.id.asc())
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def conditional_renew_generation_lease(
+    session: AsyncSession,
+    *,
+    generation_id: UUID,
+    conversation_id: UUID,
+    owner_id: UUID,
+    lease_token: str,
+    current_time: datetime,
+    new_lease_expires_at: datetime,
+) -> Generation | None:
+    """Extend an active, unexpired generation lease matching `lease_token`."""
+    stmt = (
+        update(Generation)
+        .where(
+            *_active_lease_conditions(
+                generation_id=generation_id,
+                conversation_id=conversation_id,
+                owner_id=owner_id,
+                lease_token=lease_token,
+                current_time=current_time,
+            )
+        )
+        .values(
+            lease_expires_at=new_lease_expires_at,
+            updated_at=func.now(),
+        )
+        .returning(Generation)
+        .execution_options(populate_existing=True)
+    )
+    result = await session.execute(stmt)
+    row = result.scalar_one_or_none()
+    await session.flush()
+    return row
+
+
 async def conditional_mark_generation_succeeded(
     session: AsyncSession,
     *,
     generation_id: UUID,
+    conversation_id: UUID,
+    owner_id: UUID,
     lease_token: str,
     assistant_message_id: UUID,
     usage: ModelUsage,
     finish_reason: str | None,
     completed_at: datetime,
 ) -> Generation | None:
-    """Atomically transition a `running` generation matching `lease_token` to `succeeded`."""
+    """Atomically mark an unexpired `running` generation matching `lease_token` as `succeeded`."""
     stmt = (
         update(Generation)
         .where(
-            Generation.id == generation_id,
-            Generation.status == "running",
-            Generation.lease_token == lease_token,
+            *_active_lease_conditions(
+                generation_id=generation_id,
+                conversation_id=conversation_id,
+                owner_id=owner_id,
+                lease_token=lease_token,
+                current_time=completed_at,
+            )
         )
         .values(
             status="succeeded",
@@ -248,19 +382,43 @@ async def conditional_mark_generation_terminal_failure(
     session: AsyncSession,
     *,
     generation_id: UUID,
+    conversation_id: UUID,
+    owner_id: UUID,
     target_status: Literal["failed", "cancelled"],
     lease_token: str | None,
+    current_time: datetime,
     error_code: str,
     error_message: str,
-    completed_at: datetime,
+    expired_only: bool = False,
 ) -> Generation | None:
-    """Conditionally transition a `running` generation to `failed` or `cancelled`."""
-    conditions = [
-        Generation.id == generation_id,
-        Generation.status == "running",
-    ]
-    if lease_token is not None:
-        conditions.append(Generation.lease_token == lease_token)
+    """Conditionally transition a `running` generation to `failed` or `cancelled` and release lease.
+
+    - `expired_only=False` (active executor): requires matching `lease_token` and unexpired lease.
+    - `expired_only=True` (takeover / Worker recovery): requires `lease_expires_at <= current_time`.
+    """
+    if expired_only:
+        conditions: list[ColumnElement[bool]] = [
+            Generation.id == generation_id,
+            Generation.conversation_id == conversation_id,
+            Generation.owner_id == owner_id,
+            Generation.status == "running",
+            Generation.lease_expires_at.is_not(None),
+            Generation.lease_expires_at <= current_time,
+        ]
+        if lease_token is not None:
+            conditions.append(Generation.lease_token == lease_token)
+    else:
+        if lease_token is None:
+            raise ValueError("lease_token is required for active-executor failure convergence")
+        conditions = list(
+            _active_lease_conditions(
+                generation_id=generation_id,
+                conversation_id=conversation_id,
+                owner_id=owner_id,
+                lease_token=lease_token,
+                current_time=current_time,
+            )
+        )
 
     stmt = (
         update(Generation)
@@ -271,7 +429,7 @@ async def conditional_mark_generation_terminal_failure(
             error_message=error_message[:500],
             lease_token=None,
             lease_expires_at=None,
-            completed_at=completed_at,
+            completed_at=current_time,
             updated_at=func.now(),
         )
         .returning(Generation)

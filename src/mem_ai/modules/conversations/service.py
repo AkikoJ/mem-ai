@@ -16,8 +16,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Coroutine, Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass
+from types import TracebackType
 from typing import Any, TypeVar
 from uuid import UUID
 
@@ -67,7 +68,8 @@ class SyncChatOptions:
     require_streaming: bool = False
     required_capabilities: frozenset[str] = frozenset()
     history_limit: int = 20
-    lease_ttl_seconds: int = 60
+    lease_ttl_seconds: float = 60.0
+    lease_renew_interval_seconds: float | None = 20.0
     timeout_seconds: float | None = None
     task_registry: SyncGenerationTaskRegistry | None = None
     before_commit_hook: BeforeCommitHook | None = None
@@ -86,10 +88,83 @@ def sync_chat_options_from_settings(
         user_permissions=user_permissions,
         require_streaming=require_streaming,
         history_limit=settings.chat_history_message_limit,
-        lease_ttl_seconds=settings.chat_lease_ttl_seconds,
+        lease_ttl_seconds=float(settings.chat_lease_ttl_seconds),
+        lease_renew_interval_seconds=settings.chat_lease_renew_interval_seconds,
         timeout_seconds=settings.chat_generation_timeout_seconds,
         task_registry=task_registry,
     )
+
+
+class GenerationLeaseHeartbeat:
+    """Periodic lease renewal context manager shared by sync and streaming generation execution."""
+
+    def __init__(
+        self,
+        *,
+        session_factory: async_sessionmaker[AsyncSession],
+        prepared: PreparedGeneration,
+        lease_ttl_seconds: float,
+        renew_interval_seconds: float | None,
+        on_lease_lost: Callable[[AppError], None] | None = None,
+    ) -> None:
+        self._session_factory = session_factory
+        self._prepared = prepared
+        self._lease_ttl_seconds = lease_ttl_seconds
+        self._renew_interval_seconds = renew_interval_seconds
+        self._on_lease_lost = on_lease_lost
+        self._task: asyncio.Task[None] | None = None
+        self.loss_error: AppError | None = None
+
+    async def __aenter__(self) -> GenerationLeaseHeartbeat:
+        if self._renew_interval_seconds is not None and self._renew_interval_seconds > 0:
+            self._task = asyncio.create_task(self._run_loop())
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        _ = (exc_type, exc, tb)
+        await self.stop()
+
+    async def stop(self) -> None:
+        """Stop the background renewal loop cleanly before Tx 2 or failure convergence."""
+        task = self._task
+        self._task = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    async def _run_loop(self) -> None:
+        assert self._renew_interval_seconds is not None
+        while True:
+            await asyncio.sleep(self._renew_interval_seconds)
+            try:
+                await generation_store.renew_generation_lease_phase(
+                    self._session_factory,
+                    owner_id=self._prepared.owner_id,
+                    conversation_id=self._prepared.conversation_id,
+                    generation_id=self._prepared.generation_id,
+                    lease_token=self._prepared.lease_token,
+                    lease_ttl_seconds=self._lease_ttl_seconds,
+                )
+            except AppError as exc:
+                self.loss_error = exc
+                if self._on_lease_lost is not None:
+                    self._on_lease_lost(exc)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Transient error renewing generation lease; retrying before expiry",
+                    exc_info=True,
+                )
 
 
 class SyncGenerationTaskRegistry:
@@ -267,10 +342,14 @@ async def _safe_converge_failure(
     error_code: str,
     error_message: str,
 ) -> None:
+    if error_code == "generation_lease_lost":
+        return
     try:
         await generation_store.converge_generation_failure_phase(
             session_factory,
             generation_id=prepared.generation_id,
+            owner_id=prepared.owner_id,
+            conversation_id=prepared.conversation_id,
             lease_token=prepared.lease_token,
             target_status="failed",
             error_code=error_code,
@@ -294,6 +373,8 @@ async def complete_prepared_sync_generation(
     prepared: PreparedGeneration,
     timeout_seconds: float | None = None,
     max_history_messages: int | None = 20,
+    lease_ttl_seconds: float = 60.0,
+    lease_renew_interval_seconds: float | None = 20.0,
     before_commit_hook: BeforeCommitHook | None = None,
 ) -> CommittedChatResult:
     """Run context compilation, external model completion, and atomic Tx 2 commit/convergence."""
@@ -301,17 +382,49 @@ async def complete_prepared_sync_generation(
         conversation_id=str(prepared.conversation_id),
         generation_id=str(prepared.generation_id),
     )
+    model_task: asyncio.Task[ModelResponse] | None = None
+
+    def _abort_model_on_lease_lost(_error: AppError) -> None:
+        if model_task is not None and not model_task.done():
+            model_task.cancel()
+
     try:
         try:
-            context = prepare_context(
+            async with GenerationLeaseHeartbeat(
+                session_factory=session_factory,
                 prepared=prepared,
-                max_history_messages=max_history_messages,
-            )
-            model_response = await execute_model_completion(
-                model_provider=model_provider,
-                context=context,
-                timeout_seconds=timeout_seconds,
-            )
+                lease_ttl_seconds=lease_ttl_seconds,
+                renew_interval_seconds=lease_renew_interval_seconds,
+                on_lease_lost=_abort_model_on_lease_lost,
+            ) as heartbeat:
+                context = prepare_context(
+                    prepared=prepared,
+                    max_history_messages=max_history_messages,
+                )
+                if heartbeat.loss_error is not None:
+                    raise heartbeat.loss_error
+
+                model_task = asyncio.create_task(
+                    execute_model_completion(
+                        model_provider=model_provider,
+                        context=context,
+                        timeout_seconds=timeout_seconds,
+                    )
+                )
+                try:
+                    model_response = await model_task
+                except asyncio.CancelledError:
+                    if heartbeat.loss_error is not None:
+                        raise heartbeat.loss_error from None
+                    raise
+                finally:
+                    if not model_task.done():
+                        model_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await model_task
+
+                if heartbeat.loss_error is not None:
+                    raise heartbeat.loss_error
         except AppError as exc:
             await _safe_converge_failure(
                 session_factory,
@@ -403,6 +516,8 @@ async def run_sync_chat(
         prepared=prepared,
         timeout_seconds=resolved_options.timeout_seconds,
         max_history_messages=resolved_options.history_limit,
+        lease_ttl_seconds=resolved_options.lease_ttl_seconds,
+        lease_renew_interval_seconds=resolved_options.lease_renew_interval_seconds,
         before_commit_hook=resolved_options.before_commit_hook,
     )
     if resolved_options.task_registry is not None:

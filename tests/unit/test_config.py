@@ -316,3 +316,26 @@ def test_model_routing_policy_and_registry_entry_validation() -> None:
                 {"model_id": "bad-int", "max_output_tokens": 0},
             ],
         )
+
+
+def test_chat_lease_renew_interval_must_be_strictly_less_than_ttl() -> None:
+    defaults = Settings(_env_file=None, app_env="test")
+    assert defaults.chat_lease_ttl_seconds == 60
+    assert defaults.chat_lease_renew_interval_seconds == 20.0
+    assert defaults.chat_lease_renew_interval_seconds < defaults.chat_lease_ttl_seconds
+
+    with pytest.raises(ValidationError, match="chat_lease_renew_interval_seconds"):
+        Settings(
+            _env_file=None,
+            app_env="test",
+            chat_lease_ttl_seconds=10,
+            chat_lease_renew_interval_seconds=10.0,
+        )
+
+    with pytest.raises(ValidationError, match="chat_lease_renew_interval_seconds"):
+        Settings(
+            _env_file=None,
+            app_env="test",
+            chat_lease_ttl_seconds=10,
+            chat_lease_renew_interval_seconds=15.0,
+        )

@@ -215,6 +215,8 @@ async def test_sync_chat_commits_user_message_before_model_and_filters_failed_tu
         )
         cancelled_record = await generation_store.converge_generation_failure_phase(
             session_factory,
+            owner_id=alice.id,
+            conversation_id=prepared_cancelled.conversation_id,
             generation_id=prepared_cancelled.generation_id,
             lease_token=prepared_cancelled.lease_token,
             target_status="cancelled",

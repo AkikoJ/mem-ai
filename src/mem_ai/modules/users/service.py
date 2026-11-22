@@ -34,9 +34,10 @@ async def ensure_user_active_in_session(
     session: AsyncSession,
     *,
     user_id: UUID,
+    for_share: bool = False,
 ) -> UserRecord:
     """Verify inside an existing transaction that a user still exists and is active."""
-    user = await repository.get_user_by_id(session, user_id=user_id)
+    user = await repository.get_user_by_id(session, user_id=user_id, for_share=for_share)
     if user is None:
         raise ForbiddenError(
             code="user_not_active",

@@ -72,7 +72,7 @@ async def test_health_live_and_ready_with_request_id_and_json_access_log(
                     "message": "ok",
                     "data": {
                         "database": "ok",
-                        "migration_revision": "20261122_0005",
+                        "migration_revision": "20261122_0006",
                     },
                     "request_id": "req_custom_123",
                 }
@@ -272,7 +272,7 @@ async def test_shared_async_client_fixture_and_main_asgi_entrypoint(
     assert body["code"] == "ok"
     assert body["data"] == {
         "database": "ok",
-        "migration_revision": "20261122_0005",
+        "migration_revision": "20261122_0006",
     }
 
 

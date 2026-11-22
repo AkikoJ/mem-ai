@@ -239,6 +239,7 @@ class Settings(BaseSettings):
     chat_generation_timeout_seconds: float = Field(default=60.0, gt=0.0)
     chat_history_message_limit: int = Field(default=20, ge=0, le=200)
     chat_lease_ttl_seconds: int = Field(default=60, ge=5, le=600)
+    chat_lease_renew_interval_seconds: float = Field(default=20.0, gt=0.0, le=300.0)
 
     @model_validator(mode="after")
     def validate_production_boundaries(self) -> Settings:
@@ -330,6 +331,12 @@ class Settings(BaseSettings):
             raise ValueError("model_default_id must not be blank when set")
         if self.model_forced_id is not None and not self.model_forced_id.strip():
             raise ValueError("model_forced_id must not be blank when set")
+
+        if self.chat_lease_renew_interval_seconds >= self.chat_lease_ttl_seconds:
+            raise ValueError(
+                "chat_lease_renew_interval_seconds must be strictly less than "
+                "chat_lease_ttl_seconds"
+            )
 
         _validate_model_registry_entries(self.model_registry_entries)
 

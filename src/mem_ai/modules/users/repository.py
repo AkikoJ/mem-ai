@@ -12,9 +12,16 @@ from mem_ai.modules.users.models import User, UserIdentity
 from mem_ai.modules.users.schemas import UserStatus
 
 
-async def get_user_by_id(session: AsyncSession, *, user_id: UUID) -> User | None:
-    """Fetch a local user row by primary key."""
+async def get_user_by_id(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    for_share: bool = False,
+) -> User | None:
+    """Fetch a local user row by primary key, optionally acquiring a `FOR SHARE` row lock."""
     stmt = select(User).where(User.id == user_id)
+    if for_share:
+        stmt = stmt.with_for_update(read=True)
     return await session.scalar(stmt)
 
 
