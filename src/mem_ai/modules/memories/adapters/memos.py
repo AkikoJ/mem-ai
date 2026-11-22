@@ -99,21 +99,25 @@ def _extract_scope_metadata(raw: dict[str, Any]) -> tuple[MemoryScope, UUID | No
             with contextlib.suppress(ValueError):
                 memory_epoch = max(0, int(tag[len(_TAG_EPOCH_PREFIX) :]))
 
-    scene = info.get("scene")
+    scene = info.get("scene") if "scene" in info else raw.get("scene")
     if scene == "scope:conversation":
         scope = "conversation"
     elif scene == "scope:user":
         scope = "user"
 
     if conversation_id is None:
-        business_type = info.get("business_type")
+        business_type = (
+            info.get("business_type") if "business_type" in info else raw.get("business_type")
+        )
         if isinstance(business_type, str) and business_type.startswith("conv:"):
             conversation_id = _parse_uuid(business_type[len("conv:") :])
         elif scope == "conversation":
             conversation_id = _parse_uuid(raw.get("conversation_id"))
 
     if memory_epoch == 0:
-        custom_status = info.get("custom_status")
+        custom_status = (
+            info.get("custom_status") if "custom_status" in info else raw.get("custom_status")
+        )
         if isinstance(custom_status, str) and custom_status.startswith("epoch:"):
             with contextlib.suppress(ValueError):
                 memory_epoch = max(0, int(custom_status[len("epoch:") :]))
@@ -527,23 +531,31 @@ class MemOSMemoryProvider:
         )
 
     async def recall(self, query: MemoryRecallQuery) -> list[MemoryRecallItem]:
-        """Recall relevant scoped memories via MemOS `POST /search/memory` (extended in 08)."""
+        """Recall relevant scoped memories via MemOS `POST /search/memory`."""
+        if query.scope == "conversation" and query.conversation_id is None:
+            return []
+
         filter_conditions: list[dict[str, Any]] = [
             {"tags": {"contains": f"{_TAG_SCOPE_PREFIX}{query.scope}"}},
+            {"scene": f"scope:{query.scope}"},
         ]
         if query.scope == "conversation" and query.conversation_id is not None:
-            filter_conditions.append(
-                {"tags": {"contains": f"{_TAG_CONV_PREFIX}{query.conversation_id}"}}
-            )
+            conv_str = str(query.conversation_id)
+            filter_conditions.append({"tags": {"contains": f"{_TAG_CONV_PREFIX}{conv_str}"}})
+            filter_conditions.append({"business_type": f"conv:{conv_str}"})
+
+        # MemOS Cloud caps search output limits at 25 per category.
+        bounded_limit = min(query.limit, 25)
         payload: dict[str, Any] = {
             "user_id": str(query.user_id),
             "query": query.query,
-            "memory_limit_number": query.limit,
+            "memory_limit_number": bounded_limit,
+            "preference_limit_number": bounded_limit,
             "include_preference": True,
             "include_tool_memory": False,
             "filter": {"and": filter_conditions},
         }
-        if query.conversation_id is not None:
+        if query.scope == "conversation" and query.conversation_id is not None:
             payload["conversation_id"] = str(query.conversation_id)
         if query.min_relevance is not None:
             payload["relativity"] = query.min_relevance
@@ -561,29 +573,58 @@ class MemOSMemoryProvider:
             fallback_time=self._now(),
         )
         relevances: dict[str, float] = {}
-        for key in ("memory_detail_list", "preference_detail_list"):
+        for key in ("memory_detail_list", "preference_detail_list", "memories"):
             entries = outcome.data.get(key)
-            if isinstance(entries, list):
-                for entry in entries:
-                    if isinstance(entry, dict) and isinstance(entry.get("id"), str):
-                        rel = entry.get("relativity")
-                        if isinstance(rel, (int, float)):
-                            relevances[entry["id"].strip()] = float(rel)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                raw_id = entry.get("id") or entry.get("memory_id")
+                if not isinstance(raw_id, str) or not raw_id.strip():
+                    continue
+                raw_rel: Any = None
+                for rel_key in ("relativity", "relevance", "score"):
+                    if entry.get(rel_key) is not None:
+                        raw_rel = entry.get(rel_key)
+                        break
+                if isinstance(raw_rel, (int, float)) and not isinstance(raw_rel, bool):
+                    clamped = max(0.0, min(1.0, float(raw_rel)))
+                    relevances[raw_id.strip()] = clamped
 
-        recalled = [
-            MemoryRecallItem(
-                memory_id=rec.memory_id,
-                provider_id=self.provider_id,
-                scope=rec.scope,
-                content=rec.content,
-                relevance=relevances.get(rec.memory_id),
-                conversation_id=rec.conversation_id,
-                memory_epoch=rec.memory_epoch,
+        recalled: list[MemoryRecallItem] = []
+        for rec in parsed:
+            if rec.scope != query.scope:
+                continue
+            if query.scope == "conversation" and rec.conversation_id != query.conversation_id:
+                continue
+            if query.scope == "user" and rec.conversation_id is not None:
+                continue
+            rel = relevances.get(rec.memory_id)
+            if query.min_relevance is not None:
+                if rel is None:
+                    if query.min_relevance > 0.0:
+                        continue
+                elif rel < query.min_relevance:
+                    continue
+            recalled.append(
+                MemoryRecallItem(
+                    memory_id=rec.memory_id,
+                    provider_id=self.provider_id,
+                    scope=rec.scope,
+                    content=rec.content,
+                    relevance=rel,
+                    conversation_id=rec.conversation_id,
+                    memory_epoch=rec.memory_epoch,
+                )
             )
-            for rec in parsed
-            if rec.scope == query.scope
-            and (query.scope != "conversation" or rec.conversation_id == query.conversation_id)
-        ]
+        recalled.sort(
+            key=lambda item: (
+                -(item.relevance if item.relevance is not None else -1.0),
+                -item.memory_epoch,
+                item.memory_id,
+            )
+        )
         return recalled[: query.limit]
 
     async def delete_memory(self, *, user_id: UUID, memory_id: str) -> MemoryDeleteResult:

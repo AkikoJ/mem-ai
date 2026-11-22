@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Literal
 from uuid import UUID
@@ -9,8 +10,14 @@ from uuid import UUID
 from sqlalchemy import ColumnElement, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from mem_ai.contracts.memory_provider import MemoryRecallItem
 from mem_ai.contracts.model_provider import ModelUsage
-from mem_ai.modules.conversations.models import Conversation, Generation, Message
+from mem_ai.modules.conversations.models import (
+    Conversation,
+    Generation,
+    Message,
+    MessageRecalledMemory,
+)
 from mem_ai.modules.conversations.schemas import MessageRole
 
 
@@ -439,3 +446,93 @@ async def conditional_mark_generation_terminal_failure(
     row = result.scalar_one_or_none()
     await session.flush()
     return row
+
+
+async def get_active_generation_by_lease(
+    session: AsyncSession,
+    *,
+    generation_id: UUID,
+    conversation_id: UUID,
+    owner_id: UUID,
+    lease_token: str,
+    current_time: datetime,
+) -> Generation | None:
+    """Verify and lock an active, unexpired `running` generation matching `lease_token`."""
+    stmt = (
+        select(Generation)
+        .where(
+            *_active_lease_conditions(
+                generation_id=generation_id,
+                conversation_id=conversation_id,
+                owner_id=owner_id,
+                lease_token=lease_token,
+                current_time=current_time,
+            )
+        )
+        .with_for_update()
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def get_message_for_conversation(
+    session: AsyncSession,
+    *,
+    conversation_id: UUID,
+    message_id: UUID,
+    generation_id: UUID | None = None,
+    role: MessageRole | None = None,
+) -> Message | None:
+    """Fetch a message verified against its conversation (and optional generation/role)."""
+    conditions: list[ColumnElement[bool]] = [
+        Message.id == message_id,
+        Message.conversation_id == conversation_id,
+    ]
+    if generation_id is not None:
+        conditions.append(Message.generation_id == generation_id)
+    if role is not None:
+        conditions.append(Message.role == role)
+    stmt = select(Message).where(*conditions)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def create_recalled_memory_references(
+    session: AsyncSession,
+    *,
+    user_message_id: UUID,
+    items: Sequence[MemoryRecallItem],
+    recalled_at: datetime,
+) -> list[MessageRecalledMemory]:
+    """Insert ordered metadata-only rows in `message_recalled_memories` (1-based position)."""
+    rows: list[MessageRecalledMemory] = []
+    for position, item in enumerate(items, start=1):
+        row = MessageRecalledMemory(
+            user_message_id=user_message_id,
+            provider_id=item.provider_id,
+            memory_id=item.memory_id,
+            scope=item.scope,
+            relevance=item.relevance,
+            prompt_position=position,
+            memory_epoch=item.memory_epoch,
+            recalled_at=recalled_at,
+        )
+        session.add(row)
+        rows.append(row)
+    await session.flush()
+    return rows
+
+
+async def list_recalled_memories_for_user_message(
+    session: AsyncSession,
+    *,
+    user_message_id: UUID,
+) -> list[MessageRecalledMemory]:
+    """Return metadata-only recalled memory references ordered by `prompt_position` ascending."""
+    stmt = (
+        select(MessageRecalledMemory)
+        .where(MessageRecalledMemory.user_message_id == user_message_id)
+        .order_by(MessageRecalledMemory.prompt_position.asc(), MessageRecalledMemory.id.asc())
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())

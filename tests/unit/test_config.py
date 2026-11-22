@@ -339,3 +339,21 @@ def test_chat_lease_renew_interval_must_be_strictly_less_than_ttl() -> None:
             chat_lease_ttl_seconds=10,
             chat_lease_renew_interval_seconds=15.0,
         )
+
+
+def test_chat_memory_recall_budget_settings_validation() -> None:
+    defaults = Settings(_env_file=None, app_env="test")
+    assert defaults.chat_memory_recall_timeout_seconds == 5.0
+    assert defaults.chat_memory_min_relevance == 0.5
+    assert defaults.chat_memory_max_items == 10
+    assert defaults.chat_memory_context_max_chars == 2000
+    assert defaults.chat_prompt_max_chars == 24000
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, app_env="test", chat_memory_min_relevance=1.5)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, app_env="test", chat_memory_recall_timeout_seconds=0.0)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, app_env="test", chat_prompt_max_chars=100)

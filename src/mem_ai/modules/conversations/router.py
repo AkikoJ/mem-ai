@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Request
 
 from mem_ai.api.dependencies import (
     ModelProviderDep,
+    OptionalMemoryProviderDep,
     PersonaProviderDep,
     SessionFactoryDep,
     SettingsDep,
@@ -47,6 +48,7 @@ async def post_chat(
     session_factory: SessionFactoryDep,
     persona_provider: PersonaProviderDep,
     model_provider: ModelProviderDep,
+    memory_provider: OptionalMemoryProviderDep,
     task_registry: SyncTaskRegistryDep,
 ) -> ApiResponse[ChatResponse]:
     """Start or continue a synchronous conversation turn."""
@@ -60,6 +62,7 @@ async def post_chat(
         session_factory,
         persona_provider=persona_provider,
         model_provider=model_provider,
+        memory_provider=memory_provider,
         owner_id=auth.user_id,
         agent_id=payload.agent_id,
         conversation_id=payload.conversation_id,

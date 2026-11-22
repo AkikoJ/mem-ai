@@ -16,6 +16,7 @@ from pydantic import SecretStr
 from mem_ai.contracts.memory_provider import (
     MemoryListQuery,
     MemoryProvider,
+    MemoryRecallQuery,
     MemoryWriteInput,
 )
 from mem_ai.core.config import Settings
@@ -506,5 +507,258 @@ async def test_memos_list_memories_maps_upstream_timeout_and_errors(
             await provider.list_memories(MemoryListQuery(user_id=user_id, limit=10))
         assert bad_gw.value.code == "memory_provider_error"
     finally:
+        await client.aclose()
+        await engine.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
+async def test_memos_recall_filters_by_tags_info_scope_user_and_redacts_logs(
+    migrated_pg_settings: Settings,
+) -> None:
+    engine = create_async_engine_from_settings(migrated_pg_settings)
+    session_factory = create_session_factory(engine)
+    captured_requests: list[tuple[str, dict[str, str], dict[str, Any]]] = []
+    mode = {"behavior": "user_and_conv"}
+
+    alice_id = uuid4()
+    bob_id = uuid4()
+    conv_a = uuid4()
+    conv_b = uuid4()
+    secret_query = "SENSITIVE_RECALL_QUERY_XYZ"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured_requests.append((str(request.url), dict(request.headers), body))
+        if mode["behavior"] == "timeout":
+            raise httpx.ReadTimeout("recall slow", request=request)
+        if mode["behavior"] == "connect":
+            raise httpx.ConnectError("recall down", request=request)
+        if mode["behavior"] == "server_error":
+            return httpx.Response(500, json={"code": 500, "message": "boom"})
+
+        if body.get("conversation_id") == str(conv_a):
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "message": "ok",
+                    "data": {
+                        "memory_detail_list": [
+                            {
+                                "id": "mem_conv_a_ok",
+                                "user_id": str(alice_id),
+                                "memory_value": "Conv A task context",
+                                "conversation_id": str(conv_a),
+                                "tags": [
+                                    "memai:scope:conversation",
+                                    f"memai:conv:{conv_a}",
+                                    "memai:epoch:2",
+                                ],
+                                "relativity": 0.88,
+                            },
+                            {
+                                "id": "mem_conv_b_leak",
+                                "user_id": str(alice_id),
+                                "memory_value": "Conv B leaked item",
+                                "conversation_id": str(conv_b),
+                                "tags": ["memai:scope:conversation", f"memai:conv:{conv_b}"],
+                                "relativity": 0.99,
+                            },
+                            {
+                                "id": "mem_bob_leak",
+                                "user_id": str(bob_id),
+                                "memory_value": "Bob secret",
+                                "conversation_id": str(conv_a),
+                                "tags": ["memai:scope:conversation", f"memai:conv:{conv_a}"],
+                                "relativity": 0.99,
+                            },
+                        ],
+                        "preference_detail_list": [],
+                    },
+                },
+            )
+
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "message": "ok",
+                "data": {
+                    "memory_detail_list": [
+                        {
+                            "id": "mem_user_ok",
+                            "user_id": str(alice_id),
+                            "memory_value": "Alice prefers concise answers",
+                            "scene": "scope:user",
+                            "custom_status": "epoch:2",
+                            "relativity": 0.91,
+                        },
+                        {
+                            "id": "mem_user_low_rel",
+                            "user_id": str(alice_id),
+                            "memory_value": "Low relevance item",
+                            "tags": ["memai:scope:user"],
+                            "relativity": 0.2,
+                        },
+                        {
+                            "id": "mem_user_zero_rel",
+                            "user_id": str(alice_id),
+                            "memory_value": "Zero relevance item",
+                            "tags": ["memai:scope:user"],
+                            "relativity": 0.0,
+                        },
+                        {
+                            "id": "mem_wrong_scope",
+                            "user_id": str(alice_id),
+                            "memory_value": "Conversation memory returned in user search",
+                            "tags": ["memai:scope:conversation", f"memai:conv:{conv_a}"],
+                            "relativity": 0.97,
+                        },
+                    ],
+                    "preference_detail_list": [
+                        {
+                            "id": "pref_user_1",
+                            "user_id": str(alice_id),
+                            "preference": "Prefers Python 3.13",
+                            "tags": ["memai:scope:user", "memai:epoch:2"],
+                            "relativity": 0.96,
+                        }
+                    ],
+                },
+            },
+        )
+
+    provider, client = _make_memos_provider(session_factory=session_factory, handler=handler)
+    log_buffer = StringIO()
+    log_handler = logging.StreamHandler(log_buffer)
+    log_handler.setFormatter(JsonLogFormatter())
+    logger = logging.getLogger("mem_ai")
+    logger.addHandler(log_handler)
+    logger.setLevel(logging.DEBUG)
+
+    try:
+        # 1. User-scoped recall sends `tags` + `scene` filters, omits conversation_id,
+        # caps limit <= 25, parses both facts and preferences, and filters low-rel/wrong-scope.
+        user_items = await provider.recall(
+            MemoryRecallQuery(
+                user_id=alice_id,
+                query=secret_query,
+                scope="user",
+                limit=40,
+                min_relevance=0.5,
+            )
+        )
+        assert [item.memory_id for item in user_items] == ["pref_user_1", "mem_user_ok"]
+        assert user_items[0].content == "Prefers Python 3.13"
+        assert user_items[0].relevance == pytest.approx(0.96)
+        assert user_items[1].memory_epoch == 2
+        assert user_items[1].relevance == pytest.approx(0.91)
+
+        url_u, headers_u, payload_u = captured_requests[-1]
+        assert url_u == f"{_BASE_URL}/search/memory"
+        assert headers_u["authorization"] == f"Token {_SECRET_API_KEY}"
+        assert "conversation_id" not in payload_u
+        assert payload_u["memory_limit_number"] == 25
+        assert payload_u["preference_limit_number"] == 25
+        assert payload_u["relativity"] == pytest.approx(0.5)
+        and_filters_u = payload_u["filter"]["and"]
+        assert {"tags": {"contains": "memai:scope:user"}} in and_filters_u
+        assert {"scene": "scope:user"} in and_filters_u
+
+        # 2. Conversation-scoped recall sends `tags` + `scene` + `business_type` + conversation_id
+        # and drops other conversations & foreign users returned by a buggy upstream.
+        conv_items = await provider.recall(
+            MemoryRecallQuery(
+                user_id=alice_id,
+                query=secret_query,
+                scope="conversation",
+                conversation_id=conv_a,
+                limit=5,
+                min_relevance=0.5,
+            )
+        )
+        assert [item.memory_id for item in conv_items] == ["mem_conv_a_ok"]
+        assert conv_items[0].conversation_id == conv_a
+        assert conv_items[0].memory_epoch == 2
+
+        _, _, payload_c = captured_requests[-1]
+        assert payload_c["conversation_id"] == str(conv_a)
+        and_filters_c = payload_c["filter"]["and"]
+        assert {"tags": {"contains": "memai:scope:conversation"}} in and_filters_c
+        assert {"tags": {"contains": f"memai:conv:{conv_a}"}} in and_filters_c
+        assert {"scene": "scope:conversation"} in and_filters_c
+        assert {"business_type": f"conv:{conv_a}"} in and_filters_c
+
+        # 3. Conversation scope without conversation_id safely returns empty without HTTP call.
+        calls_before = len(captured_requests)
+        empty_items = await provider.recall(
+            MemoryRecallQuery(
+                user_id=alice_id,
+                query=secret_query,
+                scope="conversation",
+                conversation_id=None,
+                limit=5,
+            )
+        )
+        assert empty_items == []
+        assert len(captured_requests) == calls_before
+
+        # 3b. Relevance sorting occurs BEFORE `limit` truncation (high-relevance preference
+        #     beats lower-relevance fact even when fact appeared first in upstream response),
+        #     and `min_relevance=0.0` retains unscored items consistently.
+        top_one = await provider.recall(
+            MemoryRecallQuery(
+                user_id=alice_id,
+                query=secret_query,
+                scope="user",
+                limit=1,
+                min_relevance=0.5,
+            )
+        )
+        assert [item.memory_id for item in top_one] == ["pref_user_1"]
+        zero_thresh = await provider.recall(
+            MemoryRecallQuery(
+                user_id=alice_id,
+                query=secret_query,
+                scope="user",
+                limit=10,
+                min_relevance=0.0,
+            )
+        )
+        assert [item.memory_id for item in zero_thresh] == [
+            "pref_user_1",
+            "mem_user_ok",
+            "mem_user_low_rel",
+            "mem_user_zero_rel",
+        ]
+
+        # 4. Upstream errors map cleanly and never leak API key or query text in logs.
+        mode["behavior"] = "timeout"
+        with pytest.raises(GatewayTimeoutError) as timeout_err:
+            await provider.recall(
+                MemoryRecallQuery(user_id=alice_id, query=secret_query, scope="user", limit=5)
+            )
+        assert timeout_err.value.code == "memory_provider_timeout"
+
+        mode["behavior"] = "connect"
+        with pytest.raises(ServiceUnavailableError) as conn_err:
+            await provider.recall(
+                MemoryRecallQuery(user_id=alice_id, query=secret_query, scope="user", limit=5)
+            )
+        assert conn_err.value.code == "memory_provider_unavailable"
+
+        mode["behavior"] = "server_error"
+        with pytest.raises(BadGatewayError) as bad_gw:
+            await provider.recall(
+                MemoryRecallQuery(user_id=alice_id, query=secret_query, scope="user", limit=5)
+            )
+        assert bad_gw.value.code == "memory_provider_error"
+
+        all_logs = log_buffer.getvalue()
+        assert _SECRET_API_KEY not in all_logs
+        assert secret_query not in all_logs
+    finally:
+        logger.removeHandler(log_handler)
         await client.aclose()
         await engine.dispose()

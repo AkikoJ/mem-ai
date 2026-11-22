@@ -30,6 +30,36 @@ from mem_ai.core.exceptions import (
 )
 from mem_ai.modules.jobs import service as jobs_service
 from mem_ai.modules.memories import repository
+from mem_ai.modules.memories.recall import (
+    MemoryBarrierState as MemoryBarrierState,
+)
+from mem_ai.modules.memories.recall import (
+    MemoryRecallGuard as MemoryRecallGuard,
+)
+from mem_ai.modules.memories.recall import (
+    MemoryRecallOutcome as MemoryRecallOutcome,
+)
+from mem_ai.modules.memories.recall import (
+    MemoryRecallPolicy as MemoryRecallPolicy,
+)
+from mem_ai.modules.memories.recall import (
+    TombstoneLookup as TombstoneLookup,
+)
+from mem_ai.modules.memories.recall import (
+    filter_injectable_memories_in_session as filter_injectable_memories_in_session,
+)
+from mem_ai.modules.memories.recall import (
+    get_memory_epoch_in_session as get_memory_epoch_in_session,
+)
+from mem_ai.modules.memories.recall import (
+    load_recall_guard_in_session as load_recall_guard_in_session,
+)
+from mem_ai.modules.memories.recall import (
+    recall_relevant_memories as recall_relevant_memories,
+)
+from mem_ai.modules.memories.recall import (
+    select_memories_for_prompt as select_memories_for_prompt,
+)
 from mem_ai.modules.memories.schemas import (
     AcceptedMemoryOutcome,
     CreatedMemoryOutcome,

@@ -12,7 +12,9 @@ from mem_ai.contracts.model_provider import ModelMessage
 from mem_ai.contracts.persona_provider import MemoryPolicy, PersonaSnapshot
 from mem_ai.modules.conversations.prompt import (
     DEFAULT_PLATFORM_RULES,
+    CompiledPrompt,
     PromptHistoryMessage,
+    compile_chat_context,
     compile_chat_prompt,
 )
 
@@ -132,3 +134,79 @@ def test_compile_chat_prompt_rejects_empty_current_input() -> None:
             history_messages=[],
             current_input="   ",
         )
+
+
+def test_compile_chat_context_enforces_budget_prioritizing_current_input_and_tracks_injected() -> (
+    None
+):
+    persona = _make_persona(behavior_rules=(), tone=None, language=None)
+    recalled = [
+        MemoryRecallItem(
+            memory_id="mem_1",
+            provider_id="memos",
+            scope="user",
+            content="User prefers concise Python\nwith type hints.",
+            relevance=0.95,
+        ),
+        MemoryRecallItem(
+            memory_id="mem_2",
+            provider_id="memos",
+            scope="conversation",
+            content="X" * 300,
+            relevance=0.90,
+            conversation_id=uuid4(),
+        ),
+        MemoryRecallItem(
+            memory_id="mem_3",
+            provider_id="memos",
+            scope="user",
+            content="User uses PostgreSQL 17.",
+            relevance=0.85,
+        ),
+    ]
+    history = [
+        PromptHistoryMessage(role="user", content="Earlier question"),
+        PromptHistoryMessage(role="assistant", content="Earlier answer"),
+    ]
+    current_input = "Current high-priority input that must never be dropped."
+
+    # Compute tight budget that fits base system + current_input + history + mem_1 + mem_3,
+    # while excluding oversized mem_2.
+    base_only = compile_chat_context(
+        persona=persona,
+        history_messages=history,
+        current_input=current_input,
+        recalled_memories=(),
+    )
+    assert isinstance(base_only, CompiledPrompt)
+    assert "Relevant Memories:" not in base_only.messages[0].content
+    assert base_only.injected_memories == ()
+    base_chars = sum(len(m.content) for m in base_only.messages)
+
+    tight = compile_chat_context(
+        persona=persona,
+        history_messages=history,
+        current_input=current_input,
+        recalled_memories=recalled,
+        max_prompt_chars=base_chars + 150,
+    )
+    assert [m.memory_id for m in tight.injected_memories] == ["mem_1", "mem_3"]
+    assert tight.messages[-1] == ModelMessage(role="user", content=current_input)
+    # Multi-line memory content is normalized cleanly into a single uniform bullet line.
+    assert "- [user] User prefers concise Python with type hints." in tight.messages[0].content
+    assert "- [user] User uses PostgreSQL 17." in tight.messages[0].content
+    assert "X" * 50 not in tight.messages[0].content
+
+    # Extremely tight budget drops all memories (and even older history) but ALWAYS keeps
+    # platform rules, persona, and current user input intact.
+    minimal = compile_chat_context(
+        persona=persona,
+        history_messages=history,
+        current_input=current_input,
+        recalled_memories=recalled,
+        max_prompt_chars=len(current_input) + 10,
+    )
+    assert minimal.injected_memories == ()
+    assert minimal.messages[-1] == ModelMessage(role="user", content=current_input)
+    assert persona.system_prompt in minimal.messages[0].content
+    assert "Relevant Memories:" not in minimal.messages[0].content

@@ -8,7 +8,7 @@ from uuid import UUID
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
-from mem_ai.contracts.memory_provider import MemoryRecallItem
+from mem_ai.contracts.memory_provider import MemoryRecallItem, MemoryScope
 from mem_ai.contracts.model_provider import ModelMessage, ModelUsage
 from mem_ai.contracts.persona_provider import PersonaSnapshot
 from mem_ai.modules.conversations.prompt import PromptHistoryMessage
@@ -124,6 +124,24 @@ class PreparedGeneration(BaseModel):
     history_messages: tuple[PromptHistoryMessage, ...] = ()
 
 
+class RecalledMemoryReferenceRecord(BaseModel):
+    """Immutable application DTO for a persisted metadata-only `message_recalled_memories` row."""
+
+    model_config = ConfigDict(from_attributes=True, frozen=True)
+
+    id: UUID
+    user_message_id: UUID
+    provider_id: str
+    memory_id: str
+    scope: MemoryScope
+    relevance: float | None = None
+    prompt_position: int = Field(ge=1)
+    memory_epoch: int = Field(ge=0)
+    recalled_at: datetime
+    deleted_at: datetime | None = None
+    created_at: datetime
+
+
 class PreparedContext(BaseModel):
     """Compiled prompt and memory recall metadata passed into model execution."""
 
@@ -132,6 +150,8 @@ class PreparedContext(BaseModel):
     prepared: PreparedGeneration
     compiled_messages: tuple[ModelMessage, ...]
     recalled_memories: tuple[MemoryRecallItem, ...] = ()
+    memory_recall_degraded: bool = False
+    memory_degradation_reason: str | None = None
 
 
 class CommittedChatResult(BaseModel):

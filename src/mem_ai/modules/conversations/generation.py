@@ -14,7 +14,7 @@ Implements the persistence half of Engineering Design §5.4 (Shared Generation L
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timedelta
 from typing import Literal, cast
 from uuid import UUID, uuid4
@@ -22,6 +22,7 @@ from uuid import UUID, uuid4
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from mem_ai.contracts.memory_provider import MemoryRecallItem
 from mem_ai.contracts.model_provider import ModelUsage
 from mem_ai.contracts.persona_provider import PersonaSnapshot
 from mem_ai.core.exceptions import ConflictError, ForbiddenError, NotFoundError
@@ -30,6 +31,7 @@ from mem_ai.modules.conversations import repository
 from mem_ai.modules.conversations.models import (
     GENERATION_ACTIVE_CONVERSATION_UNIQUE_INDEX,
     MESSAGE_GENERATION_ROLE_UNIQUE_CONSTRAINT,
+    MESSAGE_RECALLED_MEMORY_UNIQUE_CONSTRAINT,
     Conversation,
 )
 from mem_ai.modules.conversations.prompt import HistoryRole, PromptHistoryMessage
@@ -39,10 +41,16 @@ from mem_ai.modules.conversations.schemas import (
     GenerationRecord,
     MessageRecord,
     PreparedGeneration,
+    RecalledMemoryReferenceRecord,
 )
+from mem_ai.modules.memories import service as memories_service
 from mem_ai.modules.users import service as users_service
 
 BeforeCommitHook = Callable[[AsyncSession, GenerationRecord, MessageRecord], Awaitable[None]]
+RecalledMemoryFilterHook = Callable[
+    [AsyncSession, Sequence[MemoryRecallItem]],
+    Awaitable[list[MemoryRecallItem]],
+]
 ConversationLockMode = Literal["none", "share", "update"]
 
 
@@ -270,7 +278,8 @@ async def prepare_generation_phase(
     user_message_content: str,
     upstream_model: str | None = None,
     max_output_tokens: int | None = None,
-    memory_epoch: int = 0,
+    memory_provider_id: str | None = None,
+    memory_epoch: int | None = None,
     history_limit: int = 20,
     lease_ttl_seconds: float = 60.0,
     now: datetime | None = None,
@@ -367,6 +376,17 @@ async def prepare_generation_phase(
                     for row in history_rows
                 ]
 
+            if memory_epoch is not None:
+                resolved_memory_epoch = memory_epoch
+            elif memory_provider_id is not None:
+                resolved_memory_epoch = await memories_service.get_memory_epoch_in_session(
+                    session,
+                    user_id=owner_id,
+                    provider_id=memory_provider_id,
+                )
+            else:
+                resolved_memory_epoch = 0
+
             generation = await repository.create_generation(
                 session,
                 conversation_id=conversation.id,
@@ -374,7 +394,7 @@ async def prepare_generation_phase(
                 agent_id=agent_id,
                 persona_version_id=persona.version_id,
                 model_id=model_id,
-                memory_epoch=memory_epoch,
+                memory_epoch=resolved_memory_epoch,
                 lease_token=lease_token,
                 lease_expires_at=lease_expires_at,
                 started_at=current_time,
@@ -408,7 +428,7 @@ async def prepare_generation_phase(
                 model_id=model_id,
                 upstream_model=upstream_model,
                 max_output_tokens=max_output_tokens,
-                memory_epoch=memory_epoch,
+                memory_epoch=resolved_memory_epoch,
                 lease_token=lease_token,
                 lease_expires_at=lease_expires_at,
                 created_conversation=created_conversation,
@@ -662,3 +682,114 @@ async def list_conversation_messages_for_owner(
             conversation_id=conversation_id,
         )
         return [MessageRecord.model_validate(row) for row in rows]
+
+
+async def persist_recalled_memories_phase(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    prepared: PreparedGeneration,
+    candidates: Sequence[MemoryRecallItem],
+    filter_in_session: RecalledMemoryFilterHook | None = None,
+    now: datetime | None = None,
+) -> tuple[tuple[MemoryRecallItem, ...], list[RecalledMemoryReferenceRecord]]:
+    """Short Tx 1.5: re-verify status/lease, apply guard hook, and persist metadata-only refs."""
+    try:
+        async with session_factory.begin() as session:
+            current_time = await _resolve_current_time(session, now)
+            await users_service.ensure_user_active_in_session(
+                session,
+                user_id=prepared.owner_id,
+                for_share=True,
+            )
+            await _load_accessible_conversation_in_session(
+                session,
+                owner_id=prepared.owner_id,
+                conversation_id=prepared.conversation_id,
+                lock_mode="share",
+            )
+            active_generation = await repository.get_active_generation_by_lease(
+                session,
+                generation_id=prepared.generation_id,
+                conversation_id=prepared.conversation_id,
+                owner_id=prepared.owner_id,
+                lease_token=prepared.lease_token,
+                current_time=current_time,
+            )
+            if active_generation is None:
+                raise ConflictError(
+                    code="generation_lease_lost",
+                    message="generation lease is no longer active or has expired",
+                )
+
+            user_message = await repository.get_message_for_conversation(
+                session,
+                conversation_id=prepared.conversation_id,
+                message_id=prepared.user_message_id,
+                generation_id=prepared.generation_id,
+                role="user",
+            )
+            if user_message is None:
+                raise NotFoundError(
+                    code="message_not_found",
+                    message="generation user message not found",
+                )
+
+            filtered = (
+                await filter_in_session(session, candidates)
+                if (candidates and filter_in_session is not None)
+                else list(candidates)
+            )
+            if not filtered:
+                return (), []
+
+            rows = await repository.create_recalled_memory_references(
+                session,
+                user_message_id=user_message.id,
+                items=filtered,
+                recalled_at=current_time,
+            )
+            records = [RecalledMemoryReferenceRecord.model_validate(row) for row in rows]
+            return tuple(filtered), records
+    except IntegrityError as exc:
+        if is_unique_violation(
+            exc,
+            constraint_name=MESSAGE_RECALLED_MEMORY_UNIQUE_CONSTRAINT,
+        ):
+            raise ConflictError(
+                code="recalled_memory_conflict",
+                message="recalled memory reference already recorded for this message",
+            ) from exc
+        raise
+
+
+async def list_recalled_memories_for_message_for_owner(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    owner_id: UUID,
+    conversation_id: UUID,
+    user_message_id: UUID,
+) -> list[RecalledMemoryReferenceRecord]:
+    """Read ordered metadata-only recalled memory references for an owned user message."""
+    async with session_factory() as session:
+        await users_service.ensure_user_active_in_session(session, user_id=owner_id)
+        await _load_readable_conversation_in_session(
+            session,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+        )
+        user_message = await repository.get_message_for_conversation(
+            session,
+            conversation_id=conversation_id,
+            message_id=user_message_id,
+            role="user",
+        )
+        if user_message is None:
+            raise NotFoundError(
+                code="message_not_found",
+                message="message not found",
+            )
+        rows = await repository.list_recalled_memories_for_user_message(
+            session,
+            user_message_id=user_message.id,
+        )
+        return [RecalledMemoryReferenceRecord.model_validate(row) for row in rows]

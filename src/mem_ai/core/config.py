@@ -240,6 +240,11 @@ class Settings(BaseSettings):
     chat_history_message_limit: int = Field(default=20, ge=0, le=200)
     chat_lease_ttl_seconds: int = Field(default=60, ge=5, le=600)
     chat_lease_renew_interval_seconds: float = Field(default=20.0, gt=0.0, le=300.0)
+    chat_memory_recall_timeout_seconds: float = Field(default=5.0, gt=0.0, le=60.0)
+    chat_memory_min_relevance: float = Field(default=0.5, ge=0.0, le=1.0)
+    chat_memory_max_items: int = Field(default=10, ge=0, le=50)
+    chat_memory_context_max_chars: int = Field(default=2000, ge=0, le=32000)
+    chat_prompt_max_chars: int = Field(default=24000, ge=256, le=200000)
 
     @model_validator(mode="after")
     def validate_production_boundaries(self) -> Settings:

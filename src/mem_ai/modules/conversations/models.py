@@ -1,4 +1,4 @@
-"""SQLAlchemy ORM models for `conversations`, `messages`, and `generations`."""
+"""SQLAlchemy ORM models for `conversations`, `messages`, `generations`, and recalled refs."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from uuid import UUID
 from sqlalchemy import (
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
@@ -33,6 +34,7 @@ GENERATION_USER_MESSAGE_FK = "fk_generations_user_message_id_messages"
 GENERATION_ASSISTANT_MESSAGE_FK = "fk_generations_assistant_message_id_messages"
 GENERATION_ACTIVE_CONVERSATION_UNIQUE_INDEX = "uq_generations_active_conversation"
 GENERATION_RUNNING_LEASE_EXPIRES_INDEX = "ix_generations_running_lease_expires_at"
+MESSAGE_RECALLED_MEMORY_UNIQUE_CONSTRAINT = "uq_message_recalled_memories_msg_provider_mem_scope"
 
 
 class Conversation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -212,3 +214,62 @@ class Message(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     role: Mapped[str] = mapped_column(String(16), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class MessageRecalledMemory(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
+    """Metadata-only reference to a provider memory actually injected for a user message."""
+
+    __tablename__ = "message_recalled_memories"
+    __table_args__ = (
+        CheckConstraint("scope IN ('user', 'conversation')", name="scope_valid"),
+        CheckConstraint(
+            "relevance IS NULL OR (relevance >= 0.0 AND relevance <= 1.0)",
+            name="relevance_range",
+        ),
+        CheckConstraint("prompt_position >= 1", name="prompt_position_positive"),
+        CheckConstraint("memory_epoch >= 0", name="memory_epoch_non_negative"),
+        UniqueConstraint(
+            "user_message_id",
+            "provider_id",
+            "memory_id",
+            "scope",
+            name=MESSAGE_RECALLED_MEMORY_UNIQUE_CONSTRAINT,
+        ),
+        Index(
+            "ix_message_recalled_memories_user_message_id_pos",
+            "user_message_id",
+            "prompt_position",
+        ),
+        Index(
+            "ix_message_recalled_memories_provider_id_memory_id",
+            "provider_id",
+            "memory_id",
+        ),
+    )
+
+    user_message_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("messages.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    provider_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    memory_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    scope: Mapped[str] = mapped_column(String(32), nullable=False)
+    relevance: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
+    prompt_position: Mapped[int] = mapped_column(Integer, nullable=False)
+    memory_epoch: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
+    recalled_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
+    )

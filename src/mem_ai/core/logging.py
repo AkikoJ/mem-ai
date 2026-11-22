@@ -40,6 +40,7 @@ _SENSITIVE_KEY_MARKERS = (
     "memory_value",
     "memory_content",
     "user_content",
+    "recall_query",
 )
 _SENSITIVE_EXACT_KEYS = frozenset({"content"})
 

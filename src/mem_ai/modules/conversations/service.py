@@ -3,7 +3,9 @@
 Implements the orchestration half of Engineering Design §5.4 (Shared Generation Lifecycle):
 - `prepare_generation`: validates user/conversation, resolves read-only `PersonaSnapshot`
   strictly outside DB write transactions, resolves server-registered model, then commits Tx 1.
-- `prepare_context`: pure prompt compilation seam (Ticket 08 extends with scoped memory recall).
+- `prepare_context`: recalls scoped memories outside DB transactions via `memories.service`,
+  verifies lease and epoch/tombstone guards in short Tx 1.5 while persisting metadata-only
+  `message_recalled_memories` rows, and compiles budgeted prompt messages.
 - `execute_model_completion`: invokes `ModelProvider.generate` outside any DB transaction under
   an overall generation deadline.
 - `complete_prepared_sync_generation`: executes context -> model -> atomic Tx 2 or failure
@@ -24,7 +26,7 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from mem_ai.contracts.memory_provider import MemoryRecallItem
+from mem_ai.contracts.memory_provider import MemoryProvider, MemoryRecallItem
 from mem_ai.contracts.model_provider import ModelProvider, ModelRequest, ModelResponse
 from mem_ai.contracts.persona_provider import PersonaProvider
 from mem_ai.core.config import Settings
@@ -38,12 +40,14 @@ from mem_ai.core.exceptions import (
 from mem_ai.core.logging import bind_log_context, reset_log_context
 from mem_ai.modules.conversations import generation as generation_store
 from mem_ai.modules.conversations.generation import BeforeCommitHook
-from mem_ai.modules.conversations.prompt import compile_chat_prompt
+from mem_ai.modules.conversations.prompt import compile_chat_context
 from mem_ai.modules.conversations.schemas import (
     CommittedChatResult,
     PreparedContext,
     PreparedGeneration,
 )
+from mem_ai.modules.memories import service as memories_service
+from mem_ai.modules.memories.service import MemoryRecallPolicy, TombstoneLookup
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelRoutingPolicy
 from mem_ai.modules.users import service as users_service
@@ -61,7 +65,7 @@ def _consume_detached_task_exception(done_task: asyncio.Task[Any]) -> None:
 
 @dataclass(frozen=True, slots=True)
 class SyncChatOptions:
-    """Bundled runtime budgets, model routing policy, and hooks for chat execution."""
+    """Bundled runtime budgets, model routing policy, memory policy, and hooks for chat."""
 
     model_policy: ModelRoutingPolicy | None = None
     user_permissions: frozenset[str] = frozenset()
@@ -71,6 +75,12 @@ class SyncChatOptions:
     lease_ttl_seconds: float = 60.0
     lease_renew_interval_seconds: float | None = 20.0
     timeout_seconds: float | None = None
+    memory_recall_timeout_seconds: float | None = 5.0
+    memory_min_relevance: float = 0.5
+    memory_max_items: int = 10
+    memory_context_max_chars: int = 2000
+    prompt_max_chars: int | None = 24000
+    tombstone_lookup: TombstoneLookup | None = None
     task_registry: SyncGenerationTaskRegistry | None = None
     before_commit_hook: BeforeCommitHook | None = None
 
@@ -82,7 +92,7 @@ def sync_chat_options_from_settings(
     require_streaming: bool = False,
     task_registry: SyncGenerationTaskRegistry | None = None,
 ) -> SyncChatOptions:
-    """Construct `SyncChatOptions` with the shared server `ModelRoutingPolicy`."""
+    """Construct `SyncChatOptions` with the shared server `ModelRoutingPolicy` and budgets."""
     return SyncChatOptions(
         model_policy=models_service.model_routing_policy_from_settings(settings),
         user_permissions=user_permissions,
@@ -91,6 +101,11 @@ def sync_chat_options_from_settings(
         lease_ttl_seconds=float(settings.chat_lease_ttl_seconds),
         lease_renew_interval_seconds=settings.chat_lease_renew_interval_seconds,
         timeout_seconds=settings.chat_generation_timeout_seconds,
+        memory_recall_timeout_seconds=settings.chat_memory_recall_timeout_seconds,
+        memory_min_relevance=settings.chat_memory_min_relevance,
+        memory_max_items=settings.chat_memory_max_items,
+        memory_context_max_chars=settings.chat_memory_context_max_chars,
+        prompt_max_chars=settings.chat_prompt_max_chars,
         task_registry=task_registry,
     )
 
@@ -224,6 +239,7 @@ async def prepare_generation(
     conversation_id: UUID | None,
     user_message: str,
     requested_model_id: str | None = None,
+    memory_provider: MemoryProvider | None = None,
     options: SyncChatOptions | None = None,
 ) -> PreparedGeneration:
     """Resolve persona outside DB write tx, validate model, and commit Tx 1 preparation."""
@@ -279,30 +295,117 @@ async def prepare_generation(
         upstream_model=selected_model.upstream_model,
         user_message_content=user_message,
         max_output_tokens=selected_model.max_output_tokens,
-        memory_epoch=0,
+        memory_provider_id=memory_provider.provider_id if memory_provider is not None else None,
         history_limit=resolved_options.history_limit,
         lease_ttl_seconds=resolved_options.lease_ttl_seconds,
     )
 
 
-def prepare_context(
+async def prepare_context(
+    session_factory: async_sessionmaker[AsyncSession],
     *,
     prepared: PreparedGeneration,
-    recalled_memories: Sequence[MemoryRecallItem] = (),
-    max_history_messages: int | None = 20,
+    memory_provider: MemoryProvider | None = None,
+    options: SyncChatOptions | None = None,
+    recalled_memories: Sequence[MemoryRecallItem] | None = None,
+    max_history_messages: int | None = None,
 ) -> PreparedContext:
-    """Compile pure domain data into ordered model prompt messages (extended in Ticket 08)."""
-    compiled = compile_chat_prompt(
+    """Recall scoped memories outside DB tx, verify lease/guard, save refs, and compile prompt."""
+    resolved_options = options if options is not None else SyncChatOptions()
+    effective_history_limit = (
+        max_history_messages if max_history_messages is not None else resolved_options.history_limit
+    )
+
+    degraded = False
+    degradation_reason: str | None = None
+    captured_epoch = prepared.memory_epoch
+    provider_id = memory_provider.provider_id if memory_provider is not None else None
+
+    if recalled_memories is not None:
+        candidate_memories: tuple[MemoryRecallItem, ...] = tuple(recalled_memories)
+    elif memory_provider is not None:
+        persona_policy = prepared.persona.memory_policy
+        effective_limit = (
+            min(persona_policy.recall_limit, resolved_options.memory_max_items)
+            if persona_policy.enabled
+            else 0
+        )
+        recall_policy = MemoryRecallPolicy(
+            enabled=persona_policy.enabled,
+            recall_limit=effective_limit,
+            min_relevance=resolved_options.memory_min_relevance,
+            max_memory_chars=resolved_options.memory_context_max_chars,
+            timeout_seconds=resolved_options.memory_recall_timeout_seconds,
+        )
+        outcome = await memories_service.recall_relevant_memories(
+            session_factory,
+            memory_provider=memory_provider,
+            user_id=prepared.owner_id,
+            conversation_id=prepared.conversation_id,
+            query=prepared.user_message_content,
+            policy=recall_policy,
+            tombstone_lookup=resolved_options.tombstone_lookup,
+        )
+        candidate_memories = outcome.items
+        degraded = outcome.degraded
+        degradation_reason = outcome.degradation_reason
+        captured_epoch = max(captured_epoch, outcome.captured_epoch)
+    else:
+        candidate_memories = ()
+
+    # Pre-fit candidates against the total prompt budget so only actually injectable items
+    # are persisted into `message_recalled_memories`.
+    pre_compiled = compile_chat_context(
         persona=prepared.persona,
         history_messages=prepared.history_messages,
         current_input=prepared.user_message_content,
-        recalled_memories=recalled_memories,
-        max_history_messages=max_history_messages,
+        recalled_memories=candidate_memories,
+        max_history_messages=effective_history_limit,
+        max_prompt_chars=resolved_options.prompt_max_chars,
     )
+
+    async def _filter_in_tx(
+        session: AsyncSession,
+        items: Sequence[MemoryRecallItem],
+    ) -> list[MemoryRecallItem]:
+        if not items:
+            return []
+        effective_provider_id = provider_id or items[0].provider_id
+        return await memories_service.filter_injectable_memories_in_session(
+            session,
+            user_id=prepared.owner_id,
+            provider_id=effective_provider_id,
+            conversation_id=prepared.conversation_id,
+            candidates=items,
+            captured_epoch=captured_epoch,
+            tombstone_lookup=resolved_options.tombstone_lookup,
+        )
+
+    persisted_memories, _ = await generation_store.persist_recalled_memories_phase(
+        session_factory,
+        prepared=prepared,
+        candidates=pre_compiled.injected_memories,
+        filter_in_session=_filter_in_tx if pre_compiled.injected_memories else None,
+    )
+
+    if persisted_memories != pre_compiled.injected_memories:
+        final_compiled = compile_chat_context(
+            persona=prepared.persona,
+            history_messages=prepared.history_messages,
+            current_input=prepared.user_message_content,
+            recalled_memories=persisted_memories,
+            max_history_messages=effective_history_limit,
+            max_prompt_chars=resolved_options.prompt_max_chars,
+        )
+    else:
+        final_compiled = pre_compiled
+
     return PreparedContext(
         prepared=prepared,
-        compiled_messages=tuple(compiled),
-        recalled_memories=tuple(recalled_memories),
+        compiled_messages=final_compiled.messages,
+        recalled_memories=final_compiled.injected_memories,
+        memory_recall_degraded=degraded,
+        memory_degradation_reason=degradation_reason,
     )
 
 
@@ -371,13 +474,36 @@ async def complete_prepared_sync_generation(
     *,
     model_provider: ModelProvider,
     prepared: PreparedGeneration,
+    memory_provider: MemoryProvider | None = None,
+    options: SyncChatOptions | None = None,
     timeout_seconds: float | None = None,
-    max_history_messages: int | None = 20,
-    lease_ttl_seconds: float = 60.0,
-    lease_renew_interval_seconds: float | None = 20.0,
+    max_history_messages: int | None = None,
+    lease_ttl_seconds: float | None = None,
+    lease_renew_interval_seconds: float | None = None,
     before_commit_hook: BeforeCommitHook | None = None,
 ) -> CommittedChatResult:
-    """Run context compilation, external model completion, and atomic Tx 2 commit/convergence."""
+    """Run context preparation, external model completion, and atomic Tx 2 commit/convergence."""
+    resolved_options = options if options is not None else SyncChatOptions()
+    effective_timeout = (
+        timeout_seconds if timeout_seconds is not None else resolved_options.timeout_seconds
+    )
+    effective_history = (
+        max_history_messages if max_history_messages is not None else resolved_options.history_limit
+    )
+    effective_lease_ttl = (
+        lease_ttl_seconds if lease_ttl_seconds is not None else resolved_options.lease_ttl_seconds
+    )
+    effective_renew_interval = (
+        lease_renew_interval_seconds
+        if lease_renew_interval_seconds is not None
+        else resolved_options.lease_renew_interval_seconds
+    )
+    effective_before_commit = (
+        before_commit_hook
+        if before_commit_hook is not None
+        else resolved_options.before_commit_hook
+    )
+
     log_tokens = bind_log_context(
         conversation_id=str(prepared.conversation_id),
         generation_id=str(prepared.generation_id),
@@ -393,14 +519,30 @@ async def complete_prepared_sync_generation(
             async with GenerationLeaseHeartbeat(
                 session_factory=session_factory,
                 prepared=prepared,
-                lease_ttl_seconds=lease_ttl_seconds,
-                renew_interval_seconds=lease_renew_interval_seconds,
+                lease_ttl_seconds=effective_lease_ttl,
+                renew_interval_seconds=effective_renew_interval,
                 on_lease_lost=_abort_model_on_lease_lost,
             ) as heartbeat:
-                context = prepare_context(
-                    prepared=prepared,
-                    max_history_messages=max_history_messages,
-                )
+                try:
+                    context = await prepare_context(
+                        session_factory,
+                        prepared=prepared,
+                        memory_provider=memory_provider,
+                        options=resolved_options,
+                        max_history_messages=effective_history,
+                    )
+                except AppError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "Unexpected exception during context preparation",
+                        extra={"extra_fields": {"model_id": prepared.model_id}},
+                    )
+                    raise ServiceUnavailableError(
+                        code="generation_context_failed",
+                        message="failed to prepare generation context",
+                    ) from None
+
                 if heartbeat.loss_error is not None:
                     raise heartbeat.loss_error
 
@@ -408,7 +550,7 @@ async def complete_prepared_sync_generation(
                     execute_model_completion(
                         model_provider=model_provider,
                         context=context,
-                        timeout_seconds=timeout_seconds,
+                        timeout_seconds=effective_timeout,
                     )
                 )
                 try:
@@ -435,7 +577,7 @@ async def complete_prepared_sync_generation(
             raise
         except Exception:
             logger.exception(
-                "Unexpected exception during context preparation or model completion",
+                "Unexpected exception during model completion",
                 extra={"extra_fields": {"model_id": prepared.model_id}},
             )
             await _safe_converge_failure(
@@ -456,7 +598,7 @@ async def complete_prepared_sync_generation(
                 assistant_content=model_response.content,
                 usage=model_response.usage,
                 finish_reason=model_response.finish_reason,
-                before_commit_hook=before_commit_hook,
+                before_commit_hook=effective_before_commit,
             )
         except AppError as exc:
             await _safe_converge_failure(
@@ -495,6 +637,7 @@ async def run_sync_chat(
     conversation_id: UUID | None,
     user_message: str,
     requested_model_id: str | None = None,
+    memory_provider: MemoryProvider | None = None,
     options: SyncChatOptions | None = None,
 ) -> CommittedChatResult:
     """Execute a full synchronous chat turn shielded from client HTTP disconnects."""
@@ -502,6 +645,7 @@ async def run_sync_chat(
     prepared = await prepare_generation(
         session_factory,
         persona_provider=persona_provider,
+        memory_provider=memory_provider,
         owner_id=owner_id,
         agent_id=agent_id,
         conversation_id=conversation_id,
@@ -513,12 +657,9 @@ async def run_sync_chat(
     coro = complete_prepared_sync_generation(
         session_factory,
         model_provider=model_provider,
+        memory_provider=memory_provider,
         prepared=prepared,
-        timeout_seconds=resolved_options.timeout_seconds,
-        max_history_messages=resolved_options.history_limit,
-        lease_ttl_seconds=resolved_options.lease_ttl_seconds,
-        lease_renew_interval_seconds=resolved_options.lease_renew_interval_seconds,
-        before_commit_hook=resolved_options.before_commit_hook,
+        options=resolved_options,
     )
     if resolved_options.task_registry is not None:
         task = resolved_options.task_registry.spawn(coro)

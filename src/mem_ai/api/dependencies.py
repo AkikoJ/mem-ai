@@ -63,6 +63,12 @@ def get_memory_provider(request: Request) -> MemoryProvider:
     return _require_provider(registry.memory_provider, name="memory")
 
 
+def get_optional_memory_provider(request: Request) -> MemoryProvider | None:
+    """Return the configured MemoryProvider or None when memory is disabled for chat."""
+    registry = cast(ProviderRegistry, request.app.state.providers)
+    return registry.memory_provider
+
+
 def get_persona_provider(request: Request) -> PersonaProvider:
     """Return the configured PersonaProvider (overridable via `app.dependency_overrides`)."""
     registry = cast(ProviderRegistry, request.app.state.providers)
@@ -74,4 +80,5 @@ SessionFactoryDep = Annotated[async_sessionmaker[AsyncSession], Depends(get_sess
 HttpClientDep = Annotated[httpx.AsyncClient, Depends(get_http_client)]
 ModelProviderDep = Annotated[ModelProvider, Depends(get_model_provider)]
 MemoryProviderDep = Annotated[MemoryProvider, Depends(get_memory_provider)]
+OptionalMemoryProviderDep = Annotated[MemoryProvider | None, Depends(get_optional_memory_provider)]
 PersonaProviderDep = Annotated[PersonaProvider, Depends(get_persona_provider)]
