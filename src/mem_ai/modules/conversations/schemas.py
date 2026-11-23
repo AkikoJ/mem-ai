@@ -16,6 +16,12 @@ from mem_ai.modules.conversations.prompt import PromptHistoryMessage
 ConversationStatus = Literal["active", "deleting"]
 GenerationStatus = Literal["running", "succeeded", "failed", "cancelled"]
 MessageRole = Literal["user", "assistant"]
+DEFAULT_IDEMPOTENCY_RETENTION_SECONDS = 24.0 * 3600.0
+
+
+def generation_status_url(conversation_id: UUID, generation_id: UUID) -> str:
+    """Return the canonical status query path for a conversation generation."""
+    return f"/v1/conversations/{conversation_id}/generations/{generation_id}"
 
 
 def _strip_required_message(value: str) -> str:
@@ -167,6 +173,87 @@ class CommittedChatResult(BaseModel):
     finish_reason: str | None = None
 
 
+class IdempotencyKeySpec(BaseModel):
+    """Normalized request identity and semantic digest for chat idempotency."""
+
+    model_config = ConfigDict(frozen=True)
+
+    method: str
+    canonical_route: str
+    key: str
+    request_digest: str
+    retention_seconds: float = Field(default=DEFAULT_IDEMPOTENCY_RETENTION_SECONDS, gt=0.0)
+
+
+class IdempotencyRecordDTO(BaseModel):
+    """Immutable application DTO for a persisted `idempotency_records` row."""
+
+    model_config = ConfigDict(from_attributes=True, frozen=True)
+
+    id: UUID
+    user_id: UUID
+    method: str
+    canonical_route: str
+    idempotency_key: str
+    request_digest: str
+    conversation_id: UUID
+    generation_id: UUID
+    status: GenerationStatus
+    response_status_code: int | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    terminal_at: datetime | None = None
+    expires_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class GenerationDetail(BaseModel):
+    """Read-model combining a generation record with its committed assistant message if any."""
+
+    model_config = ConfigDict(frozen=True)
+
+    generation: GenerationRecord
+    assistant_message: MessageRecord | None = None
+
+    @property
+    def status_url(self) -> str:
+        return generation_status_url(self.generation.conversation_id, self.generation.id)
+
+    def to_committed_chat_result(self) -> CommittedChatResult:
+        """Convert a `succeeded` generation detail into a `CommittedChatResult`."""
+        if self.generation.status != "succeeded" or self.assistant_message is None:
+            raise ValueError("generation is not in a succeeded state with an assistant message")
+        usage = ModelUsage(
+            input_tokens=self.generation.input_tokens or 0,
+            output_tokens=self.generation.output_tokens or 0,
+            total_tokens=self.generation.total_tokens or 0,
+        )
+        return CommittedChatResult(
+            conversation_id=self.generation.conversation_id,
+            generation_id=self.generation.id,
+            assistant_message=self.assistant_message,
+            model_id=self.generation.model_id,
+            usage=usage,
+            finish_reason=self.generation.finish_reason,
+        )
+
+
+class ChatAcceptedResult(BaseModel):
+    """Application outcome returned when an idempotent retry hits an active `running` generation."""
+
+    model_config = ConfigDict(frozen=True)
+
+    conversation_id: UUID
+    generation_id: UUID
+    user_message_id: UUID | None = None
+    status: Literal["running"] = "running"
+    status_url: str
+
+
+ChatTurnOutcome = CommittedChatResult | ChatAcceptedResult
+
+
 class ChatRequest(BaseModel):
     """Strict HTTP request body for `POST /v1/chat`."""
 
@@ -240,4 +327,115 @@ class ChatResponse(BaseModel):
             message=ChatMessageResponse.from_record(result.assistant_message),
             model_id=result.model_id,
             usage=ChatUsageResponse.from_usage(result.usage),
+        )
+
+
+class ChatAcceptedResponse(BaseModel):
+    """202 Accepted payload returned when retrying an in-flight idempotent chat generation."""
+
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
+
+    conversation_id: UUID = Field(alias="conversationId", serialization_alias="conversationId")
+    generation_id: UUID = Field(alias="generationId", serialization_alias="generationId")
+    user_message_id: UUID | None = Field(
+        default=None, alias="userMessageId", serialization_alias="userMessageId"
+    )
+    status: Literal["running"] = "running"
+    status_url: str = Field(alias="statusUrl", serialization_alias="statusUrl")
+
+    @classmethod
+    def from_result(cls, result: ChatAcceptedResult) -> ChatAcceptedResponse:
+        return cls(
+            conversation_id=result.conversation_id,
+            generation_id=result.generation_id,
+            user_message_id=result.user_message_id,
+            status=result.status,
+            status_url=result.status_url,
+        )
+
+
+class GenerationErrorResponse(BaseModel):
+    """Sanitized error object exposed in `GET /v1/conversations/{cid}/generations/{gid}`."""
+
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
+
+    code: str
+    message: str
+
+
+class GenerationResponse(BaseModel):
+    """Public HTTP payload for `GET /v1/conversations/{cid}/generations/{gid}`."""
+
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
+
+    conversation_id: UUID = Field(alias="conversationId", serialization_alias="conversationId")
+    generation_id: UUID = Field(alias="generationId", serialization_alias="generationId")
+    agent_id: UUID = Field(alias="agentId", serialization_alias="agentId")
+    persona_version_id: UUID = Field(
+        alias="personaVersionId", serialization_alias="personaVersionId"
+    )
+    model_id: str = Field(alias="modelId", serialization_alias="modelId")
+    status: GenerationStatus
+    user_message_id: UUID | None = Field(
+        default=None, alias="userMessageId", serialization_alias="userMessageId"
+    )
+    message_id: UUID | None = Field(
+        default=None, alias="messageId", serialization_alias="messageId"
+    )
+    message: ChatMessageResponse | None = None
+    usage: ChatUsageResponse | None = None
+    finish_reason: str | None = Field(
+        default=None, alias="finishReason", serialization_alias="finishReason"
+    )
+    error: GenerationErrorResponse | None = None
+    started_at: datetime = Field(alias="startedAt", serialization_alias="startedAt")
+    completed_at: datetime | None = Field(
+        default=None, alias="completedAt", serialization_alias="completedAt"
+    )
+    created_at: datetime = Field(alias="createdAt", serialization_alias="createdAt")
+    updated_at: datetime = Field(alias="updatedAt", serialization_alias="updatedAt")
+
+    @classmethod
+    def from_detail(cls, detail: GenerationDetail) -> GenerationResponse:
+        gen = detail.generation
+        assistant_msg = (
+            ChatMessageResponse.from_record(detail.assistant_message)
+            if gen.status == "succeeded" and detail.assistant_message is not None
+            else None
+        )
+        usage_resp = (
+            ChatUsageResponse(
+                input_tokens=gen.input_tokens or 0,
+                output_tokens=gen.output_tokens or 0,
+                total_tokens=gen.total_tokens or 0,
+            )
+            if gen.status == "succeeded"
+            else None
+        )
+        error_resp = (
+            GenerationErrorResponse(
+                code=gen.error_code
+                or ("generation_cancelled" if gen.status == "cancelled" else "generation_failed"),
+                message=gen.error_message or gen.error_code or "generation did not succeed",
+            )
+            if gen.status in {"failed", "cancelled"}
+            else None
+        )
+        return cls(
+            conversation_id=gen.conversation_id,
+            generation_id=gen.id,
+            agent_id=gen.agent_id,
+            persona_version_id=gen.persona_version_id,
+            model_id=gen.model_id,
+            status=gen.status,
+            user_message_id=gen.user_message_id,
+            message_id=assistant_msg.message_id if assistant_msg is not None else None,
+            message=assistant_msg,
+            usage=usage_resp,
+            finish_reason=gen.finish_reason if gen.status == "succeeded" else None,
+            error=error_resp,
+            started_at=gen.started_at,
+            completed_at=gen.completed_at,
+            created_at=gen.created_at,
+            updated_at=gen.updated_at,
         )

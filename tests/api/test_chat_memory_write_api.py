@@ -148,7 +148,7 @@ async def test_post_chat_enqueues_turn_memory_and_worker_recovers_after_outage(
             # POST /v1/chat succeeds immediately without waiting for background memory provider.
             chat_resp = await client.post(
                 "/v1/chat",
-                headers=headers,
+                headers={**headers, "Idempotency-Key": "mem-write-turn-1"},
                 json={
                     "agentId": agent_id,
                     "message": "Project codename is Orion.",

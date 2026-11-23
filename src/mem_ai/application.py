@@ -26,10 +26,8 @@ from mem_ai.modules.auth.adapters import (
     StaticTokenAuthAdapter,
     build_credential_verifier,
 )
-from mem_ai.modules.conversations.service import (
-    DatabaseConversationAccessChecker,
-    SyncGenerationTaskRegistry,
-)
+from mem_ai.modules.conversations.queries import DatabaseConversationAccessChecker
+from mem_ai.modules.conversations.service import SyncGenerationTaskRegistry
 from mem_ai.modules.memories.adapters.memos import MemOSMemoryProvider
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.adapters.openai_compatible import OpenAICompatibleModelProvider

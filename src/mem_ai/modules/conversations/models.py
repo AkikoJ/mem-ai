@@ -35,6 +35,8 @@ GENERATION_ASSISTANT_MESSAGE_FK = "fk_generations_assistant_message_id_messages"
 GENERATION_ACTIVE_CONVERSATION_UNIQUE_INDEX = "uq_generations_active_conversation"
 GENERATION_RUNNING_LEASE_EXPIRES_INDEX = "ix_generations_running_lease_expires_at"
 MESSAGE_RECALLED_MEMORY_UNIQUE_CONSTRAINT = "uq_message_recalled_memories_msg_provider_mem_scope"
+IDEMPOTENCY_SCOPE_UNIQUE_CONSTRAINT = "uq_idempotency_records_scope"
+IDEMPOTENCY_GENERATION_UNIQUE_CONSTRAINT = "uq_idempotency_records_generation_id"
 
 
 class Conversation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -269,6 +271,85 @@ class MessageRecalledMemory(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
         server_default=func.now(),
     )
     deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
+    )
+
+
+class IdempotencyRecord(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """User/method/route/key-scoped chat idempotency record bound to a single generation."""
+
+    __tablename__ = "idempotency_records"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('running', 'succeeded', 'failed', 'cancelled')",
+            name="status_valid",
+        ),
+        CheckConstraint(
+            "(status = 'running' AND terminal_at IS NULL AND expires_at IS NULL) "
+            "OR (status <> 'running' AND terminal_at IS NOT NULL "
+            "AND expires_at IS NOT NULL AND expires_at >= terminal_at)",
+            name="terminal_expiry_valid",
+        ),
+        UniqueConstraint(
+            "user_id",
+            "method",
+            "canonical_route",
+            "idempotency_key",
+            name=IDEMPOTENCY_SCOPE_UNIQUE_CONSTRAINT,
+        ),
+        UniqueConstraint(
+            "generation_id",
+            name=IDEMPOTENCY_GENERATION_UNIQUE_CONSTRAINT,
+        ),
+        Index("ix_idempotency_records_conversation_id", "conversation_id"),
+        Index("ix_idempotency_records_user_id", "user_id"),
+        Index(
+            "ix_idempotency_records_expires_at",
+            "expires_at",
+            postgresql_where=text("expires_at IS NOT NULL"),
+        ),
+    )
+
+    user_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    method: Mapped[str] = mapped_column(String(16), nullable=False)
+    canonical_route: Mapped[str] = mapped_column(String(128), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    request_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    conversation_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("conversations.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    generation_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("generations.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="running",
+        server_default="running",
+    )
+    response_status_code: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        default=None,
+    )
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True, default=None)
+    error_message: Mapped[str | None] = mapped_column(String(500), nullable=True, default=None)
+    terminal_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
         default=None,

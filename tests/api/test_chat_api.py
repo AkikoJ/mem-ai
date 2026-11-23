@@ -84,6 +84,10 @@ class _GateModelProvider:
         yield ModelStreamChunk(sequence=1)
 
 
+def _with_idem(headers: dict[str, str], key: str | None = None) -> dict[str, str]:
+    return {**headers, "Idempotency-Key": key if key is not None else f"chat-{uuid4().hex}"}
+
+
 async def _create_and_publish_agent(
     client: httpx.AsyncClient,
     *,
@@ -179,7 +183,7 @@ async def test_chat_start_continue_pinned_persona_rejections_and_isolation(
             )
             res_unpub = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers=_with_idem(alice_headers),
                 json={"agentId": unpublished["agentId"], "message": "hello"},
             )
             assert res_unpub.status_code == 404
@@ -194,7 +198,7 @@ async def test_chat_start_continue_pinned_persona_rejections_and_isolation(
             )
             res_disabled = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers=_with_idem(alice_headers),
                 json={"agentId": disabled_model_agent["agentId"], "message": "hello"},
             )
             assert res_disabled.status_code == 409
@@ -202,7 +206,7 @@ async def test_chat_start_continue_pinned_persona_rejections_and_isolation(
 
             res_extra = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers=_with_idem(alice_headers),
                 json={
                     "agentId": disabled_model_agent["agentId"],
                     "message": "hello",
@@ -213,7 +217,7 @@ async def test_chat_start_continue_pinned_persona_rejections_and_isolation(
 
             res_stream = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers=_with_idem(alice_headers),
                 json={
                     "agentId": disabled_model_agent["agentId"],
                     "message": "hello",
@@ -241,7 +245,7 @@ async def test_chat_start_continue_pinned_persona_rejections_and_isolation(
 
             turn1 = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers=_with_idem(alice_headers),
                 json={
                     "agentId": alice_agent["agentId"],
                     "message": "First message",
@@ -286,14 +290,14 @@ async def test_chat_start_continue_pinned_persona_rejections_and_isolation(
             calls_before_reject = len(model_provider.requests)
             bob_use_alice_agent = await client.post(
                 "/v1/chat",
-                headers=bob_headers,
+                headers=_with_idem(bob_headers),
                 json={"agentId": alice_agent["agentId"], "message": "steal"},
             )
             assert bob_use_alice_agent.status_code == 404
 
             bob_use_alice_conv = await client.post(
                 "/v1/chat",
-                headers=bob_headers,
+                headers=_with_idem(bob_headers),
                 json={
                     "agentId": alice_agent["agentId"],
                     "conversationId": str(conv_id),
@@ -304,7 +308,7 @@ async def test_chat_start_continue_pinned_persona_rejections_and_isolation(
 
             mismatch = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers=_with_idem(alice_headers),
                 json={
                     "agentId": alice_other_agent["agentId"],
                     "conversationId": str(conv_id),
@@ -322,7 +326,7 @@ async def test_chat_start_continue_pinned_persona_rejections_and_isolation(
             )
             failed_turn = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers=_with_idem(alice_headers),
                 json={
                     "agentId": alice_agent["agentId"],
                     "conversationId": str(conv_id),
@@ -335,7 +339,7 @@ async def test_chat_start_continue_pinned_persona_rejections_and_isolation(
             # 7. Continue conversation: keeps pinned v1 persona & excludes failed turn from prompt.
             turn3 = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers=_with_idem(alice_headers),
                 json={
                     "agentId": alice_agent["agentId"],
                     "conversationId": str(conv_id),
@@ -433,7 +437,7 @@ async def test_sync_chat_disconnect_does_not_abort_in_flight_model_commit(
             gate_provider.release.set()
             seed_resp = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers=_with_idem(alice_headers),
                 json={"agentId": agent["agentId"], "message": "seed"},
             )
             assert seed_resp.status_code == 200
@@ -447,7 +451,7 @@ async def test_sync_chat_disconnect_does_not_abort_in_flight_model_commit(
             http_task = asyncio.create_task(
                 client.post(
                     "/v1/chat",
-                    headers=alice_headers,
+                    headers=_with_idem(alice_headers),
                     json={
                         "agentId": agent["agentId"],
                         "conversationId": str(conv_id),
@@ -554,7 +558,7 @@ async def test_chat_end_to_end_with_openai_compatible_adapter_and_startup_model_
 
                 ok_resp = await client.post(
                     "/v1/chat",
-                    headers=alice_headers,
+                    headers=_with_idem(alice_headers),
                     json={"agentId": agent["agentId"], "message": "hello openai"},
                 )
                 assert ok_resp.status_code == 200
@@ -570,7 +574,7 @@ async def test_chat_end_to_end_with_openai_compatible_adapter_and_startup_model_
                 # Timeout from OpenAI-compatible adapter maps cleanly to 504 `generation_timeout`.
                 timeout_resp = await client.post(
                     "/v1/chat",
-                    headers=alice_headers,
+                    headers=_with_idem(alice_headers),
                     json={
                         "agentId": agent["agentId"],
                         "conversationId": data["conversationId"],

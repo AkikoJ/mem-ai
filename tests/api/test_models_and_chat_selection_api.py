@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -296,7 +296,7 @@ async def test_chat_model_override_disabled_pinned_default_failure_recording_and
             ):
                 bad = await client.post(
                     "/v1/chat",
-                    headers=std_headers,
+                    headers={**std_headers, "Idempotency-Key": f"model-{uuid4().hex}"},
                     json={
                         "agentId": std_agent["agentId"],
                         "message": "hijack attempt",
@@ -314,7 +314,7 @@ async def test_chat_model_override_disabled_pinned_default_failure_recording_and
             ):
                 rejected = await client.post(
                     "/v1/chat",
-                    headers=std_headers,
+                    headers={**std_headers, "Idempotency-Key": f"model-{uuid4().hex}"},
                     json={
                         "agentId": std_agent["agentId"],
                         "message": "should reject",
@@ -334,7 +334,7 @@ async def test_chat_model_override_disabled_pinned_default_failure_recording_and
             )
             turn1 = await client.post(
                 "/v1/chat",
-                headers=pro_headers,
+                headers={**pro_headers, "Idempotency-Key": f"model-{uuid4().hex}"},
                 json={"agentId": pro_agent["agentId"], "message": "use default"},
             )
             assert turn1.status_code == 200
@@ -346,7 +346,7 @@ async def test_chat_model_override_disabled_pinned_default_failure_recording_and
 
             turn2 = await client.post(
                 "/v1/chat",
-                headers=pro_headers,
+                headers={**pro_headers, "Idempotency-Key": f"model-{uuid4().hex}"},
                 json={
                     "agentId": pro_agent["agentId"],
                     "conversationId": str(conv_id),
@@ -387,7 +387,7 @@ async def test_chat_model_override_disabled_pinned_default_failure_recording_and
             calls_before = len(provider.requests)
             pinned_disabled_resp = await client.post(
                 "/v1/chat",
-                headers=pro_headers,
+                headers={**pro_headers, "Idempotency-Key": f"model-{uuid4().hex}"},
                 json={
                     "agentId": pro_agent["agentId"],
                     "conversationId": str(conv_id),
@@ -400,7 +400,7 @@ async def test_chat_model_override_disabled_pinned_default_failure_recording_and
 
             recovered_resp = await client.post(
                 "/v1/chat",
-                headers=pro_headers,
+                headers={**pro_headers, "Idempotency-Key": f"model-{uuid4().hex}"},
                 json={
                     "agentId": pro_agent["agentId"],
                     "conversationId": str(conv_id),
@@ -422,7 +422,7 @@ async def test_chat_model_override_disabled_pinned_default_failure_recording_and
             )
             fail_resp = await client.post(
                 "/v1/chat",
-                headers=pro_headers,
+                headers={**pro_headers, "Idempotency-Key": f"model-{uuid4().hex}"},
                 json={
                     "agentId": pro_agent["agentId"],
                     "conversationId": str(conv_id),
@@ -511,7 +511,7 @@ async def test_server_forced_policy_takes_precedence_over_request_and_agent_defa
             )
             chat_resp = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers={**alice_headers, "Idempotency-Key": f"model-{uuid4().hex}"},
                 json={
                     "agentId": agent["agentId"],
                     "message": "forced wins",
@@ -561,7 +561,7 @@ async def test_missing_server_model_config_returns_503_before_upstream_call(
             )
             missing_resp = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers={**alice_headers, "Idempotency-Key": f"model-{uuid4().hex}"},
                 json={"agentId": agent_no_default["agentId"], "message": "no model configured"},
             )
             assert missing_resp.status_code == 503
@@ -578,7 +578,7 @@ async def test_missing_server_model_config_returns_503_before_upstream_call(
             )
             unsynced_resp = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers={**alice_headers, "Idempotency-Key": f"model-{uuid4().hex}"},
                 json={"agentId": agent_with_default["agentId"], "message": "registry empty"},
             )
             assert unsynced_resp.status_code == 503

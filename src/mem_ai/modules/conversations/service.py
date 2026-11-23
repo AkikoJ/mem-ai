@@ -18,10 +18,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass
-from types import TracebackType
-from typing import Any, TypeVar
+from datetime import datetime
+from typing import Any, TypeVar, overload
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -36,24 +36,30 @@ from mem_ai.core.exceptions import (
     GatewayTimeoutError,
     NotFoundError,
     ServiceUnavailableError,
+    UnprocessableEntityError,
 )
 from mem_ai.core.logging import bind_log_context, reset_log_context
 from mem_ai.modules.conversations import generation as generation_store
-from mem_ai.modules.conversations.generation import BeforeCommitHook
+from mem_ai.modules.conversations import idempotency as idempotency_store
+from mem_ai.modules.conversations import queries as conversation_queries
+from mem_ai.modules.conversations.generation import (
+    BeforeCommitHook,
+    GenerationLeaseHeartbeat,
+    IdempotencyRecordHitError,
+    IdempotencyScopeRaceError,
+)
 from mem_ai.modules.conversations.prompt import compile_chat_context
 from mem_ai.modules.conversations.schemas import (
+    ChatTurnOutcome,
     CommittedChatResult,
     GenerationRecord,
+    IdempotencyKeySpec,
     MessageRecord,
     PreparedContext,
     PreparedGeneration,
 )
 from mem_ai.modules.memories import service as memories_service
-from mem_ai.modules.memories.service import (
-    MemoryRecallPolicy,
-    TombstoneLookup,
-    TurnContentRecord,
-)
+from mem_ai.modules.memories.service import MemoryRecallPolicy, TombstoneLookup
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelRoutingPolicy
 from mem_ai.modules.users import service as users_service
@@ -87,6 +93,7 @@ class SyncChatOptions:
     memory_context_max_chars: int = 2000
     prompt_max_chars: int | None = 24000
     memory_write_max_attempts: int = 5
+    idempotency_retention_seconds: float = idempotency_store.DEFAULT_IDEMPOTENCY_RETENTION_SECONDS
     tombstone_lookup: TombstoneLookup | None = None
     task_registry: SyncGenerationTaskRegistry | None = None
     before_commit_hook: BeforeCommitHook | None = None
@@ -114,80 +121,9 @@ def sync_chat_options_from_settings(
         memory_context_max_chars=settings.chat_memory_context_max_chars,
         prompt_max_chars=settings.chat_prompt_max_chars,
         memory_write_max_attempts=settings.worker_max_attempts,
+        idempotency_retention_seconds=float(settings.idempotency_retention_hours * 3600),
         task_registry=task_registry,
     )
-
-
-class GenerationLeaseHeartbeat:
-    """Periodic lease renewal context manager shared by sync and streaming generation execution."""
-
-    def __init__(
-        self,
-        *,
-        session_factory: async_sessionmaker[AsyncSession],
-        prepared: PreparedGeneration,
-        lease_ttl_seconds: float,
-        renew_interval_seconds: float | None,
-        on_lease_lost: Callable[[AppError], None] | None = None,
-    ) -> None:
-        self._session_factory = session_factory
-        self._prepared = prepared
-        self._lease_ttl_seconds = lease_ttl_seconds
-        self._renew_interval_seconds = renew_interval_seconds
-        self._on_lease_lost = on_lease_lost
-        self._task: asyncio.Task[None] | None = None
-        self.loss_error: AppError | None = None
-
-    async def __aenter__(self) -> GenerationLeaseHeartbeat:
-        if self._renew_interval_seconds is not None and self._renew_interval_seconds > 0:
-            self._task = asyncio.create_task(self._run_loop())
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        _ = (exc_type, exc, tb)
-        await self.stop()
-
-    async def stop(self) -> None:
-        """Stop the background renewal loop cleanly before Tx 2 or failure convergence."""
-        task = self._task
-        self._task = None
-        if task is None:
-            return
-        if not task.done():
-            task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-
-    async def _run_loop(self) -> None:
-        assert self._renew_interval_seconds is not None
-        while True:
-            await asyncio.sleep(self._renew_interval_seconds)
-            try:
-                await generation_store.renew_generation_lease_phase(
-                    self._session_factory,
-                    owner_id=self._prepared.owner_id,
-                    conversation_id=self._prepared.conversation_id,
-                    generation_id=self._prepared.generation_id,
-                    lease_token=self._prepared.lease_token,
-                    lease_ttl_seconds=self._lease_ttl_seconds,
-                )
-            except AppError as exc:
-                self.loss_error = exc
-                if self._on_lease_lost is not None:
-                    self._on_lease_lost(exc)
-                return
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.warning(
-                    "Transient error renewing generation lease; retrying before expiry",
-                    exc_info=True,
-                )
 
 
 class SyncGenerationTaskRegistry:
@@ -217,62 +153,6 @@ class SyncGenerationTaskRegistry:
             task.cancel()
         if still_pending:
             await asyncio.gather(*still_pending, return_exceptions=True)
-
-
-class DatabaseConversationAccessChecker:
-    """Real `ConversationAccessChecker` backed by `conversations.generation`."""
-
-    def __init__(self, *, session_factory: async_sessionmaker[AsyncSession]) -> None:
-        self._session_factory = session_factory
-
-    async def ensure_conversation_accessible(
-        self,
-        *,
-        owner_id: UUID,
-        conversation_id: UUID,
-    ) -> None:
-        await generation_store.ensure_conversation_accessible(
-            self._session_factory,
-            owner_id=owner_id,
-            conversation_id=conversation_id,
-        )
-
-
-class DatabaseTurnContentLoader:
-    """Read-only `TurnContentLoader` delegating to `conversations.generation`."""
-
-    def __init__(self, *, session_factory: async_sessionmaker[AsyncSession]) -> None:
-        self._session_factory = session_factory
-
-    async def load_turn_for_memory_write(
-        self,
-        *,
-        owner_id: UUID,
-        conversation_id: UUID,
-        generation_id: UUID,
-    ) -> TurnContentRecord | None:
-        """Load committed user/assistant turn messages via `conversations.generation`."""
-        return await generation_store.load_turn_for_memory_write(
-            self._session_factory,
-            owner_id=owner_id,
-            conversation_id=conversation_id,
-            generation_id=generation_id,
-        )
-
-    async def is_conversation_active_in_session(
-        self,
-        session: AsyncSession,
-        *,
-        owner_id: UUID,
-        conversation_id: UUID,
-    ) -> bool:
-        """Re-check conversation ownership and `active` status (`FOR SHARE`) inside caller's Tx."""
-        return await generation_store.is_conversation_active_in_session(
-            session,
-            owner_id=owner_id,
-            conversation_id=conversation_id,
-            for_share=True,
-        )
 
 
 def build_turn_memory_enqueue_hook(
@@ -321,6 +201,8 @@ async def prepare_generation(
     requested_model_id: str | None = None,
     memory_provider: MemoryProvider | None = None,
     options: SyncChatOptions | None = None,
+    idempotency_spec: IdempotencyKeySpec | None = None,
+    now: datetime | None = None,
 ) -> PreparedGeneration:
     """Resolve persona outside DB write tx, validate model, and commit Tx 1 preparation."""
     resolved_options = options if options is not None else SyncChatOptions()
@@ -328,17 +210,14 @@ async def prepare_generation(
 
     # Read existing conversation (if any) in a short read session before calling PersonaProvider.
     if conversation_id is None:
-        persona = await persona_provider.get_latest_published(
-            owner_id=owner_id,
-            agent_id=agent_id,
-        )
+        persona = await persona_provider.get_latest_published(owner_id=owner_id, agent_id=agent_id)
         if persona is None:
             raise NotFoundError(
                 code="agent_persona_not_found",
                 message="published agent persona not found",
             )
     else:
-        existing_conversation = await generation_store.load_conversation_for_continuation(
+        existing_conversation = await conversation_queries.load_conversation_for_continuation(
             session_factory,
             owner_id=owner_id,
             conversation_id=conversation_id,
@@ -378,6 +257,9 @@ async def prepare_generation(
         memory_provider_id=memory_provider.provider_id if memory_provider is not None else None,
         history_limit=resolved_options.history_limit,
         lease_ttl_seconds=resolved_options.lease_ttl_seconds,
+        idempotency_spec=idempotency_spec,
+        idempotency_retention_seconds=resolved_options.idempotency_retention_seconds,
+        now=now,
     )
 
 
@@ -524,6 +406,8 @@ async def _safe_converge_failure(
     prepared: PreparedGeneration,
     error_code: str,
     error_message: str,
+    error_status_code: int | None = None,
+    idempotency_retention_seconds: float = idempotency_store.DEFAULT_IDEMPOTENCY_RETENTION_SECONDS,
 ) -> None:
     if error_code == "generation_lease_lost":
         return
@@ -537,15 +421,13 @@ async def _safe_converge_failure(
             target_status="failed",
             error_code=error_code,
             error_message=error_message,
+            error_status_code=error_status_code,
+            idempotency_retention_seconds=idempotency_retention_seconds,
         )
     except Exception:
         logger.exception(
             "Failed to converge generation to failed state",
-            extra={
-                "extra_fields": {
-                    "error_code": error_code,
-                }
-            },
+            extra={"extra_fields": {"error_code": error_code}},
         )
 
 
@@ -593,6 +475,16 @@ async def complete_prepared_sync_generation(
     def _abort_model_on_lease_lost(_error: AppError) -> None:
         if model_task is not None and not model_task.done():
             model_task.cancel()
+
+    async def _converge(error_code: str, error_message: str, status_code: int) -> None:
+        await _safe_converge_failure(
+            session_factory,
+            prepared=prepared,
+            error_code=error_code,
+            error_message=error_message,
+            error_status_code=status_code,
+            idempotency_retention_seconds=resolved_options.idempotency_retention_seconds,
+        )
 
     try:
         try:
@@ -648,27 +540,16 @@ async def complete_prepared_sync_generation(
                 if heartbeat.loss_error is not None:
                     raise heartbeat.loss_error
         except AppError as exc:
-            await _safe_converge_failure(
-                session_factory,
-                prepared=prepared,
-                error_code=exc.code,
-                error_message=exc.message,
-            )
+            await _converge(exc.code, exc.message, exc.status_code)
             raise
         except Exception:
             logger.exception(
                 "Unexpected exception during model completion",
                 extra={"extra_fields": {"model_id": prepared.model_id}},
             )
-            await _safe_converge_failure(
-                session_factory,
-                prepared=prepared,
-                error_code="model_upstream_error",
-                error_message="model generation failed",
-            )
+            await _converge("model_upstream_error", "model generation failed", 502)
             raise BadGatewayError(
-                code="model_upstream_error",
-                message="model generation failed",
+                code="model_upstream_error", message="model generation failed"
             ) from None
 
         tx2_before_commit = build_turn_memory_enqueue_hook(
@@ -685,32 +566,163 @@ async def complete_prepared_sync_generation(
                 usage=model_response.usage,
                 finish_reason=model_response.finish_reason,
                 before_commit_hook=tx2_before_commit,
+                idempotency_retention_seconds=resolved_options.idempotency_retention_seconds,
             )
         except AppError as exc:
-            await _safe_converge_failure(
-                session_factory,
-                prepared=prepared,
-                error_code=exc.code,
-                error_message=exc.message,
-            )
+            await _converge(exc.code, exc.message, exc.status_code)
             raise
         except Exception:
             logger.exception(
                 "Failed to commit completed generation atomically",
                 extra={"extra_fields": {"model_id": prepared.model_id}},
             )
-            await _safe_converge_failure(
-                session_factory,
-                prepared=prepared,
-                error_code="generation_commit_failed",
-                error_message="failed to commit generation result",
-            )
+            await _converge("generation_commit_failed", "failed to commit generation result", 503)
             raise ServiceUnavailableError(
                 code="generation_commit_failed",
                 message="failed to commit generation result",
             ) from None
     finally:
         reset_log_context(log_tokens)
+
+
+async def _execute_shielded_sync_generation(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    model_provider: ModelProvider,
+    prepared: PreparedGeneration,
+    memory_provider: MemoryProvider | None,
+    options: SyncChatOptions,
+) -> CommittedChatResult:
+    coro = complete_prepared_sync_generation(
+        session_factory,
+        model_provider=model_provider,
+        memory_provider=memory_provider,
+        prepared=prepared,
+        options=options,
+    )
+    if options.task_registry is not None:
+        task = options.task_registry.spawn(coro)
+    else:
+        task = asyncio.create_task(coro)
+        task.add_done_callback(_consume_detached_task_exception)
+    return await asyncio.shield(task)
+
+
+async def prepare_chat_turn(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    persona_provider: PersonaProvider,
+    owner_id: UUID,
+    agent_id: UUID,
+    conversation_id: UUID | None,
+    user_message: str,
+    idempotency_key: str,
+    requested_model_id: str | None = None,
+    stream: bool = False,
+    allow_streaming: bool = False,
+    memory_provider: MemoryProvider | None = None,
+    options: SyncChatOptions | None = None,
+    now: datetime | None = None,
+) -> PreparedGeneration | ChatTurnOutcome:
+    """Shared idempotent chat preparation entry point for sync and future SSE execution.
+
+    Resolves any existing live idempotency record BEFORE stream gating, persona/model lookups,
+    or conversation lease contention. Concurrent same-key races resolve to the winning record.
+    """
+    resolved_options = options if options is not None else SyncChatOptions()
+    spec = idempotency_store.build_chat_idempotency_spec(
+        raw_key=idempotency_key,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        message=user_message,
+        requested_model_id=requested_model_id,
+        retention_seconds=resolved_options.idempotency_retention_seconds,
+    )
+
+    replayed = await idempotency_store.resolve_chat_idempotency(
+        session_factory,
+        owner_id=owner_id,
+        spec=spec,
+        load_detail_in_session=conversation_queries.load_generation_detail_in_session,
+        now=now,
+    )
+    if replayed is not None:
+        return replayed
+
+    if stream and not allow_streaming:
+        raise UnprocessableEntityError(
+            code="streaming_not_enabled",
+            message="streaming responses are not enabled on this endpoint yet",
+        )
+
+    for _ in range(2):
+        try:
+            return await prepare_generation(
+                session_factory,
+                persona_provider=persona_provider,
+                memory_provider=memory_provider,
+                owner_id=owner_id,
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+                user_message=user_message,
+                requested_model_id=requested_model_id,
+                options=resolved_options,
+                idempotency_spec=spec,
+                now=now,
+            )
+        except (IdempotencyRecordHitError, IdempotencyScopeRaceError):
+            resolved = await idempotency_store.resolve_chat_idempotency(
+                session_factory,
+                owner_id=owner_id,
+                spec=spec,
+                load_detail_in_session=conversation_queries.load_generation_detail_in_session,
+                now=now,
+            )
+            if resolved is not None:
+                return resolved
+
+    raise ServiceUnavailableError(
+        code="idempotency_resolution_failed",
+        message="failed to resolve concurrent idempotent chat request",
+    )
+
+
+@overload
+async def run_sync_chat(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    persona_provider: PersonaProvider,
+    model_provider: ModelProvider,
+    owner_id: UUID,
+    agent_id: UUID,
+    conversation_id: UUID | None,
+    user_message: str,
+    requested_model_id: str | None = None,
+    memory_provider: MemoryProvider | None = None,
+    options: SyncChatOptions | None = None,
+    idempotency_key: None = None,
+    stream: bool = False,
+    now: datetime | None = None,
+) -> CommittedChatResult: ...
+
+
+@overload
+async def run_sync_chat(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    persona_provider: PersonaProvider,
+    model_provider: ModelProvider,
+    owner_id: UUID,
+    agent_id: UUID,
+    conversation_id: UUID | None,
+    user_message: str,
+    idempotency_key: str,
+    requested_model_id: str | None = None,
+    memory_provider: MemoryProvider | None = None,
+    options: SyncChatOptions | None = None,
+    stream: bool = False,
+    now: datetime | None = None,
+) -> ChatTurnOutcome: ...
 
 
 async def run_sync_chat(
@@ -725,32 +737,49 @@ async def run_sync_chat(
     requested_model_id: str | None = None,
     memory_provider: MemoryProvider | None = None,
     options: SyncChatOptions | None = None,
-) -> CommittedChatResult:
-    """Execute a full synchronous chat turn shielded from client HTTP disconnects."""
+    idempotency_key: str | None = None,
+    stream: bool = False,
+    now: datetime | None = None,
+) -> ChatTurnOutcome:
+    """Execute or idempotently replay a synchronous chat turn shielded from HTTP disconnects."""
     resolved_options = options if options is not None else SyncChatOptions()
-    prepared = await prepare_generation(
-        session_factory,
-        persona_provider=persona_provider,
-        memory_provider=memory_provider,
-        owner_id=owner_id,
-        agent_id=agent_id,
-        conversation_id=conversation_id,
-        user_message=user_message,
-        requested_model_id=requested_model_id,
-        options=resolved_options,
-    )
+    if idempotency_key is not None:
+        prepared_or_replay = await prepare_chat_turn(
+            session_factory,
+            persona_provider=persona_provider,
+            memory_provider=memory_provider,
+            owner_id=owner_id,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            user_message=user_message,
+            idempotency_key=idempotency_key,
+            requested_model_id=requested_model_id,
+            stream=stream,
+            allow_streaming=False,
+            options=resolved_options,
+            now=now,
+        )
+        if not isinstance(prepared_or_replay, PreparedGeneration):
+            return prepared_or_replay
+        prepared = prepared_or_replay
+    else:
+        prepared = await prepare_generation(
+            session_factory,
+            persona_provider=persona_provider,
+            memory_provider=memory_provider,
+            owner_id=owner_id,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            user_message=user_message,
+            requested_model_id=requested_model_id,
+            options=resolved_options,
+            now=now,
+        )
 
-    coro = complete_prepared_sync_generation(
+    return await _execute_shielded_sync_generation(
         session_factory,
         model_provider=model_provider,
         memory_provider=memory_provider,
         prepared=prepared,
         options=resolved_options,
     )
-    if resolved_options.task_registry is not None:
-        task = resolved_options.task_registry.spawn(coro)
-    else:
-        task = asyncio.create_task(coro)
-        task.add_done_callback(_consume_detached_task_exception)
-
-    return await asyncio.shield(task)

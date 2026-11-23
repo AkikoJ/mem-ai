@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -128,10 +128,13 @@ async def test_chat_api_rejects_overlapping_generation_allows_parallel_and_recov
             alice_user_id = UUID(alice_me.json()["data"]["userId"])
             agent_id = await _create_published_agent(client, headers=alice_headers)
 
+            def _idem() -> dict[str, str]:
+                return {**alice_headers, "Idempotency-Key": f"conc-{uuid4().hex}"}
+
             # Seed Conversation A and Conversation B.
             resp_a = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers=_idem(),
                 json={"agentId": agent_id, "message": "init-a"},
             )
             assert resp_a.status_code == 200
@@ -139,7 +142,7 @@ async def test_chat_api_rejects_overlapping_generation_allows_parallel_and_recov
 
             resp_b = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers=_idem(),
                 json={"agentId": agent_id, "message": "init-b"},
             )
             assert resp_b.status_code == 200
@@ -151,7 +154,7 @@ async def test_chat_api_rejects_overlapping_generation_allows_parallel_and_recov
             task_a = asyncio.create_task(
                 client.post(
                     "/v1/chat",
-                    headers=alice_headers,
+                    headers=_idem(),
                     json={
                         "agentId": agent_id,
                         "conversationId": conv_a,
@@ -164,7 +167,7 @@ async def test_chat_api_rejects_overlapping_generation_allows_parallel_and_recov
             calls_snapshot = list(provider.calls)
             conflict_resp = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers=_idem(),
                 json={
                     "agentId": agent_id,
                     "conversationId": conv_a,
@@ -181,7 +184,7 @@ async def test_chat_api_rejects_overlapping_generation_allows_parallel_and_recov
 
             parallel_b = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers=_idem(),
                 json={
                     "agentId": agent_id,
                     "conversationId": conv_b,
@@ -202,7 +205,7 @@ async def test_chat_api_rejects_overlapping_generation_allows_parallel_and_recov
             )
             fail_resp = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers=_idem(),
                 json={
                     "agentId": agent_id,
                     "conversationId": conv_a,
@@ -214,7 +217,7 @@ async def test_chat_api_rejects_overlapping_generation_allows_parallel_and_recov
             provider.slow_prompts["timeout-a"] = 1.0
             timeout_resp = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers=_idem(),
                 json={
                     "agentId": agent_id,
                     "conversationId": conv_a,
@@ -226,7 +229,7 @@ async def test_chat_api_rejects_overlapping_generation_allows_parallel_and_recov
 
             after_errors_resp = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers=_idem(),
                 json={
                     "agentId": agent_id,
                     "conversationId": conv_a,
@@ -268,7 +271,7 @@ async def test_chat_api_rejects_overlapping_generation_allows_parallel_and_recov
 
             takeover_resp = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers=_idem(),
                 json={
                     "agentId": agent_id,
                     "conversationId": conv_a,
@@ -302,7 +305,7 @@ async def test_chat_api_rejects_overlapping_generation_allows_parallel_and_recov
             race_r1, race_r2 = await asyncio.gather(
                 client.post(
                     "/v1/chat",
-                    headers=alice_headers,
+                    headers=_idem(),
                     json={
                         "agentId": agent_id,
                         "conversationId": conv_a,
@@ -311,7 +314,7 @@ async def test_chat_api_rejects_overlapping_generation_allows_parallel_and_recov
                 ),
                 client.post(
                     "/v1/chat",
-                    headers=alice_headers,
+                    headers=_idem(),
                     json={
                         "agentId": agent_id,
                         "conversationId": conv_a,

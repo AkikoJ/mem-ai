@@ -7,7 +7,7 @@ import logging
 from collections.abc import AsyncIterator
 from io import StringIO
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -202,7 +202,7 @@ async def test_chat_api_isolates_user_vs_conversation_memories_and_persists_inje
             # Start Conv A and Conv B for Alice.
             conv_a_turn1 = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers={**alice_headers, "Idempotency-Key": f"recall-{uuid4().hex}"},
                 json={"agentId": alice_agent["agentId"], "message": "Start Conv A"},
             )
             assert conv_a_turn1.status_code == 200
@@ -210,7 +210,7 @@ async def test_chat_api_isolates_user_vs_conversation_memories_and_persists_inje
 
             conv_b_turn1 = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers={**alice_headers, "Idempotency-Key": f"recall-{uuid4().hex}"},
                 json={"agentId": alice_agent["agentId"], "message": "Start Conv B"},
             )
             assert conv_b_turn1.status_code == 200
@@ -232,7 +232,7 @@ async def test_chat_api_isolates_user_vs_conversation_memories_and_persists_inje
             # Continue Conv A -> sees BOTH Alice's user memory AND Conv A memory, NEVER Bob's.
             conv_a_turn2 = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers={**alice_headers, "Idempotency-Key": f"recall-{uuid4().hex}"},
                 json={
                     "agentId": alice_agent["agentId"],
                     "conversationId": str(conv_a_id),
@@ -266,7 +266,7 @@ async def test_chat_api_isolates_user_vs_conversation_memories_and_persists_inje
             # Continue Conv B -> sees Alice's user memory ONLY; Conv A memory MUST NOT leak!
             conv_b_turn2 = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers={**alice_headers, "Idempotency-Key": f"recall-{uuid4().hex}"},
                 json={
                     "agentId": alice_agent["agentId"],
                     "conversationId": str(conv_b_id),
@@ -299,7 +299,7 @@ async def test_chat_api_isolates_user_vs_conversation_memories_and_persists_inje
             # Agent with `memoryPolicy.enabled=False` skips recall and saves 0 refs.
             no_mem_resp = await client.post(
                 "/v1/chat",
-                headers=alice_headers,
+                headers={**alice_headers, "Idempotency-Key": f"recall-{uuid4().hex}"},
                 json={"agentId": disabled_mem_agent["agentId"], "message": "Hello without memory"},
             )
             assert no_mem_resp.status_code == 200
@@ -377,7 +377,7 @@ async def test_chat_api_degrades_gracefully_on_recall_failure_with_sanitized_log
                 # Turn 1 succeeds despite memory provider failing.
                 resp1 = await client.post(
                     "/v1/chat",
-                    headers=alice_headers,
+                    headers={**alice_headers, "Idempotency-Key": f"recall-{uuid4().hex}"},
                     json={"agentId": agent["agentId"], "message": "First turn before outage"},
                 )
                 assert resp1.status_code == 200
@@ -386,7 +386,7 @@ async def test_chat_api_degrades_gracefully_on_recall_failure_with_sanitized_log
                 # Turn 2 also succeeds with fixed persona + Turn 1 history + current input.
                 resp2 = await client.post(
                     "/v1/chat",
-                    headers=alice_headers,
+                    headers={**alice_headers, "Idempotency-Key": f"recall-{uuid4().hex}"},
                     json={
                         "agentId": agent["agentId"],
                         "conversationId": str(conv_id),
@@ -533,7 +533,7 @@ async def test_chat_api_end_to_end_with_memos_adapter_encapsulates_vendor_format
 
                 resp = await client.post(
                     "/v1/chat",
-                    headers=alice_headers,
+                    headers={**alice_headers, "Idempotency-Key": f"recall-{uuid4().hex}"},
                     json={"agentId": agent["agentId"], "message": "Summarize my sprint"},
                 )
                 assert resp.status_code == 200

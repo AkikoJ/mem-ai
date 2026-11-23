@@ -259,6 +259,7 @@ class Settings(BaseSettings):
     worker_reconcile_delay_seconds: float = Field(default=10.0, gt=0.0, le=3600.0)
     worker_shutdown_grace_seconds: float = Field(default=15.0, gt=0.0, le=300.0)
     job_attempt_retention_days: int = Field(default=30, ge=1, le=365)
+    idempotency_retention_hours: int = Field(default=24, ge=1, le=720)
 
     @model_validator(mode="after")
     def validate_production_boundaries(self) -> Settings:

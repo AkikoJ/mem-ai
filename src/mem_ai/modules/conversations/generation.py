@@ -14,8 +14,12 @@ Implements the persistence half of Engineering Design §5.4 (Shared Generation L
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timedelta
+from types import TracebackType
 from typing import Literal, cast
 from uuid import UUID, uuid4
 
@@ -25,26 +29,38 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from mem_ai.contracts.memory_provider import MemoryRecallItem
 from mem_ai.contracts.model_provider import ModelUsage
 from mem_ai.contracts.persona_provider import PersonaSnapshot
-from mem_ai.core.exceptions import ConflictError, ForbiddenError, NotFoundError
+from mem_ai.core.exceptions import AppError, ConflictError, ForbiddenError, NotFoundError
 from mem_ai.db.base import is_unique_violation
-from mem_ai.modules.conversations import repository
+from mem_ai.modules.conversations import idempotency, queries, repository
 from mem_ai.modules.conversations.models import (
     GENERATION_ACTIVE_CONVERSATION_UNIQUE_INDEX,
+    IDEMPOTENCY_SCOPE_UNIQUE_CONSTRAINT,
     MESSAGE_GENERATION_ROLE_UNIQUE_CONSTRAINT,
     MESSAGE_RECALLED_MEMORY_UNIQUE_CONSTRAINT,
-    Conversation,
 )
 from mem_ai.modules.conversations.prompt import HistoryRole, PromptHistoryMessage
+from mem_ai.modules.conversations.queries import (
+    ensure_conversation_accessible as ensure_conversation_accessible,
+)
+from mem_ai.modules.conversations.queries import (
+    get_generation_for_owner as get_generation_for_owner,
+)
+from mem_ai.modules.conversations.queries import (
+    list_conversation_messages_for_owner as list_conversation_messages_for_owner,
+)
+from mem_ai.modules.conversations.queries import (
+    list_recalled_memories_for_message_for_owner as list_recalled_memories_for_message_for_owner,
+)
 from mem_ai.modules.conversations.schemas import (
     CommittedChatResult,
-    ConversationRecord,
     GenerationRecord,
+    IdempotencyKeySpec,
+    IdempotencyRecordDTO,
     MessageRecord,
     PreparedGeneration,
     RecalledMemoryReferenceRecord,
 )
 from mem_ai.modules.memories import service as memories_service
-from mem_ai.modules.memories.service import TurnContentRecord
 from mem_ai.modules.users import service as users_service
 
 BeforeCommitHook = Callable[[AsyncSession, GenerationRecord, MessageRecord], Awaitable[None]]
@@ -52,7 +68,92 @@ RecalledMemoryFilterHook = Callable[
     [AsyncSession, Sequence[MemoryRecallItem]],
     Awaitable[list[MemoryRecallItem]],
 ]
-ConversationLockMode = Literal["none", "share", "update"]
+
+logger = logging.getLogger("mem_ai.conversations.generation")
+
+
+class GenerationLeaseHeartbeat:
+    """Periodic lease renewal context manager shared by sync and streaming generation execution."""
+
+    def __init__(
+        self,
+        *,
+        session_factory: async_sessionmaker[AsyncSession],
+        prepared: PreparedGeneration,
+        lease_ttl_seconds: float,
+        renew_interval_seconds: float | None,
+        on_lease_lost: Callable[[AppError], None] | None = None,
+    ) -> None:
+        self._session_factory = session_factory
+        self._prepared = prepared
+        self._lease_ttl_seconds = lease_ttl_seconds
+        self._renew_interval_seconds = renew_interval_seconds
+        self._on_lease_lost = on_lease_lost
+        self._task: asyncio.Task[None] | None = None
+        self.loss_error: AppError | None = None
+
+    async def __aenter__(self) -> GenerationLeaseHeartbeat:
+        if self._renew_interval_seconds is not None and self._renew_interval_seconds > 0:
+            self._task = asyncio.create_task(self._run_loop())
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        _ = (exc_type, exc, tb)
+        await self.stop()
+
+    async def stop(self) -> None:
+        """Stop the background renewal loop cleanly before Tx 2 or failure convergence."""
+        task = self._task
+        self._task = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    async def _run_loop(self) -> None:
+        assert self._renew_interval_seconds is not None
+        while True:
+            await asyncio.sleep(self._renew_interval_seconds)
+            try:
+                await renew_generation_lease_phase(
+                    self._session_factory,
+                    owner_id=self._prepared.owner_id,
+                    conversation_id=self._prepared.conversation_id,
+                    generation_id=self._prepared.generation_id,
+                    lease_token=self._prepared.lease_token,
+                    lease_ttl_seconds=self._lease_ttl_seconds,
+                )
+            except AppError as exc:
+                self.loss_error = exc
+                if self._on_lease_lost is not None:
+                    self._on_lease_lost(exc)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Transient error renewing generation lease; retrying before expiry",
+                    exc_info=True,
+                )
+
+
+class IdempotencyRecordHitError(Exception):
+    """Internal Tx 1 signal indicating a live idempotency record was already claimed."""
+
+    def __init__(self, record: IdempotencyRecordDTO) -> None:
+        super().__init__("idempotency record already exists")
+        self.record = record
+
+
+class IdempotencyScopeRaceError(Exception):
+    """Internal Tx 1 signal indicating a concurrent insert won `uq_idempotency_records_scope`."""
 
 
 def _generation_conflict_error(
@@ -83,178 +184,21 @@ async def _inspect_resource_inactivation_in_session(
     *,
     owner_id: UUID,
     conversation_id: UUID,
-) -> tuple[str, str] | None:
-    """Return `(code, message)` when owner or conversation is no longer active."""
+) -> tuple[str, str, int] | None:
+    """Return `(code, message, status_code)` when owner or conversation is no longer active."""
     try:
         await users_service.ensure_user_active_in_session(session, user_id=owner_id, for_share=True)
     except ForbiddenError as exc:
-        return exc.code, exc.message
+        return exc.code, exc.message, exc.status_code
 
     try:
-        await _load_accessible_conversation_in_session(
-            session,
-            owner_id=owner_id,
-            conversation_id=conversation_id,
-            lock_mode="share",
+        await queries.load_accessible_conversation_in_session(
+            session, owner_id=owner_id, conversation_id=conversation_id, lock_mode="share"
         )
     except (ConflictError, NotFoundError) as exc:
-        return exc.code, exc.message
+        return exc.code, exc.message, exc.status_code
 
     return None
-
-
-async def _load_accessible_conversation_in_session(
-    session: AsyncSession,
-    *,
-    owner_id: UUID,
-    conversation_id: UUID,
-    lock_mode: ConversationLockMode = "none",
-) -> Conversation:
-    """Single resource policy for write/continuation access: 404 missing/foreign, 409 deleting."""
-    lookup = (
-        repository.get_conversation_for_update
-        if lock_mode == "update"
-        else (
-            repository.get_conversation_for_share
-            if lock_mode == "share"
-            else repository.get_conversation_for_owner
-        )
-    )
-    conversation = await lookup(session, owner_id=owner_id, conversation_id=conversation_id)
-    if conversation is None:
-        raise NotFoundError(code="conversation_not_found", message="conversation not found")
-    if conversation.status == "deleting":
-        raise ConflictError(code="conversation_deleting", message="conversation is being deleted")
-    return conversation
-
-
-async def _load_readable_conversation_in_session(
-    session: AsyncSession,
-    *,
-    owner_id: UUID,
-    conversation_id: UUID,
-) -> Conversation:
-    """Single resource policy for read queries: 404 for missing, foreign, or deleting."""
-    conversation = await repository.get_conversation_for_owner(
-        session, owner_id=owner_id, conversation_id=conversation_id
-    )
-    if conversation is None or conversation.status == "deleting":
-        raise NotFoundError(code="conversation_not_found", message="conversation not found")
-    return conversation
-
-
-async def ensure_conversation_accessible_in_session(
-    session: AsyncSession,
-    *,
-    owner_id: UUID,
-    conversation_id: UUID,
-    for_update: bool = False,
-    for_share: bool = False,
-) -> ConversationRecord:
-    """Validate conversation ownership and active status inside an existing session."""
-    mode: ConversationLockMode = "update" if for_update else ("share" if for_share else "none")
-    conversation = await _load_accessible_conversation_in_session(
-        session, owner_id=owner_id, conversation_id=conversation_id, lock_mode=mode
-    )
-    return ConversationRecord.model_validate(conversation)
-
-
-async def is_conversation_active_in_session(
-    session: AsyncSession,
-    *,
-    owner_id: UUID,
-    conversation_id: UUID,
-    for_share: bool = True,
-) -> bool:
-    """Return True iff `conversation_id` exists for `owner_id` and is `active`."""
-    try:
-        await ensure_conversation_accessible_in_session(
-            session, owner_id=owner_id, conversation_id=conversation_id, for_share=for_share
-        )
-    except (ConflictError, NotFoundError):
-        return False
-    return True
-
-
-async def load_turn_for_memory_write(
-    session_factory: async_sessionmaker[AsyncSession],
-    *,
-    owner_id: UUID,
-    conversation_id: UUID,
-    generation_id: UUID,
-) -> TurnContentRecord | None:
-    """Load committed user/assistant turn messages for background derived memory writes."""
-    async with session_factory() as session:
-        conv = await repository.get_conversation_for_owner(
-            session, owner_id=owner_id, conversation_id=conversation_id
-        )
-        if conv is None:
-            return None
-        gen = await repository.get_generation_for_owner(
-            session, owner_id=owner_id, conversation_id=conversation_id, generation_id=generation_id
-        )
-        if gen is None or gen.user_message_id is None or gen.assistant_message_id is None:
-            return None
-        user_msg = await repository.get_message_for_conversation(
-            session,
-            conversation_id=conversation_id,
-            message_id=gen.user_message_id,
-            generation_id=generation_id,
-            role="user",
-        )
-        asst_msg = await repository.get_message_for_conversation(
-            session,
-            conversation_id=conversation_id,
-            message_id=gen.assistant_message_id,
-            generation_id=generation_id,
-            role="assistant",
-        )
-        if user_msg is None or asst_msg is None:
-            return None
-        return TurnContentRecord(
-            generation_id=gen.id,
-            conversation_id=conv.id,
-            owner_id=owner_id,
-            user_message_content=user_msg.content,
-            assistant_message_content=asst_msg.content,
-            conversation_status=cast(Literal["active", "deleting"], conv.status),
-            generation_status=cast(
-                Literal["running", "succeeded", "failed", "cancelled"], gen.status
-            ),
-        )
-
-
-async def ensure_conversation_accessible(
-    session_factory: async_sessionmaker[AsyncSession],
-    *,
-    owner_id: UUID,
-    conversation_id: UUID,
-) -> ConversationRecord:
-    """Verify conversation ownership and active status in a short read session."""
-    async with session_factory() as session:
-        await users_service.ensure_user_active_in_session(session, user_id=owner_id)
-        return await ensure_conversation_accessible_in_session(
-            session, owner_id=owner_id, conversation_id=conversation_id, for_update=False
-        )
-
-
-async def load_conversation_for_continuation(
-    session_factory: async_sessionmaker[AsyncSession],
-    *,
-    owner_id: UUID,
-    conversation_id: UUID,
-    expected_agent_id: UUID,
-) -> ConversationRecord:
-    """Load an existing owned conversation outside Tx 1 to resolve its pinned persona."""
-    record = await ensure_conversation_accessible(
-        session_factory, owner_id=owner_id, conversation_id=conversation_id
-    )
-    if record.agent_id != expected_agent_id:
-        raise ConflictError(
-            code="conversation_agent_mismatch",
-            message="conversation does not belong to the specified agent",
-        )
-    return record
 
 
 async def converge_generation_failure_in_session(
@@ -269,27 +213,22 @@ async def converge_generation_failure_in_session(
     target_status: Literal["failed", "cancelled"] = "failed",
     current_time: datetime,
     expired_only: bool = False,
+    error_status_code: int | None = None,
+    idempotency_retention_seconds: float = idempotency.DEFAULT_IDEMPOTENCY_RETENTION_SECONDS,
 ) -> GenerationRecord | None:
-    """Shared in-session failure/cancellation convergence and lease release entry point.
-
-    Reused by:
-    - `converge_generation_failure_phase` (active executor failure/timeout/cancel)
-    - `prepare_generation_phase` (inline expired-lease takeover inside Tx 1)
-    - `recover_expired_generations_phase` (background Worker expiry recovery)
-    """
+    """Shared in-session failure/cancellation convergence, lease release, and idempotency sync."""
     resolved_status: Literal["failed", "cancelled"] = target_status
     resolved_error_code = error_code
     resolved_error_message = error_message
+    resolved_status_code = 409 if expired_only else error_status_code
 
     if not expired_only:
         inactivation = await _inspect_resource_inactivation_in_session(
-            session,
-            owner_id=owner_id,
-            conversation_id=conversation_id,
+            session, owner_id=owner_id, conversation_id=conversation_id
         )
         if inactivation is not None:
             resolved_status = "failed"
-            resolved_error_code, resolved_error_message = inactivation
+            resolved_error_code, resolved_error_message, resolved_status_code = inactivation
 
     updated = await repository.conditional_mark_generation_terminal_failure(
         session,
@@ -305,7 +244,36 @@ async def converge_generation_failure_in_session(
     )
     if updated is None:
         return None
+    await idempotency.finalize_terminal_failure_in_session(
+        session,
+        generation_id=generation_id,
+        target_status=resolved_status,
+        error_code=resolved_error_code,
+        error_message=resolved_error_message,
+        response_status_code=resolved_status_code,
+        terminal_at=current_time,
+        retention_seconds=idempotency_retention_seconds,
+    )
     return GenerationRecord.model_validate(updated)
+
+
+async def _ensure_idempotency_slot_available_in_session(
+    session: AsyncSession,
+    *,
+    owner_id: UUID,
+    idempotency_spec: IdempotencyKeySpec | None,
+    current_time: datetime,
+) -> None:
+    if idempotency_spec is None:
+        return
+    existing = await idempotency.purge_expired_or_find_live_in_session(
+        session,
+        user_id=owner_id,
+        spec=idempotency_spec,
+        current_time=current_time,
+    )
+    if existing is not None:
+        raise IdempotencyRecordHitError(existing)
 
 
 async def prepare_generation_phase(
@@ -323,12 +291,23 @@ async def prepare_generation_phase(
     memory_epoch: int | None = None,
     history_limit: int = 20,
     lease_ttl_seconds: float = 60.0,
+    idempotency_spec: IdempotencyKeySpec | None = None,
+    idempotency_retention_seconds: float | None = None,
     now: datetime | None = None,
 ) -> PreparedGeneration:
-    """Short Tx 1: acquire/reclaim conversation lease, load succeeded history, persist turn."""
+    """Short Tx 1: claim/reclaim lease, link idempotency placeholder, and persist user turn."""
     if lease_ttl_seconds <= 0:
         raise ValueError("lease_ttl_seconds must be positive")
     lease_token = f"genlease_{uuid4().hex}"
+    retention_seconds = (
+        idempotency_retention_seconds
+        if idempotency_retention_seconds is not None
+        else (
+            idempotency_spec.retention_seconds
+            if idempotency_spec is not None
+            else idempotency.DEFAULT_IDEMPOTENCY_RETENTION_SECONDS
+        )
+    )
 
     try:
         async with session_factory.begin() as session:
@@ -336,13 +315,17 @@ async def prepare_generation_phase(
             lease_expires_at = current_time + timedelta(seconds=lease_ttl_seconds)
 
             await users_service.ensure_user_active_in_session(
-                session,
-                user_id=owner_id,
-                for_share=True,
+                session, user_id=owner_id, for_share=True
             )
 
             created_conversation = conversation_id is None
             if conversation_id is None:
+                await _ensure_idempotency_slot_available_in_session(
+                    session,
+                    owner_id=owner_id,
+                    idempotency_spec=idempotency_spec,
+                    current_time=current_time,
+                )
                 conversation = await repository.create_conversation(
                     session,
                     owner_id=owner_id,
@@ -352,11 +335,18 @@ async def prepare_generation_phase(
                 )
                 prior_messages: list[PromptHistoryMessage] = []
             else:
-                conversation = await _load_accessible_conversation_in_session(
+                conversation = await queries.load_accessible_conversation_in_session(
                     session,
                     owner_id=owner_id,
                     conversation_id=conversation_id,
                     lock_mode="update",
+                )
+                # Always resolve an already-claimed idempotency key before checking lease conflict.
+                await _ensure_idempotency_slot_available_in_session(
+                    session,
+                    owner_id=owner_id,
+                    idempotency_spec=idempotency_spec,
+                    current_time=current_time,
                 )
                 if conversation.agent_id != agent_id:
                     raise ConflictError(
@@ -372,9 +362,7 @@ async def prepare_generation_phase(
                     )
 
                 active_generation = await repository.get_running_generation_for_conversation(
-                    session,
-                    conversation_id=conversation.id,
-                    for_update=True,
+                    session, conversation_id=conversation.id, for_update=True
                 )
                 if active_generation is not None:
                     if (
@@ -397,6 +385,7 @@ async def prepare_generation_phase(
                         error_message="generation lease expired and was reclaimed",
                         current_time=current_time,
                         expired_only=True,
+                        idempotency_retention_seconds=retention_seconds,
                     )
                     if reclaimed is None:
                         raise _generation_conflict_error(
@@ -405,15 +394,10 @@ async def prepare_generation_phase(
                         )
 
                 history_rows = await repository.list_succeeded_history_messages(
-                    session,
-                    conversation_id=conversation.id,
-                    limit=history_limit,
+                    session, conversation_id=conversation.id, limit=history_limit
                 )
                 prior_messages = [
-                    PromptHistoryMessage(
-                        role=cast(HistoryRole, row.role),
-                        content=row.content,
-                    )
+                    PromptHistoryMessage(role=cast(HistoryRole, row.role), content=row.content)
                     for row in history_rows
                 ]
 
@@ -421,9 +405,7 @@ async def prepare_generation_phase(
                 resolved_memory_epoch = memory_epoch
             elif memory_provider_id is not None:
                 resolved_memory_epoch = await memories_service.get_memory_epoch_in_session(
-                    session,
-                    user_id=owner_id,
-                    provider_id=memory_provider_id,
+                    session, user_id=owner_id, provider_id=memory_provider_id
                 )
             else:
                 resolved_memory_epoch = 0
@@ -441,8 +423,7 @@ async def prepare_generation_phase(
                 started_at=current_time,
             )
             user_sequence = await repository.allocate_message_sequence(
-                session,
-                conversation=conversation,
+                session, conversation=conversation
             )
             user_message = await repository.create_message(
                 session,
@@ -453,10 +434,16 @@ async def prepare_generation_phase(
                 sequence=user_sequence,
             )
             await repository.link_generation_user_message(
-                session,
-                generation=generation,
-                user_message_id=user_message.id,
+                session, generation=generation, user_message_id=user_message.id
             )
+            if idempotency_spec is not None:
+                await idempotency.create_placeholder_in_session(
+                    session,
+                    user_id=owner_id,
+                    spec=idempotency_spec,
+                    conversation_id=conversation.id,
+                    generation_id=generation.id,
+                )
 
             prepared = PreparedGeneration(
                 conversation_id=conversation.id,
@@ -476,6 +463,10 @@ async def prepare_generation_phase(
                 history_messages=tuple(prior_messages),
             )
     except IntegrityError as exc:
+        if idempotency_spec is not None and is_unique_violation(
+            exc, constraint_name=IDEMPOTENCY_SCOPE_UNIQUE_CONSTRAINT
+        ):
+            raise IdempotencyScopeRaceError() from exc
         if is_unique_violation(exc, constraint_name=GENERATION_ACTIVE_CONVERSATION_UNIQUE_INDEX):
             raise _generation_conflict_error(conversation_id=conversation_id) from exc
         raise
@@ -500,7 +491,7 @@ async def renew_generation_lease_phase(
     async with session_factory.begin() as session:
         current_time = await _resolve_current_time(session, now)
         await users_service.ensure_user_active_in_session(session, user_id=owner_id, for_share=True)
-        await _load_accessible_conversation_in_session(
+        await queries.load_accessible_conversation_in_session(
             session, owner_id=owner_id, conversation_id=conversation_id, lock_mode="share"
         )
         new_expires_at = current_time + timedelta(seconds=lease_ttl_seconds)
@@ -529,16 +520,17 @@ async def commit_generation_success_phase(
     usage: ModelUsage,
     finish_reason: str | None = None,
     before_commit_hook: BeforeCommitHook | None = None,
+    idempotency_retention_seconds: float = idempotency.DEFAULT_IDEMPOTENCY_RETENTION_SECONDS,
     now: datetime | None = None,
 ) -> CommittedChatResult:
-    """Short Tx 2: atomically commit complete assistant message, succeeded status, and hooks."""
+    """Short Tx 2: atomically commit reply, succeeded status, idempotency result, and hooks."""
     try:
         async with session_factory.begin() as session:
             completed_at = await _resolve_current_time(session, now)
             await users_service.ensure_user_active_in_session(
                 session, user_id=prepared.owner_id, for_share=True
             )
-            conversation = await _load_accessible_conversation_in_session(
+            conversation = await queries.load_accessible_conversation_in_session(
                 session,
                 owner_id=prepared.owner_id,
                 conversation_id=prepared.conversation_id,
@@ -546,8 +538,7 @@ async def commit_generation_success_phase(
             )
 
             assistant_sequence = await repository.allocate_message_sequence(
-                session,
-                conversation=conversation,
+                session, conversation=conversation
             )
             assistant_message = await repository.create_message(
                 session,
@@ -574,6 +565,12 @@ async def commit_generation_success_phase(
                     message="generation is no longer active or lease was lost",
                 )
 
+            await idempotency.finalize_succeeded_in_session(
+                session,
+                generation_id=prepared.generation_id,
+                terminal_at=completed_at,
+                retention_seconds=idempotency_retention_seconds,
+            )
             generation_record = GenerationRecord.model_validate(updated_generation)
             assistant_record = MessageRecord.model_validate(assistant_message)
 
@@ -607,6 +604,8 @@ async def converge_generation_failure_phase(
     error_code: str,
     error_message: str,
     target_status: Literal["failed", "cancelled"] = "failed",
+    error_status_code: int | None = None,
+    idempotency_retention_seconds: float = idempotency.DEFAULT_IDEMPOTENCY_RETENTION_SECONDS,
     now: datetime | None = None,
 ) -> GenerationRecord | None:
     """Short Tx: conditionally converge a `running` generation to `failed` or `cancelled`."""
@@ -623,6 +622,8 @@ async def converge_generation_failure_phase(
             error_message=error_message,
             current_time=current_time,
             expired_only=False,
+            error_status_code=error_status_code,
+            idempotency_retention_seconds=idempotency_retention_seconds,
         )
 
 
@@ -630,6 +631,7 @@ async def recover_expired_generations_phase(
     session_factory: async_sessionmaker[AsyncSession],
     *,
     batch_size: int = 50,
+    idempotency_retention_seconds: float = idempotency.DEFAULT_IDEMPOTENCY_RETENTION_SECONDS,
     now: datetime | None = None,
 ) -> list[GenerationRecord]:
     """Short Tx: fallback recovery converging expired `running` generations via shared entry."""
@@ -640,9 +642,7 @@ async def recover_expired_generations_phase(
     async with session_factory.begin() as session:
         current_time = await _resolve_current_time(session, now)
         expired_rows = await repository.list_expired_running_generations_for_update(
-            session,
-            current_time=current_time,
-            limit=batch_size,
+            session, current_time=current_time, limit=batch_size
         )
         for row in expired_rows:
             converged = await converge_generation_failure_in_session(
@@ -656,49 +656,11 @@ async def recover_expired_generations_phase(
                 error_message="generation lease expired before completion",
                 current_time=current_time,
                 expired_only=True,
+                idempotency_retention_seconds=idempotency_retention_seconds,
             )
             if converged is not None:
                 recovered.append(converged)
     return recovered
-
-
-async def get_generation_for_owner(
-    session_factory: async_sessionmaker[AsyncSession],
-    *,
-    owner_id: UUID,
-    conversation_id: UUID,
-    generation_id: UUID,
-) -> GenerationRecord:
-    """Read a single owned generation record (used by recovery/query flows and tests)."""
-    async with session_factory() as session:
-        await users_service.ensure_user_active_in_session(session, user_id=owner_id)
-        await _load_readable_conversation_in_session(
-            session, owner_id=owner_id, conversation_id=conversation_id
-        )
-        generation = await repository.get_generation_for_owner(
-            session, owner_id=owner_id, conversation_id=conversation_id, generation_id=generation_id
-        )
-        if generation is None:
-            raise NotFoundError(code="generation_not_found", message="generation not found")
-        return GenerationRecord.model_validate(generation)
-
-
-async def list_conversation_messages_for_owner(
-    session_factory: async_sessionmaker[AsyncSession],
-    *,
-    owner_id: UUID,
-    conversation_id: UUID,
-) -> list[MessageRecord]:
-    """Read all committed messages for an owned active conversation ordered ascending."""
-    async with session_factory() as session:
-        await users_service.ensure_user_active_in_session(session, user_id=owner_id)
-        await _load_readable_conversation_in_session(
-            session, owner_id=owner_id, conversation_id=conversation_id
-        )
-        rows = await repository.list_all_messages_for_conversation(
-            session, conversation_id=conversation_id
-        )
-        return [MessageRecord.model_validate(row) for row in rows]
 
 
 async def persist_recalled_memories_phase(
@@ -716,7 +678,7 @@ async def persist_recalled_memories_phase(
             await users_service.ensure_user_active_in_session(
                 session, user_id=prepared.owner_id, for_share=True
             )
-            await _load_accessible_conversation_in_session(
+            await queries.load_accessible_conversation_in_session(
                 session,
                 owner_id=prepared.owner_id,
                 conversation_id=prepared.conversation_id,
@@ -767,27 +729,3 @@ async def persist_recalled_memories_phase(
                 message="recalled memory reference already recorded for this message",
             ) from exc
         raise
-
-
-async def list_recalled_memories_for_message_for_owner(
-    session_factory: async_sessionmaker[AsyncSession],
-    *,
-    owner_id: UUID,
-    conversation_id: UUID,
-    user_message_id: UUID,
-) -> list[RecalledMemoryReferenceRecord]:
-    """Read ordered metadata-only recalled memory references for an owned user message."""
-    async with session_factory() as session:
-        await users_service.ensure_user_active_in_session(session, user_id=owner_id)
-        await _load_readable_conversation_in_session(
-            session, owner_id=owner_id, conversation_id=conversation_id
-        )
-        user_message = await repository.get_message_for_conversation(
-            session, conversation_id=conversation_id, message_id=user_message_id, role="user"
-        )
-        if user_message is None:
-            raise NotFoundError(code="message_not_found", message="message not found")
-        rows = await repository.list_recalled_memories_for_user_message(
-            session, user_message_id=user_message.id
-        )
-        return [RecalledMemoryReferenceRecord.model_validate(row) for row in rows]

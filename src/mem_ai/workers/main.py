@@ -15,7 +15,8 @@ from mem_ai.core.logging import configure_logging
 from mem_ai.db.engine import create_async_engine_from_settings, create_session_factory
 from mem_ai.integrations.http import create_http_client
 from mem_ai.modules.conversations import generation as conversations_generation
-from mem_ai.modules.conversations.service import DatabaseTurnContentLoader
+from mem_ai.modules.conversations.queries import DatabaseTurnContentLoader
+from mem_ai.modules.conversations.schemas import DEFAULT_IDEMPOTENCY_RETENTION_SECONDS
 from mem_ai.modules.jobs.schemas import JobExecutionContext, JobHandlerOutcome
 from mem_ai.modules.memories.adapters.memos import MemOSMemoryProvider
 from mem_ai.modules.memories.jobs import (
@@ -45,9 +46,11 @@ class GenerationLeaseRecoveryJobHandler:
         *,
         session_factory: async_sessionmaker[AsyncSession],
         batch_size: int = 50,
+        idempotency_retention_seconds: float = DEFAULT_IDEMPOTENCY_RETENTION_SECONDS,
     ) -> None:
         self._session_factory = session_factory
         self._batch_size = batch_size
+        self._idempotency_retention_seconds = idempotency_retention_seconds
 
     async def handle(self, ctx: JobExecutionContext) -> JobHandlerOutcome:
         """Converge expired generation leases using `recover_expired_generations_phase`."""
@@ -55,6 +58,7 @@ class GenerationLeaseRecoveryJobHandler:
         recovered = await conversations_generation.recover_expired_generations_phase(
             self._session_factory,
             batch_size=self._batch_size,
+            idempotency_retention_seconds=self._idempotency_retention_seconds,
         )
         return JobHandlerOutcome(
             outcome="succeeded",
@@ -66,12 +70,16 @@ def build_worker_registry(
     session_factory: async_sessionmaker[AsyncSession],
     *,
     memory_provider: MemoryProvider | None = None,
+    idempotency_retention_seconds: float = DEFAULT_IDEMPOTENCY_RETENTION_SECONDS,
 ) -> JobHandlerRegistry:
     """Assemble typed Worker job handlers with unidirectional module dependencies."""
     registry = JobHandlerRegistry()
     registry.register(
         JOB_TYPE_GENERATION_LEASE_RECOVERY,
-        GenerationLeaseRecoveryJobHandler(session_factory=session_factory),
+        GenerationLeaseRecoveryJobHandler(
+            session_factory=session_factory,
+            idempotency_retention_seconds=idempotency_retention_seconds,
+        ),
     )
 
     if memory_provider is not None:
@@ -143,6 +151,7 @@ async def run_worker(
     registry = build_worker_registry(
         session_factory,
         memory_provider=resolved_memory_provider,
+        idempotency_retention_seconds=float(resolved_settings.idempotency_retention_hours * 3600),
     )
     worker_config = (
         config_override

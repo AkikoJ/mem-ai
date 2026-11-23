@@ -43,8 +43,9 @@ from mem_ai.modules.agents import service as agents_service
 from mem_ai.modules.agents.schemas import AgentCreateRequest
 from mem_ai.modules.conversations import generation as generation_store
 from mem_ai.modules.conversations import service as conversations_service
+from mem_ai.modules.conversations.queries import DatabaseTurnContentLoader
 from mem_ai.modules.conversations.schemas import GenerationRecord, MessageRecord
-from mem_ai.modules.conversations.service import DatabaseTurnContentLoader, SyncChatOptions
+from mem_ai.modules.conversations.service import SyncChatOptions
 from mem_ai.modules.jobs import service as jobs_service
 from mem_ai.modules.jobs.schemas import (
     JobBackoffPolicy,

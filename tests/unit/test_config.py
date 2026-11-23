@@ -373,6 +373,7 @@ def test_worker_and_job_retention_settings_validation() -> None:
     assert defaults.worker_reconcile_delay_seconds == 10.0
     assert defaults.worker_shutdown_grace_seconds == 15.0
     assert defaults.job_attempt_retention_days == 30
+    assert defaults.idempotency_retention_hours == 24
 
     with pytest.raises(ValidationError, match="worker_lease_renew_interval_seconds"):
         Settings(
@@ -392,3 +393,6 @@ def test_worker_and_job_retention_settings_validation() -> None:
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None, app_env="test", job_attempt_retention_days=0)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, app_env="test", idempotency_retention_hours=0)
