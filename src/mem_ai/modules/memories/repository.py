@@ -351,3 +351,45 @@ async def load_active_tombstones(
         conv_tombstoned = (await session.execute(conv_stmt)).scalar_one_or_none() is not None
 
     return memory_ids, conv_tombstoned
+
+
+async def list_provider_ids(session: AsyncSession, *, user_id: UUID) -> list[str]:
+    """Find persisted provider scopes, including providers unavailable in the current process."""
+    return list(
+        await session.scalars(
+            select(MemoryScopeState.provider_id).where(MemoryScopeState.user_id == user_id)
+        )
+    )
+
+
+async def list_conversation_tombstones(
+    session: AsyncSession, *, user_id: UUID, conversation_id: UUID
+) -> Sequence[MemoryTombstone]:
+    """Read retained range barriers for one immutable conversation ID."""
+    return (
+        await session.scalars(
+            select(MemoryTombstone)
+            .where(
+                MemoryTombstone.user_id == user_id,
+                MemoryTombstone.target_kind == "conversation",
+                MemoryTombstone.conversation_id == conversation_id,
+            )
+            .order_by(MemoryTombstone.provider_id)
+        )
+    ).all()
+
+
+async def load_tombstoned_conversation_ids(
+    session: AsyncSession, *, user_id: UUID, provider_id: str
+) -> frozenset[UUID]:
+    """Keep deleted ranges isolated even in unfiltered lists after local root removal."""
+    return frozenset(
+        await session.scalars(
+            select(MemoryTombstone.conversation_id).where(
+                MemoryTombstone.user_id == user_id,
+                MemoryTombstone.provider_id == provider_id,
+                MemoryTombstone.target_kind == "conversation",
+                MemoryTombstone.conversation_id.is_not(None),
+            )
+        )
+    )

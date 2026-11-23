@@ -452,3 +452,33 @@ class GenerationResponse(BaseModel):
             created_at=gen.created_at,
             updated_at=gen.updated_at,
         )
+
+
+class ConversationResponse(BaseModel):
+    """Owned conversation summary/detail, with the latest persisted generation status."""
+
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
+
+    conversation_id: UUID = Field(alias="conversationId")
+    agent_id: UUID = Field(alias="agentId")
+    persona_version_id: UUID = Field(alias="personaVersionId")
+    persona_version_number: int = Field(alias="personaVersionNumber")
+    status: ConversationStatus
+    generation: GenerationResponse | None = None
+    created_at: datetime = Field(alias="createdAt")
+    updated_at: datetime = Field(alias="updatedAt")
+
+
+class HistoryMessageResponse(BaseModel):
+    """An actual committed message plus its turn status; failed turns have no invented reply."""
+
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
+
+    message_id: UUID = Field(alias="messageId")
+    generation_id: UUID = Field(alias="generationId")
+    role: MessageRole
+    content: str
+    sequence: int
+    generation_status: GenerationStatus = Field(alias="generationStatus")
+    error: GenerationErrorResponse | None = None
+    created_at: datetime = Field(alias="createdAt")

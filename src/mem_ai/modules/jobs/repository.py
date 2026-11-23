@@ -179,6 +179,9 @@ async def list_jobs_for_user_and_types(
     job_types: Sequence[str],
     statuses: Sequence[str],
     for_update: bool = False,
+    metadata_match: dict[str, Any] | None = None,
+    limit: int | None = None,
+    skip_locked: bool = False,
 ) -> list[Job]:
     """List user jobs matching `job_types` and `statuses`, optionally locking rows."""
     if not job_types or not statuses:
@@ -192,8 +195,12 @@ async def list_jobs_for_user_and_types(
         )
         .order_by(Job.created_at.asc(), Job.id.asc())
     )
+    if metadata_match:
+        stmt = stmt.where(Job.metadata_json.contains(metadata_match))
+    if limit is not None:
+        stmt = stmt.limit(limit)
     if for_update:
-        stmt = stmt.with_for_update()
+        stmt = stmt.with_for_update(skip_locked=skip_locked)
     return list((await session.execute(stmt)).scalars().all())
 
 

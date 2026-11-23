@@ -80,6 +80,8 @@ class ExplicitMemoryJobMetadata(BaseModel):
 
     write_id: str | None = None
     provider_id: str
+    scope: MemoryScope = "user"
+    conversation_id: UUID | None = None
     memory_epoch: int = 0
     operation_id: UUID | None = None
     dispatch_state: TurnMemoryDispatchState = "pending"
@@ -638,9 +640,11 @@ class ExplicitMemoryReconcileJobHandler:
         *,
         session_factory: async_sessionmaker[AsyncSession],
         memory_provider: MemoryProvider,
+        turn_loader: TurnContentLoader | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._memory_provider = memory_provider
+        self._turn_loader = turn_loader
 
     async def handle(self, ctx: JobExecutionContext) -> JobHandlerOutcome:
         """Verify an async or uncertain explicit memory write with atomic operation transition."""
@@ -732,6 +736,9 @@ class ExplicitMemoryReconcileJobHandler:
                     external_ref=resolved_ext_ref,
                     memory_id=memory_id,
                     phase="verified",
+                    scope=meta.scope,
+                    conversation_id=meta.conversation_id,
+                    turn_loader=self._turn_loader,
                     before_commit=_commit_op_succeeded if op_id is not None else None,
                 )
 

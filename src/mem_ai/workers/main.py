@@ -16,6 +16,10 @@ from mem_ai.core.logging import configure_logging
 from mem_ai.db.engine import create_async_engine_from_settings, create_session_factory
 from mem_ai.integrations.http import create_http_client
 from mem_ai.modules.conversations import generation as conversations_generation
+from mem_ai.modules.conversations.cleanup import (
+    JOB_TYPE_CONVERSATION_DELETE,
+    ConversationCleanupJobHandler,
+)
 from mem_ai.modules.conversations.queries import (
     DatabaseRecalledMemoryReferenceMarker,
     DatabaseTurnContentLoader,
@@ -87,9 +91,19 @@ def build_worker_registry(
     memory_clear_compensation_delay_seconds: float = 30.0,
     audit_archiver: DeletionAuditArchiver | None = None,
     clock: Callable[[], datetime] | None = None,
+    conversation_cleanup_batch_size: int = 50,
 ) -> JobHandlerRegistry:
     """Assemble typed Worker job handlers with unidirectional module dependencies."""
     registry = JobHandlerRegistry()
+    registry.register(
+        JOB_TYPE_CONVERSATION_DELETE,
+        ConversationCleanupJobHandler(
+            session_factory=session_factory,
+            memory_provider=memory_provider,
+            batch_size=conversation_cleanup_batch_size,
+            audit_archiver=audit_archiver,
+        ),
+    )
     registry.register(
         JOB_TYPE_GENERATION_LEASE_RECOVERY,
         GenerationLeaseRecoveryJobHandler(
@@ -114,6 +128,7 @@ def build_worker_registry(
             ExplicitMemoryReconcileJobHandler(
                 session_factory=session_factory,
                 memory_provider=memory_provider,
+                turn_loader=turn_loader,
             ),
         )
         registry.register(

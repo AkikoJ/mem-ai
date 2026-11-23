@@ -76,6 +76,22 @@ async def get_operation_by_id(
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
+async def find_operation_for_target(
+    session: AsyncSession, *, owner_id: UUID, operation_type: str, target_id: str
+) -> Operation | None:
+    """Find the latest owner-bound operation for an immutable business target."""
+    return await session.scalar(
+        select(Operation)
+        .where(
+            Operation.owner_id == owner_id,
+            Operation.operation_type == operation_type,
+            Operation.target_id == target_id,
+        )
+        .order_by(Operation.created_at.desc(), Operation.id.desc())
+        .limit(1)
+    )
+
+
 async def attach_job_id(
     session: AsyncSession,
     *,

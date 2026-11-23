@@ -612,6 +612,8 @@ async def list_user_jobs_in_session(
     job_types: Sequence[str],
     statuses: Sequence[str],
     for_update: bool = False,
+    metadata_match: dict[str, Any] | None = None,
+    limit: int | None = None,
 ) -> list[JobRecord]:
     """List user jobs matching `job_types` and `statuses` inside the caller's transaction."""
     rows = await repository.list_jobs_for_user_and_types(
@@ -620,6 +622,8 @@ async def list_user_jobs_in_session(
         job_types=job_types,
         statuses=statuses,
         for_update=for_update,
+        metadata_match=metadata_match,
+        limit=limit,
     )
     return [JobRecord.model_validate(row) for row in rows]
 
@@ -635,6 +639,9 @@ async def cancel_matching_jobs_in_session(
     error_summary: str,
     metadata_patch: dict[str, Any] | None = None,
     now: datetime | None = None,
+    metadata_match: dict[str, Any] | None = None,
+    limit: int | None = None,
+    skip_locked: bool = False,
 ) -> list[JobRecord]:
     """Atomically cancel user jobs in `allowed_statuses` matching `predicate` in caller's Tx."""
     current_time = await _resolve_current_time(session, now)
@@ -645,6 +652,9 @@ async def cancel_matching_jobs_in_session(
         job_types=job_types,
         statuses=allowed_statuses,
         for_update=True,
+        metadata_match=metadata_match,
+        limit=limit,
+        skip_locked=skip_locked,
     )
     cancelled: list[JobRecord] = []
     for row in rows:

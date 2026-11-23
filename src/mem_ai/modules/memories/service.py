@@ -65,6 +65,18 @@ from mem_ai.modules.memories.barrier import (
     map_memory_provider_error as map_memory_provider_error,
 )
 from mem_ai.modules.memories.clearing import clear_user_memories as clear_user_memories
+from mem_ai.modules.memories.conversation_cleanup import (
+    begin_conversation_cleanup_in_session as begin_conversation_cleanup_in_session,
+)
+from mem_ai.modules.memories.conversation_cleanup import (
+    clean_conversation_memory_batch as clean_conversation_memory_batch,
+)
+from mem_ai.modules.memories.conversation_cleanup import (
+    finish_conversation_cleanup_in_session as finish_conversation_cleanup_in_session,
+)
+from mem_ai.modules.memories.conversation_cleanup import (
+    settle_conversation_writes_in_session as settle_conversation_writes_in_session,
+)
 from mem_ai.modules.memories.deletions import delete_single_memory as delete_single_memory
 from mem_ai.modules.memories.jobs import (
     JOB_TYPE_MEMORY_EXPLICIT_CREATE as JOB_TYPE_MEMORY_EXPLICIT_CREATE,
@@ -135,6 +147,12 @@ class ConversationAccessChecker(Protocol):
         """Raise 404 if conversation does not exist/not owned, or 409 if deleting."""
         ...
 
+    async def ensure_conversation_accessible_in_session(
+        self, session: AsyncSession, *, owner_id: UUID, conversation_id: UUID
+    ) -> None:
+        """Validate ownership while holding a shared conversation lock."""
+        ...
+
 
 class DefaultConversationAccessChecker:
     """Default conversation ownership checker used before the `conversations` slice is wired."""
@@ -149,6 +167,13 @@ class DefaultConversationAccessChecker:
         raise NotFoundError(
             code="conversation_not_found",
             message="conversation not found",
+        )
+
+    async def ensure_conversation_accessible_in_session(
+        self, session: AsyncSession, *, owner_id: UUID, conversation_id: UUID
+    ) -> None:
+        await self.ensure_conversation_accessible(
+            owner_id=owner_id, conversation_id=conversation_id
         )
 
 
@@ -210,6 +235,9 @@ async def list_memories(
             provider_id=memory_provider.provider_id,
             conversation_id=conversation_id,
         )
+        tombstoned_conversations = await repository.load_tombstoned_conversation_ids(
+            session, user_id=user_id, provider_id=memory_provider.provider_id
+        )
 
     if conversation_id is not None:
         if scope == "user":
@@ -257,7 +285,9 @@ async def list_memories(
     visible_items = [
         item
         for item in owned_items
-        if item.memory_id not in tombstoned_ids and item.memory_epoch >= current_epoch
+        if item.memory_id not in tombstoned_ids
+        and item.memory_epoch >= current_epoch
+        and item.conversation_id not in tombstoned_conversations
     ]
     return MemoryListPage(
         items=visible_items,
@@ -290,7 +320,12 @@ async def create_explicit_memory(
 
     # Short Tx 1: serialize with clearing barrier on `memory_scopes` row lock and claim sync job.
     async with session_factory.begin() as session:
-        await users_service.ensure_user_active_in_session(session, user_id=user_id)
+        await users_service.ensure_user_active_in_session(session, user_id=user_id, for_share=True)
+        if resolved_conversation_id is not None:
+            checker = conversation_access_checker or DefaultConversationAccessChecker()
+            await checker.ensure_conversation_accessible_in_session(
+                session, owner_id=user_id, conversation_id=resolved_conversation_id
+            )
         scope_row = await repository.get_or_create_scope_for_update(
             session,
             user_id=user_id,
@@ -386,6 +421,7 @@ async def create_explicit_memory(
             write_id=write_id,
             resolved_scope=resolved_scope,
             resolved_conversation_id=resolved_conversation_id,
+            conversation_access_checker=conversation_access_checker,
             content=content,
             result=result,
         )
@@ -461,6 +497,7 @@ async def _commit_confirmed_write(
     write_id: str,
     resolved_scope: MemoryScope,
     resolved_conversation_id: UUID | None,
+    conversation_access_checker: ConversationAccessChecker | None,
     content: str,
     result: MemoryWriteResult,
 ) -> MemoryCreateOutcome:
@@ -469,10 +506,14 @@ async def _commit_confirmed_write(
     now = datetime.now(UTC)
     ext_ref = result.external_ref or write_id
     user_inactive_error: ForbiddenError | None = None
+    conversation_error: AppError | None = None
+    scope_error: ConflictError | None = None
 
     async with session_factory.begin() as session:
         try:
-            await users_service.ensure_user_active_in_session(session, user_id=user_id)
+            await users_service.ensure_user_active_in_session(
+                session, user_id=user_id, for_share=True
+            )
         except ForbiddenError as exc:
             # User became disabled/deleting mid-flight: preserve reconciling record for cleanup.
             await jobs_service.complete_job_in_session(
@@ -488,94 +529,124 @@ async def _commit_confirmed_write(
             )
             user_inactive_error = exc
         else:
-            scope_row = await repository.get_or_create_scope_for_update(
-                session,
-                user_id=user_id,
-                provider_id=provider_id,
-            )
-            if scope_row.barrier_state != "idle" or scope_row.epoch != captured_epoch:
-                if scope_row.barrier_state == "idle":
-                    await jobs_service.complete_job_in_session(
-                        session,
-                        job_id=job_id,
-                        lease_token=lease_token,
-                        status="reconciling",
-                        external_ref=ext_ref,
-                        error_code="memory_scope_cleared",
-                        error_summary="scope clear finished while explicit write was in flight",
-                        metadata_patch={
-                            "memory_id": result.memory_id,
-                            "dispatch_state": "confirmed_during_clear",
-                        },
-                        now=now,
+            if resolved_conversation_id is not None:
+                checker = conversation_access_checker or DefaultConversationAccessChecker()
+                try:
+                    await checker.ensure_conversation_accessible_in_session(
+                        session, owner_id=user_id, conversation_id=resolved_conversation_id
                     )
-                    raise ConflictError(
-                        code="memory_scope_clearing",
-                        message="memory scope was cleared while write was in flight",
-                    )
-
-                operation = await operations_service.create_operation_in_session(
-                    session,
-                    owner_id=user_id,
-                    operation_type=OPERATION_TYPE_MEMORY_EXPLICIT_CREATE,
-                    status="reconciling",
-                    target_type="memory",
-                    target_id=result.memory_id,
-                    job_id=job_id,
-                    progress={
-                        "phase": "reconciling",
-                        "provider_id": provider_id,
-                        "scope": resolved_scope,
-                        "memory_epoch": captured_epoch,
-                        "external_ref": ext_ref,
-                    },
-                    result_summary={"memory_id": result.memory_id},
-                    error_code="memory_scope_clearing",
-                    error_message="memory scope clearing started while write was in flight",
-                )
-                updated_job = await jobs_service.complete_job_in_session(
+                except (ConflictError, NotFoundError) as exc:
+                    conversation_error = exc
+            if conversation_error is not None:
+                await jobs_service.complete_job_in_session(
                     session,
                     job_id=job_id,
                     lease_token=lease_token,
                     status="reconciling",
                     external_ref=ext_ref,
-                    error_code="memory_scope_clearing",
-                    error_summary="clearing barrier started mid-flight; pending reconciliation",
+                    error_code=conversation_error.code,
+                    error_summary="conversation became inaccessible while write was in flight",
                     metadata_patch={
                         "memory_id": result.memory_id,
-                        "operation_id": str(operation.id),
                         "dispatch_state": "confirmed_during_clear",
                     },
                     now=now,
                 )
-                if updated_job is None:
-                    failed_op = await operations_service.transition_operation_in_session(
+            else:
+                scope_row = await repository.get_or_create_scope_for_update(
+                    session,
+                    user_id=user_id,
+                    provider_id=provider_id,
+                )
+                if scope_row.barrier_state != "idle" or scope_row.epoch != captured_epoch:
+                    if scope_row.barrier_state == "idle":
+                        await jobs_service.complete_job_in_session(
+                            session,
+                            job_id=job_id,
+                            lease_token=lease_token,
+                            status="reconciling",
+                            external_ref=ext_ref,
+                            error_code="memory_scope_cleared",
+                            error_summary="scope clear finished while explicit write was in flight",
+                            metadata_patch={
+                                "memory_id": result.memory_id,
+                                "dispatch_state": "confirmed_during_clear",
+                            },
+                            now=now,
+                        )
+                        scope_error = ConflictError(
+                            code="memory_scope_clearing",
+                            message="memory scope was cleared while write was in flight",
+                        )
+
+                    else:
+                        operation = await operations_service.create_operation_in_session(
+                            session,
+                            owner_id=user_id,
+                            operation_type=OPERATION_TYPE_MEMORY_EXPLICIT_CREATE,
+                            status="reconciling",
+                            target_type="memory",
+                            target_id=result.memory_id,
+                            job_id=job_id,
+                            progress={
+                                "phase": "reconciling",
+                                "provider_id": provider_id,
+                                "scope": resolved_scope,
+                                "memory_epoch": captured_epoch,
+                                "external_ref": ext_ref,
+                            },
+                            result_summary={"memory_id": result.memory_id},
+                            error_code="memory_scope_clearing",
+                            error_message="memory scope clearing started while write was in flight",
+                        )
+                        updated_job = await jobs_service.complete_job_in_session(
+                            session,
+                            job_id=job_id,
+                            lease_token=lease_token,
+                            status="reconciling",
+                            external_ref=ext_ref,
+                            error_code="memory_scope_clearing",
+                            error_summary=(
+                                "clearing barrier started mid-flight; pending reconciliation"
+                            ),
+                            metadata_patch={
+                                "memory_id": result.memory_id,
+                                "operation_id": str(operation.id),
+                                "dispatch_state": "confirmed_during_clear",
+                            },
+                            now=now,
+                        )
+                        if updated_job is None:
+                            failed_op = await operations_service.transition_operation_in_session(
+                                session,
+                                operation_id=operation.id,
+                                status="failed",
+                                progress={
+                                    "phase": "superseded_by_clear",
+                                    "provider_id": provider_id,
+                                },
+                                error_code="memory_scope_cleared",
+                                error_message="memory scope was cleared while write was in flight",
+                                now=now,
+                            )
+                            return AcceptedMemoryOutcome(operation=failed_op or operation)
+                        return AcceptedMemoryOutcome(operation=operation)
+                if scope_error is None:
+                    await jobs_service.complete_job_in_session(
                         session,
-                        operation_id=operation.id,
-                        status="failed",
-                        progress={
-                            "phase": "superseded_by_clear",
-                            "provider_id": provider_id,
-                        },
-                        error_code="memory_scope_cleared",
-                        error_message="memory scope was cleared while write was in flight",
+                        job_id=job_id,
+                        lease_token=lease_token,
+                        status="succeeded",
+                        external_ref=ext_ref,
+                        metadata_patch={"memory_id": result.memory_id},
                         now=now,
                     )
-                    return AcceptedMemoryOutcome(operation=failed_op or operation)
-                return AcceptedMemoryOutcome(operation=operation)
-
-            await jobs_service.complete_job_in_session(
-                session,
-                job_id=job_id,
-                lease_token=lease_token,
-                status="succeeded",
-                external_ref=ext_ref,
-                metadata_patch={"memory_id": result.memory_id},
-                now=now,
-            )
-
     if user_inactive_error is not None:
         raise user_inactive_error
+    if conversation_error is not None:
+        raise conversation_error
+    if scope_error is not None:
+        raise scope_error
 
     record = MemoryRecord(
         memory_id=result.memory_id,

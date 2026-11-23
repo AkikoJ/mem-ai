@@ -52,6 +52,13 @@ class _InMemoryConversationAccessChecker:
                 message="conversation not found",
             )
 
+    async def ensure_conversation_accessible_in_session(
+        self, session, *, owner_id: UUID, conversation_id: UUID
+    ) -> None:
+        await self.ensure_conversation_accessible(
+            owner_id=owner_id, conversation_id=conversation_id
+        )
+
 
 class _ScriptedMemoryProvider:
     """Scripted MemoryProvider for testing 202 accepted, reconciling, and failure paths."""

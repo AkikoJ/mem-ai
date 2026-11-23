@@ -109,6 +109,16 @@ async def get_operation_in_session(
     return OperationRecord.model_validate(row) if row is not None else None
 
 
+async def find_operation_for_target_in_session(
+    session: AsyncSession, *, owner_id: UUID, operation_type: str, target_id: str
+) -> OperationRecord | None:
+    """Recover an owner's effective operation after its business target was removed."""
+    row = await repository.find_operation_for_target(
+        session, owner_id=owner_id, operation_type=operation_type, target_id=target_id
+    )
+    return OperationRecord.model_validate(row) if row is not None else None
+
+
 async def attach_job_in_session(
     session: AsyncSession,
     *,

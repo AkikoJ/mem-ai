@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Path, Request, Response, status
+from fastapi import APIRouter, Depends, Path, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 
 from mem_ai.api.dependencies import (
@@ -15,9 +15,11 @@ from mem_ai.api.dependencies import (
     SessionFactoryDep,
     SettingsDep,
 )
+from mem_ai.api.pagination import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, PaginatedResponse
 from mem_ai.api.responses import ApiResponse, ok_response
 from mem_ai.core.exceptions import UnprocessableEntityError
 from mem_ai.modules.auth.dependencies import AuthContextDep
+from mem_ai.modules.conversations import cleanup as conversation_cleanup
 from mem_ai.modules.conversations import queries as conversation_queries
 from mem_ai.modules.conversations import service as conversations_service
 from mem_ai.modules.conversations import stream as conversations_stream
@@ -27,15 +29,43 @@ from mem_ai.modules.conversations.schemas import (
     ChatAcceptedResult,
     ChatRequest,
     ChatResponse,
+    ConversationResponse,
     GenerationResponse,
+    HistoryMessageResponse,
     PreparedGeneration,
 )
 from mem_ai.modules.conversations.service import chat_options_from_settings
+from mem_ai.modules.operations.schemas import OperationAcceptedResponse
 
 router = APIRouter(tags=["chat"])
 
 ConversationIdPath = Annotated[UUID, Path(alias="conversationId")]
 GenerationIdPath = Annotated[UUID, Path(alias="generationId")]
+
+
+@router.delete(
+    "/conversations/{conversationId}",
+    tags=["conversations"],
+    response_model=ApiResponse[OperationAcceptedResponse],
+    status_code=202,
+)
+async def delete_conversation(
+    conversation_id: ConversationIdPath,
+    auth: AuthContextDep,
+    session_factory: SessionFactoryDep,
+    memory_provider: OptionalMemoryProviderDep,
+    response: Response,
+) -> ApiResponse[OperationAcceptedResponse]:
+    """Hide an owned conversation immediately and return its durable cleanup operation."""
+    operation = await conversation_cleanup.delete_conversation_for_owner(
+        session_factory,
+        owner_id=auth.user_id,
+        conversation_id=conversation_id,
+        memory_provider=memory_provider,
+    )
+    response.headers["Location"] = operation.status_url
+    return ok_response(OperationAcceptedResponse.from_record(operation))
+
 
 _IDEMPOTENCY_OPENAPI_EXTRA: dict[str, object] = {
     "parameters": [
@@ -62,6 +92,63 @@ SyncTaskRegistryDep = Annotated[
     SyncGenerationTaskRegistry | None,
     Depends(get_sync_generation_task_registry),
 ]
+
+
+@router.get("/conversations", response_model=ApiResponse[PaginatedResponse[ConversationResponse]])
+async def list_conversations(
+    auth: AuthContextDep,
+    session_factory: SessionFactoryDep,
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_LIMIT)] = DEFAULT_PAGE_LIMIT,
+    cursor: Annotated[str | None, Query(min_length=1, max_length=2048)] = None,
+) -> ApiResponse[PaginatedResponse[ConversationResponse]]:
+    """List active conversations belonging to the authenticated user."""
+    return ok_response(
+        await conversation_queries.list_conversations_for_owner(
+            session_factory,
+            owner_id=auth.user_id,
+            limit=limit,
+            cursor=cursor,
+        )
+    )
+
+
+@router.get("/conversations/{conversationId}", response_model=ApiResponse[ConversationResponse])
+async def get_conversation(
+    conversation_id: ConversationIdPath,
+    auth: AuthContextDep,
+    session_factory: SessionFactoryDep,
+) -> ApiResponse[ConversationResponse]:
+    """Get an owned conversation and its latest turn status."""
+    return ok_response(
+        await conversation_queries.get_conversation_for_owner(
+            session_factory,
+            owner_id=auth.user_id,
+            conversation_id=conversation_id,
+        )
+    )
+
+
+@router.get(
+    "/conversations/{conversationId}/messages",
+    response_model=ApiResponse[PaginatedResponse[HistoryMessageResponse]],
+)
+async def list_messages(
+    conversation_id: ConversationIdPath,
+    auth: AuthContextDep,
+    session_factory: SessionFactoryDep,
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_LIMIT)] = DEFAULT_PAGE_LIMIT,
+    cursor: Annotated[str | None, Query(min_length=1, max_length=2048)] = None,
+) -> ApiResponse[PaginatedResponse[HistoryMessageResponse]]:
+    """Get a page of actual messages and the status of each message's generation."""
+    return ok_response(
+        await conversation_queries.page_messages_for_owner(
+            session_factory,
+            owner_id=auth.user_id,
+            conversation_id=conversation_id,
+            limit=limit,
+            cursor=cursor,
+        )
+    )
 
 
 @router.post(
