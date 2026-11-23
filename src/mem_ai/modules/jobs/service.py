@@ -504,6 +504,9 @@ async def record_job_outcome(
         if effective_hook is not None:
             await effective_hook(session, record)
 
+    if outcome.after_commit is not None:
+        await outcome.after_commit(record)
+
     if record.status == "reconciling":
         logger.warning(
             "Durable job entered reconciling state; external outcome requires verification",
@@ -600,6 +603,113 @@ async def requeue_failed_job(
         },
     )
     return record
+
+
+async def list_user_jobs_in_session(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    job_types: Sequence[str],
+    statuses: Sequence[str],
+    for_update: bool = False,
+) -> list[JobRecord]:
+    """List user jobs matching `job_types` and `statuses` inside the caller's transaction."""
+    rows = await repository.list_jobs_for_user_and_types(
+        session,
+        user_id=user_id,
+        job_types=job_types,
+        statuses=statuses,
+        for_update=for_update,
+    )
+    return [JobRecord.model_validate(row) for row in rows]
+
+
+async def cancel_matching_jobs_in_session(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    job_types: Sequence[str],
+    allowed_statuses: Sequence[JobStatus],
+    predicate: Callable[[JobRecord], bool],
+    error_code: str,
+    error_summary: str,
+    metadata_patch: dict[str, Any] | None = None,
+    now: datetime | None = None,
+) -> list[JobRecord]:
+    """Atomically cancel user jobs in `allowed_statuses` matching `predicate` in caller's Tx."""
+    current_time = await _resolve_current_time(session, now)
+    cleaned_summary = _sanitize_error_summary(error_summary)
+    rows = await repository.list_jobs_for_user_and_types(
+        session,
+        user_id=user_id,
+        job_types=job_types,
+        statuses=allowed_statuses,
+        for_update=True,
+    )
+    cancelled: list[JobRecord] = []
+    for row in rows:
+        record = JobRecord.model_validate(row)
+        if not predicate(record):
+            continue
+        merged_metadata = _merge_sanitized_metadata(row.metadata_json, metadata_patch)
+        updated = await repository.conditional_transition_job_by_status(
+            session,
+            job_id=row.id,
+            allowed_from_statuses=allowed_statuses,
+            new_status="cancelled",
+            current_time=current_time,
+            finished_at=current_time,
+            next_run_at=None,
+            last_error_code=error_code,
+            last_error_summary=cleaned_summary,
+            metadata_json=merged_metadata,
+            clear_lease=True,
+        )
+        if updated is not None:
+            cancelled.append(JobRecord.model_validate(updated))
+    return cancelled
+
+
+async def update_reconciling_job_in_session(
+    session: AsyncSession,
+    *,
+    job_id: UUID,
+    allowed_statuses: Sequence[JobStatus] = ("reconciling", "running"),
+    error_code: str | None = None,
+    error_summary: str | None = None,
+    metadata_patch: dict[str, Any] | None = None,
+    defer_next_run_seconds: float | None = None,
+    now: datetime | None = None,
+) -> JobRecord | None:
+    """Update metadata/deferral on an existing reconciling/expired job in caller's Tx."""
+    current_time = await _resolve_current_time(session, now)
+    existing = await repository.get_job_by_id(session, job_id=job_id, for_update=True)
+    if existing is None or existing.status not in allowed_statuses:
+        return None
+    merged_metadata = _merge_sanitized_metadata(existing.metadata_json, metadata_patch)
+    next_run = (
+        current_time + timedelta(seconds=defer_next_run_seconds)
+        if defer_next_run_seconds is not None
+        else None
+    )
+    updated = await repository.conditional_transition_job_by_status(
+        session,
+        job_id=job_id,
+        allowed_from_statuses=allowed_statuses,
+        new_status="reconciling",
+        current_time=current_time,
+        finished_at=None,
+        next_run_at=next_run,
+        last_error_code=error_code if error_code is not None else existing.last_error_code,
+        last_error_summary=(
+            _sanitize_error_summary(error_summary)
+            if error_summary is not None
+            else existing.last_error_summary
+        ),
+        metadata_json=merged_metadata,
+        clear_lease=True,
+    )
+    return JobRecord.model_validate(updated) if updated is not None else None
 
 
 async def get_job(

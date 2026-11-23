@@ -27,11 +27,15 @@ from mem_ai.modules.auth.adapters import (
     build_credential_verifier,
 )
 from mem_ai.modules.conversations.execution import SyncGenerationTaskRegistry
-from mem_ai.modules.conversations.queries import DatabaseConversationAccessChecker
+from mem_ai.modules.conversations.queries import (
+    DatabaseConversationAccessChecker,
+    DatabaseRecalledMemoryReferenceMarker,
+)
 from mem_ai.modules.memories.adapters.memos import MemOSMemoryProvider
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.adapters.openai_compatible import OpenAICompatibleModelProvider
 from mem_ai.modules.models.schemas import ModelConfigSeed
+from mem_ai.modules.operations.audit import build_deletion_audit_archiver
 from mem_ai.modules.personas.provider import LocalPersonaProvider
 
 _OFFLINE_DOCS_STATIC_DIR = Path(fastapi_offline.__file__).resolve().parent / "static"
@@ -104,6 +108,10 @@ def create_app(
         app.state.sync_generation_tasks = sync_task_registry
         app.state.conversation_access_checker = DatabaseConversationAccessChecker(
             session_factory=session_factory
+        )
+        app.state.recalled_memory_marker = DatabaseRecalledMemoryReferenceMarker()
+        app.state.deletion_audit_archiver = build_deletion_audit_archiver(
+            resolved_settings.deletion_audit_archive_path
         )
 
         model_seeds = [

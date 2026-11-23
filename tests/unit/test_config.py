@@ -433,3 +433,30 @@ def test_chat_stream_timeout_and_heartbeat_settings_validation() -> None:
             chat_stream_timeout_seconds=10.0,
             chat_stream_heartbeat_interval_seconds=15.0,
         )
+
+
+def test_memory_deletion_barrier_and_audit_archive_settings_validation() -> None:
+    defaults = Settings(_env_file=None, app_env="test")
+    assert defaults.memory_inflight_settle_timeout == 60.0
+    assert defaults.memory_clear_compensation_delay_seconds == 30.0
+    assert defaults.deletion_audit_archive_path is None
+
+    configured = Settings(
+        _env_file=None,
+        app_env="test",
+        memory_inflight_settle_timeout=15.0,
+        memory_clear_compensation_delay_seconds=5.0,
+        deletion_audit_archive_path="/tmp/mem-ai-audit.jsonl",
+    )
+    assert configured.memory_inflight_settle_timeout == 15.0
+    assert configured.memory_clear_compensation_delay_seconds == 5.0
+    assert configured.deletion_audit_archive_path == "/tmp/mem-ai-audit.jsonl"
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, app_env="test", memory_inflight_settle_timeout=0.0)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, app_env="test", memory_clear_compensation_delay_seconds=0.0)
+
+    with pytest.raises(ValidationError, match="deletion_audit_archive_path"):
+        Settings(_env_file=None, app_env="test", deletion_audit_archive_path="   ")

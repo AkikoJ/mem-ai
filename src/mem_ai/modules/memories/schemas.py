@@ -83,3 +83,47 @@ class AcceptedMemoryOutcome(BaseModel):
 
 
 MemoryCreateOutcome = CreatedMemoryOutcome | AcceptedMemoryOutcome
+
+MemoryTombstoneStatus = Literal["pending", "reconciling", "verified"]
+MemoryTombstoneTargetKind = Literal["memory", "conversation", "user"]
+
+
+class MemoryTombstoneRecord(BaseModel):
+    """Immutable DTO representing a persisted `memory_tombstones` row."""
+
+    model_config = ConfigDict(frozen=True, from_attributes=True)
+
+    id: UUID
+    user_id: UUID
+    provider_id: str
+    target_kind: MemoryTombstoneTargetKind
+    memory_id: str | None = None
+    conversation_id: UUID | None = None
+    memory_epoch: int
+    operation_id: UUID | None = None
+    status: MemoryTombstoneStatus
+    external_ref: str | None = None
+    verified_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class CompletedMemoryDeletionOutcome(BaseModel):
+    """Confirmed 204 No Content outcome for a single-memory delete or user clear."""
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["completed"] = "completed"
+    operation: OperationRecord | None = None
+
+
+class AcceptedMemoryDeletionOutcome(BaseModel):
+    """Asynchronous or reconciling 202 Accepted outcome carrying the queryable operation."""
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["accepted"] = "accepted"
+    operation: OperationRecord
+
+
+MemoryDeletionOutcome = CompletedMemoryDeletionOutcome | AcceptedMemoryDeletionOutcome

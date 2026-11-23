@@ -151,6 +151,7 @@ class JobExecutionContext(BaseModel):
 
 
 JobBeforeCommitHook = Callable[[AsyncSession, JobRecord], Awaitable[None]]
+JobAfterCommitHook = Callable[[JobRecord], Awaitable[None]]
 
 
 class JobHandlerOutcome(BaseModel):
@@ -166,6 +167,7 @@ class JobHandlerOutcome(BaseModel):
     metadata_patch: dict[str, Any] = Field(default_factory=dict)
     retry_after_seconds: float | None = Field(default=None, ge=0.0)
     before_commit: JobBeforeCommitHook | None = Field(default=None, exclude=True)
+    after_commit: JobAfterCommitHook | None = Field(default=None, exclude=True)
 
 
 class ResolvedJobTransition(BaseModel):

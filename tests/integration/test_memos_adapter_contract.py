@@ -7,7 +7,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from io import StringIO
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -760,5 +760,143 @@ async def test_memos_recall_filters_by_tags_info_scope_user_and_redacts_logs(
         assert secret_query not in all_logs
     finally:
         logger.removeHandler(log_handler)
+        await client.aclose()
+        await engine.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
+async def test_memos_delete_clear_ownership_guard_and_verification_contract(
+    migrated_pg_settings: Settings,
+) -> None:
+    engine = create_async_engine_from_settings(migrated_pg_settings)
+    session_factory = create_session_factory(engine)
+    alice_id = uuid4()
+    bob_id = uuid4()
+    store: dict[str, tuple[UUID, str]] = {
+        "mem_alice_1": (alice_id, "Alice memory"),
+        "mem_bob_1": (bob_id, "Bob secret"),
+    }
+    delete_calls: list[dict[str, Any]] = []
+    mode = {"get_behavior": "ok", "delete_behavior": "ok", "clear_behavior": "ok"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if request.url.path.endswith("/get/memory"):
+            if mode["get_behavior"] == "timeout":
+                raise httpx.ReadTimeout("get timeout", request=request)
+            uid = body["user_id"]
+            page = int(body.get("page", 1))
+            if page > 1:
+                return httpx.Response(200, json={"code": 0, "data": {"memory_detail_list": []}})
+            items = [
+                {
+                    "id": mid,
+                    "user_id": str(owner),
+                    "memory_value": text,
+                    "tags": ["memai:scope:user"],
+                }
+                for mid, (owner, text) in store.items()
+                if str(owner) == uid
+            ]
+            return httpx.Response(200, json={"code": 0, "data": {"memory_detail_list": items}})
+
+        if request.url.path.endswith("/delete/memory"):
+            delete_calls.append(body)
+            if "memory_ids" in body:
+                if mode["delete_behavior"] == "timeout":
+                    raise httpx.ReadTimeout("delete timeout", request=request)
+                for mid in body["memory_ids"]:
+                    store.pop(mid, None)
+                return httpx.Response(200, json={"code": 0, "data": {"success": "true"}})
+            if "user_id" in body:
+                if mode["clear_behavior"] == "timeout":
+                    raise httpx.ReadTimeout("clear timeout", request=request)
+                uid = body["user_id"]
+                for mid in [k for k, (owner, _) in store.items() if str(owner) == uid]:
+                    store.pop(mid, None)
+                return httpx.Response(200, json={"code": 0, "data": {"success": "true"}})
+        return httpx.Response(404)
+
+    provider, client = _make_memos_provider(
+        session_factory=session_factory, handler=handler, list_page_size=20
+    )
+    try:
+        # 1. Bob cannot delete Alice's memory: ownership check blocks `/delete/memory` call!
+        bob_del = await provider.delete_memory(user_id=bob_id, memory_id="mem_alice_1")
+        assert bob_del.status == "failed"
+        assert bob_del.error_code == "memory_not_found"
+        assert delete_calls == []
+        assert "mem_alice_1" in store
+
+        # 1b. Pre-delete ownership read timeout fails closed (`failed`, never `reconciling`).
+        mode["get_behavior"] = "timeout"
+        pre_timeout = await provider.delete_memory(user_id=bob_id, memory_id="mem_alice_1")
+        assert pre_timeout.status == "failed"
+        assert pre_timeout.error_code == "memory_provider_timeout"
+        assert delete_calls == []
+        mode["get_behavior"] = "ok"
+
+        # 1c. Bounded list truncation at `list_max_items` fails closed for both delete and verify.
+        capped_provider, capped_client = _make_memos_provider(
+            session_factory=session_factory,
+            handler=handler,
+            list_page_size=1,
+            list_max_items=1,
+        )
+        try:
+            capped_del = await capped_provider.delete_memory(
+                user_id=bob_id, memory_id="mem_alice_1"
+            )
+            assert capped_del.status == "failed"
+            assert capped_del.error_code == "memory_provider_error"
+            assert delete_calls == []
+            capped_verify = await capped_provider.verify_operation(
+                user_id=bob_id, external_ref="delete_memory:mem_alice_1"
+            )
+            assert capped_verify.status == "reconciling"
+            assert capped_verify.error_code == "memory_verification_truncated"
+        finally:
+            await capped_client.aclose()
+
+        # 2. Alice delete times out -> reconciling; verify sees still present -> failed -> retry ok.
+        mode["delete_behavior"] = "timeout"
+        res_timeout = await provider.delete_memory(user_id=alice_id, memory_id="mem_alice_1")
+        assert res_timeout.status == "reconciling"
+        assert res_timeout.external_ref == "delete_memory:mem_alice_1"
+
+        verify_present = await provider.verify_operation(
+            user_id=alice_id, external_ref="delete_memory:mem_alice_1"
+        )
+        assert verify_present.status == "failed"
+        assert verify_present.error_code == "memory_still_present"
+
+        mode["delete_behavior"] = "ok"
+        res_ok = await provider.delete_memory(user_id=alice_id, memory_id="mem_alice_1")
+        assert res_ok.status == "succeeded"
+        verify_gone = await provider.verify_operation(
+            user_id=alice_id, external_ref="delete_memory:mem_alice_1"
+        )
+        assert verify_gone.status == "succeeded"
+
+        # 3. Clear times out -> reconciling; verify sees Bob's memory -> retry clears only Bob.
+        mode["clear_behavior"] = "timeout"
+        clear_timeout = await provider.clear_memories(user_id=bob_id)
+        assert clear_timeout.status == "reconciling"
+        assert clear_timeout.external_ref == f"clear_memories:{bob_id}"
+        verify_clear_fail = await provider.verify_operation(
+            user_id=bob_id, external_ref=f"clear_memories:{bob_id}"
+        )
+        assert verify_clear_fail.status == "failed"
+
+        mode["clear_behavior"] = "ok"
+        clear_ok = await provider.clear_memories(user_id=bob_id)
+        assert clear_ok.status == "succeeded"
+        verify_clear_ok = await provider.verify_operation(
+            user_id=bob_id, external_ref=f"clear_memories:{bob_id}"
+        )
+        assert verify_clear_ok.status == "succeeded"
+        assert store == {}
+    finally:
         await client.aclose()
         await engine.dispose()

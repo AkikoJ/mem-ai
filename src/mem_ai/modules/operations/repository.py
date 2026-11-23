@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -62,11 +63,43 @@ async def get_operation_for_owner(
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
+async def get_operation_by_id(
+    session: AsyncSession,
+    *,
+    operation_id: UUID,
+    for_update: bool = False,
+) -> Operation | None:
+    """Load an operation by primary key inside the active transaction."""
+    stmt = select(Operation).where(Operation.id == operation_id)
+    if for_update:
+        stmt = stmt.with_for_update()
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def attach_job_id(
+    session: AsyncSession,
+    *,
+    operation_id: UUID,
+    job_id: UUID,
+    updated_at: datetime,
+) -> Operation | None:
+    """Attach the backing durable job ID to an operation inside the active transaction."""
+    stmt = (
+        update(Operation)
+        .where(Operation.id == operation_id)
+        .values(job_id=job_id, updated_at=updated_at)
+        .returning(Operation)
+        .execution_options(populate_existing=True)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
 async def conditional_transition_operation(
     session: AsyncSession,
     *,
     operation_id: UUID,
     new_status: str,
+    allowed_from_statuses: Sequence[str],
     progress: dict[str, Any] | None,
     result_summary: dict[str, Any] | None,
     error_code: str | None,
@@ -74,7 +107,9 @@ async def conditional_transition_operation(
     completed_at: datetime | None,
     updated_at: datetime,
 ) -> Operation | None:
-    """Conditionally advance a non-terminal operation without overwriting terminal outcomes."""
+    """Conditionally advance an operation strictly according to allowed source statuses."""
+    if not allowed_from_statuses:
+        return None
     values: dict[str, Any] = {
         "status": new_status,
         "error_code": error_code,
@@ -91,7 +126,7 @@ async def conditional_transition_operation(
         update(Operation)
         .where(
             Operation.id == operation_id,
-            Operation.status.in_(("pending", "running", "reconciling")),
+            Operation.status.in_(tuple(allowed_from_statuses)),
         )
         .values(**values)
         .returning(Operation)

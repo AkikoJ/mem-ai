@@ -15,6 +15,8 @@ from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mem_ai.contracts.memory_provider import (
+    CLEAR_MEMORIES_REF_PREFIX,
+    DELETE_MEMORY_REF_PREFIX,
     MemoryDeleteResult,
     MemoryListPage,
     MemoryListQuery,
@@ -25,7 +27,10 @@ from mem_ai.contracts.memory_provider import (
     MemoryScope,
     MemoryWriteInput,
     MemoryWriteResult,
+    build_clear_memories_external_ref,
+    build_delete_memory_external_ref,
 )
+from mem_ai.core.exceptions import AppError
 from mem_ai.modules.memories.service import map_memory_provider_error
 from mem_ai.modules.memories.snapshots import MemoryListScopeKey, MemorySnapshotStore
 
@@ -211,6 +216,7 @@ class MemOSMemoryProvider:
         list_page_size: int = 100,
         list_max_items: int = 1000,
         snapshot_ttl_seconds: int = 600,
+        supports_write_status_verification: bool = True,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._http_client = http_client
@@ -219,6 +225,7 @@ class MemOSMemoryProvider:
         self._timeout = httpx.Timeout(timeout_seconds)
         self._list_page_size = list_page_size
         self._list_max_items = list_max_items
+        self.supports_write_status_verification = supports_write_status_verification
         self._snapshots = MemorySnapshotStore(
             session_factory=session_factory,
             ttl_seconds=snapshot_ttl_seconds,
@@ -627,28 +634,66 @@ class MemOSMemoryProvider:
         )
         return recalled[: query.limit]
 
+    async def _fetch_owned_records_or_error(
+        self, *, user_id: UUID
+    ) -> tuple[list[MemoryRecord] | None, str | None]:
+        """Fetch owned records for ownership/verification guards, normalizing `AppError`."""
+        try:
+            return await self._fetch_all_user_memories_bounded(user_id=user_id), None
+        except AppError as exc:
+            return None, exc.code
+
     async def delete_memory(self, *, user_id: UUID, memory_id: str) -> MemoryDeleteResult:
-        """Delete a single memory via MemOS `POST /delete/memory` (extended in 13)."""
-        _ = user_id
+        """Verify ownership for `user_id` before deleting one memory via `POST /delete/memory`."""
+        default_ref = build_delete_memory_external_ref(memory_id)
+        # Pre-delete ownership read occurs before any upstream mutation: fail closed on any error
+        # (including timeout) so we never enter `reconciling` before `/delete/memory` is sent.
+        owned_records, fetch_error = await self._fetch_owned_records_or_error(user_id=user_id)
+        if owned_records is None:
+            return MemoryDeleteResult(
+                status="failed",
+                external_ref=default_ref,
+                error_code=fetch_error or "memory_provider_error",
+            )
+
+        owned_ids = {rec.memory_id for rec in owned_records}
+        if memory_id not in owned_ids:
+            if len(owned_records) < self._list_max_items:
+                return MemoryDeleteResult(
+                    status="failed",
+                    external_ref=default_ref,
+                    error_code="memory_not_found",
+                )
+            # Bounded scan hit `list_max_items` without proving ownership; fail closed to block
+            # cross-user deletion because `/delete/memory` with `memory_ids` omits `user_id`.
+            return MemoryDeleteResult(
+                status="failed",
+                external_ref=default_ref,
+                error_code="memory_provider_error",
+            )
+
         outcome = await self._post_memos("/delete/memory", {"memory_ids": [memory_id]})
         if not outcome.ok:
             return MemoryDeleteResult(
                 status="reconciling" if outcome.uncertain else "failed",
-                external_ref=memory_id,
+                external_ref=default_ref,
                 error_code=outcome.error_code or "memory_provider_error",
             )
-        return MemoryDeleteResult(status="succeeded", external_ref=memory_id)
+        ext_ref = _extract_external_ref(outcome.data, fallback=default_ref)
+        return MemoryDeleteResult(status="succeeded", external_ref=ext_ref)
 
     async def clear_memories(self, *, user_id: UUID) -> MemoryDeleteResult:
-        """Clear all memories for a user via MemOS `POST /delete/memory` (extended in 13)."""
+        """Clear all memories for a user via MemOS `POST /delete/memory`."""
+        default_ref = build_clear_memories_external_ref(user_id)
         outcome = await self._post_memos("/delete/memory", {"user_id": str(user_id)})
         if not outcome.ok:
             return MemoryDeleteResult(
                 status="reconciling" if outcome.uncertain else "failed",
-                external_ref=str(user_id),
+                external_ref=default_ref,
                 error_code=outcome.error_code or "memory_provider_error",
             )
-        return MemoryDeleteResult(status="succeeded", external_ref=str(user_id))
+        ext_ref = _extract_external_ref(outcome.data, fallback=default_ref)
+        return MemoryDeleteResult(status="succeeded", external_ref=ext_ref)
 
     async def verify_operation(
         self,
@@ -656,7 +701,46 @@ class MemOSMemoryProvider:
         user_id: UUID,
         external_ref: str,
     ) -> MemoryOperationStatus:
-        """Verify an async or uncertain external MemOS operation via `POST /get/status`."""
+        """Verify an async or uncertain external MemOS write, delete, or clear operation."""
+        if external_ref.startswith(DELETE_MEMORY_REF_PREFIX):
+            memory_id = external_ref[len(DELETE_MEMORY_REF_PREFIX) :]
+            owned_records, fetch_error = await self._fetch_owned_records_or_error(user_id=user_id)
+            if owned_records is None:
+                return MemoryOperationStatus(
+                    status="reconciling",
+                    external_ref=external_ref,
+                    error_code=fetch_error,
+                )
+            if memory_id not in {rec.memory_id for rec in owned_records}:
+                if len(owned_records) >= self._list_max_items:
+                    return MemoryOperationStatus(
+                        status="reconciling",
+                        external_ref=external_ref,
+                        error_code="memory_verification_truncated",
+                    )
+                return MemoryOperationStatus(status="succeeded", external_ref=external_ref)
+            return MemoryOperationStatus(
+                status="failed",
+                external_ref=external_ref,
+                error_code="memory_still_present",
+            )
+
+        if external_ref.startswith(CLEAR_MEMORIES_REF_PREFIX):
+            owned_records, fetch_error = await self._fetch_owned_records_or_error(user_id=user_id)
+            if owned_records is None:
+                return MemoryOperationStatus(
+                    status="reconciling",
+                    external_ref=external_ref,
+                    error_code=fetch_error,
+                )
+            if not owned_records:
+                return MemoryOperationStatus(status="succeeded", external_ref=external_ref)
+            return MemoryOperationStatus(
+                status="failed",
+                external_ref=external_ref,
+                error_code="memories_still_present",
+            )
+
         outcome = await self._post_memos(
             "/get/status",
             {"user_id": str(user_id), "task_id": external_ref},

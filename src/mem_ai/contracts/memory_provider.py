@@ -160,3 +160,26 @@ class MemoryProvider(Protocol):
     ) -> MemoryOperationStatus:
         """Verify an in-flight or uncertain external memory operation."""
         ...
+
+
+DELETE_MEMORY_REF_PREFIX = "delete_memory:"
+CLEAR_MEMORIES_REF_PREFIX = "clear_memories:"
+
+
+def build_delete_memory_external_ref(memory_id: str) -> str:
+    """Build the contract pre-dispatch correlation reference for single-memory deletion."""
+    return f"{DELETE_MEMORY_REF_PREFIX}{memory_id}"
+
+
+def build_clear_memories_external_ref(user_id: UUID) -> str:
+    """Build the contract pre-dispatch correlation reference for user-wide memory clearing."""
+    return f"{CLEAR_MEMORIES_REF_PREFIX}{user_id}"
+
+
+def provider_supports_write_status_verification(provider: MemoryProvider) -> bool:
+    """Return True when `provider` supports per-write external status verification.
+
+    Defaults to True for providers that do not explicitly opt out via
+    `supports_write_status_verification = False`.
+    """
+    return bool(getattr(provider, "supports_write_status_verification", True))

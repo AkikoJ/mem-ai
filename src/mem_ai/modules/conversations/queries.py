@@ -7,6 +7,7 @@ background turn-memory loading.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal, cast
 from uuid import UUID
 
@@ -338,4 +339,44 @@ class DatabaseTurnContentLoader:
         """Re-check conversation ownership and `active` status (`FOR SHARE`) inside caller's Tx."""
         return await is_conversation_active_in_session(
             session, owner_id=owner_id, conversation_id=conversation_id, for_share=True
+        )
+
+
+class DatabaseRecalledMemoryReferenceMarker:
+    """In-session marker setting `message_recalled_memories.deleted_at` without reverse imports."""
+
+    async def mark_memory_deleted_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        owner_id: UUID,
+        provider_id: str,
+        memory_id: str,
+        deleted_at: datetime,
+    ) -> int:
+        """Mark historical recalled references for one owned memory as deleted."""
+        return await repository.mark_recalled_memories_deleted_for_memory(
+            session,
+            owner_id=owner_id,
+            provider_id=provider_id,
+            memory_id=memory_id,
+            deleted_at=deleted_at,
+        )
+
+    async def mark_user_memories_deleted_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        owner_id: UUID,
+        provider_id: str,
+        max_memory_epoch: int,
+        deleted_at: datetime,
+    ) -> int:
+        """Mark historical recalled references up to `max_memory_epoch` as deleted."""
+        return await repository.mark_recalled_memories_deleted_for_user_epoch(
+            session,
+            owner_id=owner_id,
+            provider_id=provider_id,
+            max_memory_epoch=max_memory_epoch,
+            deleted_at=deleted_at,
         )

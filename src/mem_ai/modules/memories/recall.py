@@ -257,12 +257,14 @@ async def get_memory_epoch_in_session(
     *,
     user_id: UUID,
     provider_id: str,
+    for_share: bool = False,
 ) -> int:
     """Read the current `(user_id, provider_id)` memory epoch without creating a scope row."""
     scope_row = await repository.get_scope(
         session,
         user_id=user_id,
         provider_id=provider_id,
+        for_share=for_share,
     )
     return scope_row.epoch if scope_row is not None else 0
 
@@ -275,7 +277,7 @@ async def load_recall_guard_in_session(
     conversation_id: UUID | None = None,
     tombstone_lookup: TombstoneLookup | None = None,
 ) -> MemoryRecallGuard:
-    """Load `(epoch, barrier_state, tombstones)` inside an active DB session (extended in 13)."""
+    """Load `(epoch, barrier_state, tombstones)` inside an active DB session."""
     scope_row = await repository.get_scope(
         session,
         user_id=user_id,
@@ -288,14 +290,19 @@ async def load_recall_guard_in_session(
         else "idle"
     )
 
-    tombstoned_ids: frozenset[str] = frozenset()
-    conversation_tombstoned = False
     if tombstone_lookup is not None:
         tombstoned_ids, conversation_tombstoned = await tombstone_lookup(
             session,
             user_id,
             provider_id,
             conversation_id,
+        )
+    else:
+        tombstoned_ids, conversation_tombstoned = await repository.load_active_tombstones(
+            session,
+            user_id=user_id,
+            provider_id=provider_id,
+            conversation_id=conversation_id,
         )
 
     return MemoryRecallGuard(

@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
-from sqlalchemy import ColumnElement, func, select, update
+from sqlalchemy import ColumnElement, Select, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from mem_ai.contracts.memory_provider import MemoryRecallItem
@@ -523,3 +523,69 @@ async def list_recalled_memories_for_user_message(
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+def _owned_user_message_ids_subquery(owner_id: UUID) -> Select[UUID]:
+    return (
+        select(Message.id)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .where(Conversation.owner_id == owner_id)
+    )
+
+
+async def _mark_recalled_memories_deleted(
+    session: AsyncSession,
+    *,
+    owner_id: UUID,
+    provider_id: str,
+    deleted_at: datetime,
+    extra_criterion: Any,
+) -> int:
+    stmt = (
+        update(MessageRecalledMemory)
+        .where(
+            MessageRecalledMemory.user_message_id.in_(_owned_user_message_ids_subquery(owner_id)),
+            MessageRecalledMemory.provider_id == provider_id,
+            extra_criterion,
+            MessageRecalledMemory.deleted_at.is_(None),
+        )
+        .values(deleted_at=deleted_at)
+        .returning(MessageRecalledMemory.id)
+    )
+    return len((await session.execute(stmt)).all())
+
+
+async def mark_recalled_memories_deleted_for_memory(
+    session: AsyncSession,
+    *,
+    owner_id: UUID,
+    provider_id: str,
+    memory_id: str,
+    deleted_at: datetime,
+) -> int:
+    """Mark historical recalled references for one `(owner, provider, memory_id)` as deleted."""
+    return await _mark_recalled_memories_deleted(
+        session,
+        owner_id=owner_id,
+        provider_id=provider_id,
+        deleted_at=deleted_at,
+        extra_criterion=MessageRecalledMemory.memory_id == memory_id,
+    )
+
+
+async def mark_recalled_memories_deleted_for_user_epoch(
+    session: AsyncSession,
+    *,
+    owner_id: UUID,
+    provider_id: str,
+    max_memory_epoch: int,
+    deleted_at: datetime,
+) -> int:
+    """Mark historical recalled references up to `max_memory_epoch` for `(owner, provider)`."""
+    return await _mark_recalled_memories_deleted(
+        session,
+        owner_id=owner_id,
+        provider_id=provider_id,
+        deleted_at=deleted_at,
+        extra_criterion=MessageRecalledMemory.memory_epoch <= max_memory_epoch,
+    )

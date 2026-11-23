@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -15,15 +16,26 @@ from mem_ai.core.logging import configure_logging
 from mem_ai.db.engine import create_async_engine_from_settings, create_session_factory
 from mem_ai.integrations.http import create_http_client
 from mem_ai.modules.conversations import generation as conversations_generation
-from mem_ai.modules.conversations.queries import DatabaseTurnContentLoader
+from mem_ai.modules.conversations.queries import (
+    DatabaseRecalledMemoryReferenceMarker,
+    DatabaseTurnContentLoader,
+)
 from mem_ai.modules.conversations.schemas import DEFAULT_IDEMPOTENCY_RETENTION_SECONDS
 from mem_ai.modules.jobs.schemas import JobExecutionContext, JobHandlerOutcome
 from mem_ai.modules.memories.adapters.memos import MemOSMemoryProvider
 from mem_ai.modules.memories.jobs import (
+    JOB_TYPE_MEMORY_CLEAR,
+    JOB_TYPE_MEMORY_DELETE,
     JOB_TYPE_MEMORY_EXPLICIT_CREATE,
     JOB_TYPE_MEMORY_TURN_WRITE,
     ExplicitMemoryReconcileJobHandler,
+    MemoryClearJobHandler,
+    MemoryDeleteJobHandler,
     TurnMemoryWriteJobHandler,
+)
+from mem_ai.modules.operations.audit import (
+    DeletionAuditArchiver,
+    build_deletion_audit_archiver,
 )
 from mem_ai.workers.runner import (
     JobHandlerRegistry,
@@ -71,6 +83,10 @@ def build_worker_registry(
     *,
     memory_provider: MemoryProvider | None = None,
     idempotency_retention_seconds: float = DEFAULT_IDEMPOTENCY_RETENTION_SECONDS,
+    memory_inflight_settle_timeout_seconds: float = 60.0,
+    memory_clear_compensation_delay_seconds: float = 30.0,
+    audit_archiver: DeletionAuditArchiver | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> JobHandlerRegistry:
     """Assemble typed Worker job handlers with unidirectional module dependencies."""
     registry = JobHandlerRegistry()
@@ -84,6 +100,7 @@ def build_worker_registry(
 
     if memory_provider is not None:
         turn_loader = DatabaseTurnContentLoader(session_factory=session_factory)
+        recalled_marker = DatabaseRecalledMemoryReferenceMarker()
         registry.register(
             JOB_TYPE_MEMORY_TURN_WRITE,
             TurnMemoryWriteJobHandler(
@@ -97,6 +114,26 @@ def build_worker_registry(
             ExplicitMemoryReconcileJobHandler(
                 session_factory=session_factory,
                 memory_provider=memory_provider,
+            ),
+        )
+        registry.register(
+            JOB_TYPE_MEMORY_DELETE,
+            MemoryDeleteJobHandler(
+                session_factory=session_factory,
+                memory_provider=memory_provider,
+                audit_archiver=audit_archiver,
+            ),
+        )
+        registry.register(
+            JOB_TYPE_MEMORY_CLEAR,
+            MemoryClearJobHandler(
+                session_factory=session_factory,
+                memory_provider=memory_provider,
+                inflight_settle_timeout_seconds=memory_inflight_settle_timeout_seconds,
+                compensation_delay_seconds=memory_clear_compensation_delay_seconds,
+                recalled_memory_marker=recalled_marker,
+                audit_archiver=audit_archiver,
+                clock=clock,
             ),
         )
 
@@ -148,10 +185,16 @@ async def run_worker(
             snapshot_ttl_seconds=resolved_settings.memory_list_snapshot_ttl_seconds,
         )
 
+    audit_archiver = build_deletion_audit_archiver(resolved_settings.deletion_audit_archive_path)
     registry = build_worker_registry(
         session_factory,
         memory_provider=resolved_memory_provider,
         idempotency_retention_seconds=float(resolved_settings.idempotency_retention_hours * 3600),
+        memory_inflight_settle_timeout_seconds=resolved_settings.memory_inflight_settle_timeout,
+        memory_clear_compensation_delay_seconds=(
+            resolved_settings.memory_clear_compensation_delay_seconds
+        ),
+        audit_archiver=audit_archiver,
     )
     worker_config = (
         config_override

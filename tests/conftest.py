@@ -209,8 +209,13 @@ class FakeMemoryProvider:
 
     async def delete_memory(self, *, user_id: UUID, memory_id: str) -> MemoryDeleteResult:
         record = self.records.get(memory_id)
-        if record is not None and record.user_id == user_id:
-            del self.records[memory_id]
+        if record is None or record.user_id != user_id:
+            return MemoryDeleteResult(
+                status="failed",
+                external_ref=memory_id,
+                error_code="memory_not_found",
+            )
+        del self.records[memory_id]
         return MemoryDeleteResult(status="succeeded", external_ref=memory_id)
 
     async def clear_memories(self, *, user_id: UUID) -> MemoryDeleteResult:

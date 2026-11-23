@@ -51,6 +51,8 @@ def test_assembled_fastapi_app_has_unique_method_and_canonical_routes() -> None:
     assert ("GET", "/v1/models") in seen
     assert ("POST", "/v1/chat") in seen
     assert ("GET", "/v1/conversations/{conversationId}/generations/{generationId}") in seen
+    assert ("DELETE", "/v1/memories") in seen
+    assert ("DELETE", "/v1/memories/{memoryId}") in seen
 
 
 def test_layered_import_rule_rejects_forbidden_contract_and_router_dependencies() -> None:

@@ -13,6 +13,7 @@ from mem_ai.contracts.memory_provider import (
     MemoryProvider,
     MemoryScope,
     MemoryWriteInput,
+    provider_supports_write_status_verification,
 )
 from mem_ai.core.exceptions import AppError, ConflictError, ForbiddenError, GatewayTimeoutError
 from mem_ai.core.logging import bind_log_context, reset_log_context
@@ -24,6 +25,21 @@ from mem_ai.modules.jobs.schemas import (
     JobRecord,
 )
 from mem_ai.modules.memories import repository
+from mem_ai.modules.memories.barrier import (
+    AUDIT_RECONCILING_DEFER_SECONDS,
+)
+from mem_ai.modules.memories.barrier import (
+    JOB_TYPE_MEMORY_CLEAR as JOB_TYPE_MEMORY_CLEAR,
+)
+from mem_ai.modules.memories.barrier import (
+    JOB_TYPE_MEMORY_DELETE as JOB_TYPE_MEMORY_DELETE,
+)
+from mem_ai.modules.memories.clear_jobs import (
+    MemoryClearJobHandler as MemoryClearJobHandler,
+)
+from mem_ai.modules.memories.deletions import (
+    MemoryDeleteJobHandler as MemoryDeleteJobHandler,
+)
 from mem_ai.modules.operations import service as operations_service
 from mem_ai.modules.users import service as users_service
 
@@ -66,6 +82,7 @@ class ExplicitMemoryJobMetadata(BaseModel):
     provider_id: str
     memory_epoch: int = 0
     operation_id: UUID | None = None
+    dispatch_state: TurnMemoryDispatchState = "pending"
 
 
 class TurnContentRecord(BaseModel):
@@ -172,9 +189,9 @@ async def _finalize_confirmed_outcome(
         conversation_id=conversation_id,
         turn_loader=turn_loader,
     )
-    patch: dict[str, Any] = {}
-    if scope is not None:
-        patch["dispatch_state"] = "confirmed" if still_valid else "confirmed_during_clear"
+    patch: dict[str, Any] = {
+        "dispatch_state": "confirmed" if still_valid else "confirmed_during_clear",
+    }
     if memory_id is not None:
         patch["memory_id"] = memory_id
 
@@ -197,6 +214,80 @@ async def _finalize_confirmed_outcome(
         metadata_patch=patch,
         result_summary=summary,
         before_commit=before_commit,
+    )
+
+
+def _superseded_audit_outcome(job: JobRecord, *, external_ref: str) -> JobHandlerOutcome:
+    return JobHandlerOutcome(
+        outcome="reconciling",
+        external_ref=external_ref,
+        error_code=job.last_error_code or "memory_inflight_settle_timeout",
+        error_summary="superseded write job retained in reconciling state for audit",
+        retry_after_seconds=AUDIT_RECONCILING_DEFER_SECONDS,
+        result_summary={"phase": "reconciling", "reason": "retained_for_clear_audit"},
+    )
+
+
+def _unverifiable_write_outcome(job: JobRecord, *, external_ref: str) -> JobHandlerOutcome:
+    return JobHandlerOutcome(
+        outcome="reconciling",
+        external_ref=external_ref,
+        error_code=job.last_error_code or "memory_verification_unsupported",
+        error_summary="memory provider does not support per-write status verification",
+        result_summary={"phase": "reconciling", "reason": "verification_unsupported"},
+    )
+
+
+async def _handle_confirmed_during_clear(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    user_id: UUID,
+    provider_id: str,
+    expected_epoch: int,
+    external_ref: str,
+    last_error_code: str | None,
+    operation_id: UUID | None = None,
+) -> JobHandlerOutcome:
+    """Self-cancel a `confirmed_during_clear` write once clear completes, else stay reconciling."""
+    async with session_factory.begin() as session:
+        scope_row = await repository.get_scope(
+            session,
+            user_id=user_id,
+            provider_id=provider_id,
+        )
+    if (
+        scope_row is not None
+        and scope_row.barrier_state == "idle"
+        and scope_row.epoch > expected_epoch
+    ):
+
+        async def _fail_op_if_pending(session: AsyncSession, _job: JobRecord) -> None:
+            if operation_id is None:
+                return
+            await operations_service.transition_operation_in_session(
+                session,
+                operation_id=operation_id,
+                status="failed",
+                progress={"phase": "superseded_by_clear", "provider_id": provider_id},
+                error_code="memory_scope_cleared",
+                error_message="memory scope was cleared while creation was in flight",
+            )
+
+        return JobHandlerOutcome(
+            outcome="cancelled",
+            external_ref=external_ref,
+            error_code="memory_scope_cleared",
+            error_summary="memory write superseded by completed scope clear",
+            result_summary={"phase": "cancelled", "reason": "memory_scope_cleared"},
+            before_commit=_fail_op_if_pending if operation_id is not None else None,
+        )
+
+    return JobHandlerOutcome(
+        outcome="reconciling",
+        external_ref=external_ref,
+        error_code=last_error_code or "memory_scope_clearing",
+        error_summary="confirmed write awaiting clearing barrier convergence",
+        result_summary={"phase": "reconciling", "reason": "awaiting_clearing_convergence"},
     )
 
 
@@ -254,16 +345,19 @@ class TurnMemoryWriteJobHandler:
                     result_summary={"phase": "failed", "reason": "provider_mismatch"},
                 )
 
+            if ctx.job.metadata_json.get("superseded_by_clear_operation_id"):
+                return _superseded_audit_outcome(
+                    ctx.job, external_ref=ctx.job.external_ref or write_id
+                )
+
             if meta.dispatch_state == "confirmed_during_clear":
-                return JobHandlerOutcome(
-                    outcome="reconciling",
+                return await _handle_confirmed_during_clear(
+                    self._session_factory,
+                    user_id=ctx.job.user_id,
+                    provider_id=meta.provider_id,
+                    expected_epoch=meta.memory_epoch,
                     external_ref=ctx.job.external_ref or write_id,
-                    error_code=ctx.job.last_error_code or "memory_scope_clearing",
-                    error_summary="confirmed write awaiting clearing barrier convergence",
-                    result_summary={
-                        "phase": "reconciling",
-                        "reason": "awaiting_clearing_convergence",
-                    },
+                    last_error_code=ctx.job.last_error_code,
                 )
 
             if (
@@ -294,6 +388,8 @@ class TurnMemoryWriteJobHandler:
         meta: TurnMemoryJobMetadata,
         external_ref: str,
     ) -> JobHandlerOutcome:
+        if not provider_supports_write_status_verification(self._memory_provider):
+            return _unverifiable_write_outcome(ctx.job, external_ref=external_ref)
         try:
             status = await self._memory_provider.verify_operation(
                 user_id=user_id,
@@ -576,6 +672,21 @@ class ExplicitMemoryReconcileJobHandler:
                     error_code="memory_provider_mismatch",
                     error_summary="explicit memory job provider or external_ref is invalid",
                 )
+            if ctx.job.metadata_json.get("superseded_by_clear_operation_id"):
+                return _superseded_audit_outcome(ctx.job, external_ref=external_ref)
+            if meta.dispatch_state == "confirmed_during_clear":
+                return await _handle_confirmed_during_clear(
+                    self._session_factory,
+                    user_id=ctx.job.user_id,
+                    provider_id=meta.provider_id,
+                    expected_epoch=meta.memory_epoch,
+                    external_ref=external_ref,
+                    last_error_code=ctx.job.last_error_code,
+                    operation_id=meta.operation_id,
+                )
+
+            if not provider_supports_write_status_verification(self._memory_provider):
+                return _unverifiable_write_outcome(ctx.job, external_ref=external_ref)
 
             try:
                 status = await self._memory_provider.verify_operation(

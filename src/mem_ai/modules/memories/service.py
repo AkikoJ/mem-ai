@@ -26,12 +26,46 @@ from mem_ai.core.exceptions import (
     ForbiddenError,
     GatewayTimeoutError,
     NotFoundError,
-    ServiceUnavailableError,
     UnprocessableEntityError,
 )
 from mem_ai.modules.jobs import service as jobs_service
 from mem_ai.modules.jobs.schemas import JobRecord
 from mem_ai.modules.memories import repository
+from mem_ai.modules.memories.barrier import (
+    ALLOWED_BARRIER_TRANSITIONS as ALLOWED_BARRIER_TRANSITIONS,
+)
+from mem_ai.modules.memories.barrier import (
+    ALLOWED_TOMBSTONE_TRANSITIONS as ALLOWED_TOMBSTONE_TRANSITIONS,
+)
+from mem_ai.modules.memories.barrier import (
+    JOB_TYPE_MEMORY_CLEAR as JOB_TYPE_MEMORY_CLEAR,
+)
+from mem_ai.modules.memories.barrier import (
+    JOB_TYPE_MEMORY_DELETE as JOB_TYPE_MEMORY_DELETE,
+)
+from mem_ai.modules.memories.barrier import (
+    OPERATION_TYPE_MEMORY_CLEAR as OPERATION_TYPE_MEMORY_CLEAR,
+)
+from mem_ai.modules.memories.barrier import (
+    OPERATION_TYPE_MEMORY_DELETE as OPERATION_TYPE_MEMORY_DELETE,
+)
+from mem_ai.modules.memories.barrier import (
+    NoopRecalledMemoryReferenceMarker as NoopRecalledMemoryReferenceMarker,
+)
+from mem_ai.modules.memories.barrier import (
+    RecalledMemoryReferenceMarker as RecalledMemoryReferenceMarker,
+)
+from mem_ai.modules.memories.barrier import (
+    is_valid_barrier_transition as is_valid_barrier_transition,
+)
+from mem_ai.modules.memories.barrier import (
+    is_valid_tombstone_transition as is_valid_tombstone_transition,
+)
+from mem_ai.modules.memories.barrier import (
+    map_memory_provider_error as map_memory_provider_error,
+)
+from mem_ai.modules.memories.clearing import clear_user_memories as clear_user_memories
+from mem_ai.modules.memories.deletions import delete_single_memory as delete_single_memory
 from mem_ai.modules.memories.jobs import (
     JOB_TYPE_MEMORY_EXPLICIT_CREATE as JOB_TYPE_MEMORY_EXPLICIT_CREATE,
 )
@@ -118,25 +152,6 @@ class DefaultConversationAccessChecker:
         )
 
 
-def map_memory_provider_error(error_code: str | None, *, default_message: str) -> AppError:
-    """Translate a stable memory provider error code into an HTTP-mapped `AppError`."""
-    normalized = error_code or "memory_provider_error"
-    if normalized in ("memory_provider_unavailable", "memory_provider_rate_limited"):
-        return ServiceUnavailableError(
-            code=normalized,
-            message="memory provider is temporarily unavailable",
-        )
-    if normalized == "memory_provider_timeout":
-        return GatewayTimeoutError(
-            code="memory_provider_timeout",
-            message="memory provider request timed out",
-        )
-    return BadGatewayError(
-        code="memory_provider_error",
-        message=default_message,
-    )
-
-
 async def resolve_and_validate_scope(
     *,
     user_id: UUID,
@@ -189,6 +204,12 @@ async def list_memories(
             user_id=user_id,
             provider_id=memory_provider.provider_id,
         )
+        tombstoned_ids, conversation_tombstoned = await repository.load_active_tombstones(
+            session,
+            user_id=user_id,
+            provider_id=memory_provider.provider_id,
+            conversation_id=conversation_id,
+        )
 
     if conversation_id is not None:
         if scope == "user":
@@ -208,7 +229,10 @@ async def list_memories(
 
     if scope_state is not None and scope_state.barrier_state != "idle":
         return MemoryListPage(items=[], next_cursor=None, has_more=False)
+    if conversation_id is not None and conversation_tombstoned:
+        return MemoryListPage(items=[], next_cursor=None, has_more=False)
 
+    current_epoch = scope_state.epoch if scope_state is not None else 0
     query = MemoryListQuery(
         user_id=user_id,
         scope=effective_scope,
@@ -218,7 +242,7 @@ async def list_memories(
     )
     page = await memory_provider.list_memories(query)
 
-    # Defense-in-depth owner isolation check in case an adapter returns foreign items.
+    # Defense-in-depth owner, epoch, and tombstone isolation filter.
     owned_items = [item for item in page.items if item.user_id == user_id]
     if len(owned_items) != len(page.items):
         logger.warning(
@@ -230,8 +254,13 @@ async def list_memories(
                 }
             },
         )
+    visible_items = [
+        item
+        for item in owned_items
+        if item.memory_id not in tombstoned_ids and item.memory_epoch >= current_epoch
+    ]
     return MemoryListPage(
-        items=owned_items,
+        items=visible_items,
         next_cursor=page.next_cursor,
         has_more=page.has_more,
     )
@@ -465,6 +494,26 @@ async def _commit_confirmed_write(
                 provider_id=provider_id,
             )
             if scope_row.barrier_state != "idle" or scope_row.epoch != captured_epoch:
+                if scope_row.barrier_state == "idle":
+                    await jobs_service.complete_job_in_session(
+                        session,
+                        job_id=job_id,
+                        lease_token=lease_token,
+                        status="reconciling",
+                        external_ref=ext_ref,
+                        error_code="memory_scope_cleared",
+                        error_summary="scope clear finished while explicit write was in flight",
+                        metadata_patch={
+                            "memory_id": result.memory_id,
+                            "dispatch_state": "confirmed_during_clear",
+                        },
+                        now=now,
+                    )
+                    raise ConflictError(
+                        code="memory_scope_clearing",
+                        message="memory scope was cleared while write was in flight",
+                    )
+
                 operation = await operations_service.create_operation_in_session(
                     session,
                     owner_id=user_id,
@@ -484,7 +533,7 @@ async def _commit_confirmed_write(
                     error_code="memory_scope_clearing",
                     error_message="memory scope clearing started while write was in flight",
                 )
-                await jobs_service.complete_job_in_session(
+                updated_job = await jobs_service.complete_job_in_session(
                     session,
                     job_id=job_id,
                     lease_token=lease_token,
@@ -495,9 +544,24 @@ async def _commit_confirmed_write(
                     metadata_patch={
                         "memory_id": result.memory_id,
                         "operation_id": str(operation.id),
+                        "dispatch_state": "confirmed_during_clear",
                     },
                     now=now,
                 )
+                if updated_job is None:
+                    failed_op = await operations_service.transition_operation_in_session(
+                        session,
+                        operation_id=operation.id,
+                        status="failed",
+                        progress={
+                            "phase": "superseded_by_clear",
+                            "provider_id": provider_id,
+                        },
+                        error_code="memory_scope_cleared",
+                        error_message="memory scope was cleared while write was in flight",
+                        now=now,
+                    )
+                    return AcceptedMemoryOutcome(operation=failed_op or operation)
                 return AcceptedMemoryOutcome(operation=operation)
 
             await jobs_service.complete_job_in_session(

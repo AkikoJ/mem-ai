@@ -172,6 +172,72 @@ async def list_jobs_for_user(
     return list((await session.execute(stmt)).scalars().all())
 
 
+async def list_jobs_for_user_and_types(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    job_types: Sequence[str],
+    statuses: Sequence[str],
+    for_update: bool = False,
+) -> list[Job]:
+    """List user jobs matching `job_types` and `statuses`, optionally locking rows."""
+    if not job_types or not statuses:
+        return []
+    stmt = (
+        select(Job)
+        .where(
+            Job.user_id == user_id,
+            Job.job_type.in_(tuple(job_types)),
+            Job.status.in_(tuple(statuses)),
+        )
+        .order_by(Job.created_at.asc(), Job.id.asc())
+    )
+    if for_update:
+        stmt = stmt.with_for_update()
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def conditional_transition_job_by_status(
+    session: AsyncSession,
+    *,
+    job_id: UUID,
+    allowed_from_statuses: Sequence[str],
+    new_status: str,
+    current_time: datetime,
+    finished_at: datetime | None,
+    next_run_at: datetime | None,
+    last_error_code: str | None,
+    last_error_summary: str | None,
+    metadata_json: dict[str, Any],
+    clear_lease: bool = True,
+) -> Job | None:
+    """Conditionally update a job row guarded by `allowed_from_statuses`."""
+    if not allowed_from_statuses:
+        return None
+    values: dict[str, Any] = {
+        "status": new_status,
+        "finished_at": finished_at,
+        "last_error_code": last_error_code,
+        "last_error_summary": last_error_summary,
+        "metadata_json": dict(metadata_json),
+        "updated_at": current_time,
+    }
+    if next_run_at is not None:
+        values["next_run_at"] = next_run_at
+    if clear_lease:
+        values["lease_token"] = None
+        values["lease_expires_at"] = None
+
+    stmt = (
+        update(Job)
+        .where(Job.id == job_id, Job.status.in_(tuple(allowed_from_statuses)))
+        .values(**values)
+        .returning(Job)
+        .execution_options(populate_existing=True)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
 async def create_job_attempt(
     session: AsyncSession,
     *,

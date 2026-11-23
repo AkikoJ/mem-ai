@@ -405,7 +405,10 @@ async def prepare_generation_phase(
                 resolved_memory_epoch = memory_epoch
             elif memory_provider_id is not None:
                 resolved_memory_epoch = await memories_service.get_memory_epoch_in_session(
-                    session, user_id=owner_id, provider_id=memory_provider_id
+                    session,
+                    user_id=owner_id,
+                    provider_id=memory_provider_id,
+                    for_share=True,
                 )
             else:
                 resolved_memory_epoch = 0

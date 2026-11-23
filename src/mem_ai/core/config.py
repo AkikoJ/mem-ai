@@ -225,6 +225,9 @@ class Settings(BaseSettings):
     memos_list_page_size: int = Field(default=100, ge=1, le=200)
     memos_list_max_items: int = Field(default=1000, ge=1, le=5000)
     memory_list_snapshot_ttl_seconds: int = Field(default=600, ge=10, le=86400)
+    memory_inflight_settle_timeout: float = Field(default=60.0, gt=0.0, le=3600.0)
+    memory_clear_compensation_delay_seconds: float = Field(default=30.0, gt=0.0, le=3600.0)
+    deletion_audit_archive_path: str | None = None
 
     # Model provider (OpenAI-compatible) and chat generation budgets
     model_provider_mode: ModelProviderMode = "disabled"
@@ -353,6 +356,11 @@ class Settings(BaseSettings):
             raise ValueError("model_default_id must not be blank when set")
         if self.model_forced_id is not None and not self.model_forced_id.strip():
             raise ValueError("model_forced_id must not be blank when set")
+        if (
+            self.deletion_audit_archive_path is not None
+            and not self.deletion_audit_archive_path.strip()
+        ):
+            raise ValueError("deletion_audit_archive_path must not be blank when set")
 
         if self.chat_lease_renew_interval_seconds >= self.chat_lease_ttl_seconds:
             raise ValueError(
