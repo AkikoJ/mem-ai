@@ -49,11 +49,23 @@ async def get_agent_for_owner(
     return await session.scalar(stmt)
 
 
+async def get_agent_status_for_owner(
+    session: AsyncSession,
+    *,
+    owner_id: UUID,
+    agent_id: UUID,
+) -> str | None:
+    """Read the current committed `agents.status` directly from PostgreSQL without ORM cache."""
+    stmt = select(Agent.status).where(Agent.id == agent_id, Agent.owner_id == owner_id)
+    return await session.scalar(stmt)
+
+
 async def get_agent_with_published_version(
     session: AsyncSession,
     *,
     owner_id: UUID,
     agent_id: UUID,
+    populate_existing: bool = False,
 ) -> tuple[Agent, PersonaVersion | None] | None:
     """Fetch an owned Agent and its currently published PersonaVersion (if any)."""
     stmt = (
@@ -67,7 +79,12 @@ async def get_agent_with_published_version(
         )
         .where(Agent.id == agent_id, Agent.owner_id == owner_id)
     )
-    row = (await session.execute(stmt)).first()
+    result = (
+        await session.execute(stmt, execution_options={"populate_existing": True})
+        if populate_existing
+        else await session.execute(stmt)
+    )
+    row = result.first()
     if row is None:
         return None
     return (row[0], row[1])
@@ -290,6 +307,34 @@ async def conditional_publish_agent(
         .values(
             current_published_version_id=new_current_version_id,
             latest_version_number=new_latest_version,
+            revision=Agent.revision + 1,
+            updated_at=func.now(),
+        )
+        .returning(Agent)
+    )
+    return await session.scalar(stmt, execution_options={"populate_existing": True})
+
+
+async def conditional_retire_agent(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    owner_id: UUID,
+    expected_revision: int,
+    retired_at: datetime,
+) -> Agent | None:
+    """Conditionally transition an active owned Agent to `retired` guarded by `revision`."""
+    stmt = (
+        update(Agent)
+        .where(
+            Agent.id == agent_id,
+            Agent.owner_id == owner_id,
+            Agent.status == "active",
+            Agent.revision == expected_revision,
+        )
+        .values(
+            status="retired",
+            retired_at=func.coalesce(Agent.retired_at, retired_at),
             revision=Agent.revision + 1,
             updated_at=func.now(),
         )

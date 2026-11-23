@@ -389,7 +389,7 @@ class AgentSummaryResponse(_AgentSummaryFields):
 
 
 class AgentDetailResponse(_AgentSummaryFields):
-    """Public HTTP detail payload returned for create, get, patch, and publish."""
+    """Public HTTP detail payload returned for create, get, patch, publish, and retire."""
 
     draft: AgentDraftResponse
     published_version: PersonaVersionResponse | None = Field(

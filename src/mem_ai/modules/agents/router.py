@@ -145,3 +145,21 @@ async def publish_agent(
         data=payload,
     )
     return ok_response(AgentDetailResponse.from_detail_record(record))
+
+
+@router.delete(
+    "/{agentId}",
+    response_model=ApiResponse[AgentDetailResponse],
+)
+async def retire_agent(
+    agent_id: AgentIdPath,
+    auth: AuthContextDep,
+    session_factory: SessionFactoryDep,
+) -> ApiResponse[AgentDetailResponse]:
+    """Idempotently retire an owned Agent, blocking new chats while keeping existing sessions."""
+    record = await agents_service.retire_agent(
+        session_factory,
+        owner_id=auth.user_id,
+        agent_id=agent_id,
+    )
+    return ok_response(AgentDetailResponse.from_detail_record(record))

@@ -8,7 +8,6 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
-from sqlalchemy import update
 
 from mem_ai.api.dependencies import PersonaProviderDep, ProviderRegistry, get_persona_provider
 from mem_ai.application import create_app
@@ -16,7 +15,6 @@ from mem_ai.contracts.persona_provider import MemoryPolicy, PersonaProvider, Per
 from mem_ai.core.config import Settings
 from mem_ai.db.engine import create_async_engine_from_settings, create_session_factory
 from mem_ai.modules.agents import service as agents_service
-from mem_ai.modules.agents.models import Agent
 from mem_ai.modules.agents.schemas import (
     AgentCreateRequest,
     AgentPublishRequest,
@@ -216,12 +214,11 @@ async def test_local_and_replacement_persona_providers_share_identical_contract(
         v2_id = v2.published_version.version_id
 
         async def _retire_in_db() -> None:
-            async with sf.begin() as session:
-                await session.execute(
-                    update(Agent)
-                    .where(Agent.id == created.agent_id)
-                    .values(status="retired", retired_at=datetime.now(UTC))
-                )
+            await agents_service.retire_agent(
+                sf,
+                owner_id=alice.id,
+                agent_id=created.agent_id,
+            )
 
         await _assert_persona_provider_contract(
             local_provider,

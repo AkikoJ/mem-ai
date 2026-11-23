@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 from uuid import UUID
 
 from sqlalchemy.exc import IntegrityError
@@ -95,6 +95,16 @@ def _to_agent_record(
     )
 
 
+def _to_agent_record_from_rows(
+    agent: Agent,
+    published_row: PersonaVersion | None,
+) -> AgentRecord:
+    published_record = (
+        _to_persona_version_record(published_row) if published_row is not None else None
+    )
+    return _to_agent_record(agent, published_version=published_record)
+
+
 async def _insert_draft_snapshot(
     session: AsyncSession,
     *,
@@ -110,6 +120,27 @@ async def _insert_draft_snapshot(
         published_at=published_at,
     )
     return row, next_version
+
+
+async def _raise_conditional_update_conflict(
+    session: AsyncSession,
+    *,
+    owner_id: UUID,
+    agent_id: UUID,
+    conflict_code: str,
+    conflict_message: str,
+    retired_message: str,
+) -> NoReturn:
+    current_status = await repository.get_agent_status_for_owner(
+        session,
+        owner_id=owner_id,
+        agent_id=agent_id,
+    )
+    if current_status is None:
+        raise NotFoundError(code="agent_not_found", message="agent not found")
+    if current_status != "active":
+        raise ConflictError(code="agent_retired", message=retired_message)
+    raise ConflictError(code=conflict_code, message=conflict_message)
 
 
 async def create_agent(
@@ -154,10 +185,7 @@ async def get_agent(
         if result is None:
             raise NotFoundError(code="agent_not_found", message="agent not found")
         agent, published_row = result
-        published_record = (
-            _to_persona_version_record(published_row) if published_row is not None else None
-        )
-        return _to_agent_record(agent, published_version=published_record)
+        return _to_agent_record_from_rows(agent, published_row)
 
 
 async def list_agents(
@@ -269,15 +297,16 @@ async def update_agent_draft(
             values=updates,
         )
         if updated_agent is None:
-            raise ConflictError(
-                code="agent_revision_conflict",
-                message="agent was modified concurrently while updating draft",
+            await _raise_conditional_update_conflict(
+                session,
+                owner_id=owner_id,
+                agent_id=agent.id,
+                conflict_code="agent_revision_conflict",
+                conflict_message="agent was modified concurrently while updating draft",
+                retired_message="retired agent draft cannot be edited",
             )
 
-        published_record = (
-            _to_persona_version_record(published_row) if published_row is not None else None
-        )
-        return _to_agent_record(updated_agent, published_version=published_record)
+        return _to_agent_record_from_rows(updated_agent, published_row)
 
 
 async def create_persona_version(
@@ -316,9 +345,13 @@ async def create_persona_version(
                 new_latest_version=next_version,
             )
             if updated_agent is None:
-                raise ConflictError(
-                    code="agent_version_conflict",
-                    message="agent was modified concurrently while allocating version",
+                await _raise_conditional_update_conflict(
+                    session,
+                    owner_id=owner_id,
+                    agent_id=agent.id,
+                    conflict_code="agent_version_conflict",
+                    conflict_message="agent was modified concurrently while allocating version",
+                    retired_message="retired agent cannot create persona versions",
                 )
             return _to_persona_version_record(version_row)
     except IntegrityError as exc:
@@ -389,9 +422,13 @@ async def publish_agent(
                 new_latest_version=new_latest_version,
             )
             if updated_agent is None:
-                raise ConflictError(
-                    code="agent_publish_conflict",
-                    message="agent was modified concurrently during publish",
+                await _raise_conditional_update_conflict(
+                    session,
+                    owner_id=owner_id,
+                    agent_id=agent.id,
+                    conflict_code="agent_publish_conflict",
+                    conflict_message="agent was modified concurrently during publish",
+                    retired_message="retired agent cannot be published",
                 )
 
             version_record = _to_persona_version_record(target_version)
@@ -403,6 +440,54 @@ async def publish_agent(
                 message="concurrent persona version publish conflict",
             ) from exc
         raise
+
+
+async def retire_agent(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    owner_id: UUID,
+    agent_id: UUID,
+) -> AgentRecord:
+    """Idempotently retire an owned private Agent while preserving published persona snapshots."""
+    async with session_factory.begin() as session:
+        await users_service.ensure_user_active_in_session(session, user_id=owner_id)
+        found = await repository.get_agent_with_published_version(
+            session,
+            owner_id=owner_id,
+            agent_id=agent_id,
+        )
+        if found is None:
+            raise NotFoundError(code="agent_not_found", message="agent not found")
+
+        agent, published_row = found
+        if agent.status == "retired":
+            return _to_agent_record_from_rows(agent, published_row)
+
+        retired_agent = await repository.conditional_retire_agent(
+            session,
+            agent_id=agent.id,
+            owner_id=owner_id,
+            expected_revision=agent.revision,
+            retired_at=datetime.now(UTC),
+        )
+        if retired_agent is None:
+            reloaded = await repository.get_agent_with_published_version(
+                session,
+                owner_id=owner_id,
+                agent_id=agent_id,
+                populate_existing=True,
+            )
+            if reloaded is None:
+                raise NotFoundError(code="agent_not_found", message="agent not found")
+            current_agent, current_published = reloaded
+            if current_agent.status == "retired":
+                return _to_agent_record_from_rows(current_agent, current_published)
+            raise ConflictError(
+                code="agent_retire_conflict",
+                message="agent was modified concurrently while retiring",
+            )
+
+        return _to_agent_record_from_rows(retired_agent, published_row)
 
 
 async def get_latest_published_version_for_owner(
