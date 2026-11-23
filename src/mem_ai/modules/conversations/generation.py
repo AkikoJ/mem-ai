@@ -44,6 +44,7 @@ from mem_ai.modules.conversations.schemas import (
     RecalledMemoryReferenceRecord,
 )
 from mem_ai.modules.memories import service as memories_service
+from mem_ai.modules.memories.service import TurnContentRecord
 from mem_ai.modules.users import service as users_service
 
 BeforeCommitHook = Callable[[AsyncSession, GenerationRecord, MessageRecord], Awaitable[None]]
@@ -110,34 +111,20 @@ async def _load_accessible_conversation_in_session(
     lock_mode: ConversationLockMode = "none",
 ) -> Conversation:
     """Single resource policy for write/continuation access: 404 missing/foreign, 409 deleting."""
-    if lock_mode == "update":
-        conversation = await repository.get_conversation_for_update(
-            session,
-            owner_id=owner_id,
-            conversation_id=conversation_id,
+    lookup = (
+        repository.get_conversation_for_update
+        if lock_mode == "update"
+        else (
+            repository.get_conversation_for_share
+            if lock_mode == "share"
+            else repository.get_conversation_for_owner
         )
-    elif lock_mode == "share":
-        conversation = await repository.get_conversation_for_share(
-            session,
-            owner_id=owner_id,
-            conversation_id=conversation_id,
-        )
-    else:
-        conversation = await repository.get_conversation_for_owner(
-            session,
-            owner_id=owner_id,
-            conversation_id=conversation_id,
-        )
+    )
+    conversation = await lookup(session, owner_id=owner_id, conversation_id=conversation_id)
     if conversation is None:
-        raise NotFoundError(
-            code="conversation_not_found",
-            message="conversation not found",
-        )
+        raise NotFoundError(code="conversation_not_found", message="conversation not found")
     if conversation.status == "deleting":
-        raise ConflictError(
-            code="conversation_deleting",
-            message="conversation is being deleted",
-        )
+        raise ConflictError(code="conversation_deleting", message="conversation is being deleted")
     return conversation
 
 
@@ -149,15 +136,10 @@ async def _load_readable_conversation_in_session(
 ) -> Conversation:
     """Single resource policy for read queries: 404 for missing, foreign, or deleting."""
     conversation = await repository.get_conversation_for_owner(
-        session,
-        owner_id=owner_id,
-        conversation_id=conversation_id,
+        session, owner_id=owner_id, conversation_id=conversation_id
     )
     if conversation is None or conversation.status == "deleting":
-        raise NotFoundError(
-            code="conversation_not_found",
-            message="conversation not found",
-        )
+        raise NotFoundError(code="conversation_not_found", message="conversation not found")
     return conversation
 
 
@@ -167,15 +149,79 @@ async def ensure_conversation_accessible_in_session(
     owner_id: UUID,
     conversation_id: UUID,
     for_update: bool = False,
+    for_share: bool = False,
 ) -> ConversationRecord:
     """Validate conversation ownership and active status inside an existing session."""
+    mode: ConversationLockMode = "update" if for_update else ("share" if for_share else "none")
     conversation = await _load_accessible_conversation_in_session(
-        session,
-        owner_id=owner_id,
-        conversation_id=conversation_id,
-        lock_mode="update" if for_update else "none",
+        session, owner_id=owner_id, conversation_id=conversation_id, lock_mode=mode
     )
     return ConversationRecord.model_validate(conversation)
+
+
+async def is_conversation_active_in_session(
+    session: AsyncSession,
+    *,
+    owner_id: UUID,
+    conversation_id: UUID,
+    for_share: bool = True,
+) -> bool:
+    """Return True iff `conversation_id` exists for `owner_id` and is `active`."""
+    try:
+        await ensure_conversation_accessible_in_session(
+            session, owner_id=owner_id, conversation_id=conversation_id, for_share=for_share
+        )
+    except (ConflictError, NotFoundError):
+        return False
+    return True
+
+
+async def load_turn_for_memory_write(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    owner_id: UUID,
+    conversation_id: UUID,
+    generation_id: UUID,
+) -> TurnContentRecord | None:
+    """Load committed user/assistant turn messages for background derived memory writes."""
+    async with session_factory() as session:
+        conv = await repository.get_conversation_for_owner(
+            session, owner_id=owner_id, conversation_id=conversation_id
+        )
+        if conv is None:
+            return None
+        gen = await repository.get_generation_for_owner(
+            session, owner_id=owner_id, conversation_id=conversation_id, generation_id=generation_id
+        )
+        if gen is None or gen.user_message_id is None or gen.assistant_message_id is None:
+            return None
+        user_msg = await repository.get_message_for_conversation(
+            session,
+            conversation_id=conversation_id,
+            message_id=gen.user_message_id,
+            generation_id=generation_id,
+            role="user",
+        )
+        asst_msg = await repository.get_message_for_conversation(
+            session,
+            conversation_id=conversation_id,
+            message_id=gen.assistant_message_id,
+            generation_id=generation_id,
+            role="assistant",
+        )
+        if user_msg is None or asst_msg is None:
+            return None
+        return TurnContentRecord(
+            generation_id=gen.id,
+            conversation_id=conv.id,
+            owner_id=owner_id,
+            user_message_content=user_msg.content,
+            assistant_message_content=asst_msg.content,
+            conversation_status=cast(Literal["active", "deleting"], conv.status),
+            generation_status=cast(
+                Literal["running", "succeeded", "failed", "cancelled"], gen.status
+            ),
+        )
 
 
 async def ensure_conversation_accessible(
@@ -188,10 +234,7 @@ async def ensure_conversation_accessible(
     async with session_factory() as session:
         await users_service.ensure_user_active_in_session(session, user_id=owner_id)
         return await ensure_conversation_accessible_in_session(
-            session,
-            owner_id=owner_id,
-            conversation_id=conversation_id,
-            for_update=False,
+            session, owner_id=owner_id, conversation_id=conversation_id, for_update=False
         )
 
 
@@ -204,9 +247,7 @@ async def load_conversation_for_continuation(
 ) -> ConversationRecord:
     """Load an existing owned conversation outside Tx 1 to resolve its pinned persona."""
     record = await ensure_conversation_accessible(
-        session_factory,
-        owner_id=owner_id,
-        conversation_id=conversation_id,
+        session_factory, owner_id=owner_id, conversation_id=conversation_id
     )
     if record.agent_id != expected_agent_id:
         raise ConflictError(
@@ -435,10 +476,7 @@ async def prepare_generation_phase(
                 history_messages=tuple(prior_messages),
             )
     except IntegrityError as exc:
-        if is_unique_violation(
-            exc,
-            constraint_name=GENERATION_ACTIVE_CONVERSATION_UNIQUE_INDEX,
-        ):
+        if is_unique_violation(exc, constraint_name=GENERATION_ACTIVE_CONVERSATION_UNIQUE_INDEX):
             raise _generation_conflict_error(conversation_id=conversation_id) from exc
         raise
 
@@ -461,16 +499,9 @@ async def renew_generation_lease_phase(
 
     async with session_factory.begin() as session:
         current_time = await _resolve_current_time(session, now)
-        await users_service.ensure_user_active_in_session(
-            session,
-            user_id=owner_id,
-            for_share=True,
-        )
+        await users_service.ensure_user_active_in_session(session, user_id=owner_id, for_share=True)
         await _load_accessible_conversation_in_session(
-            session,
-            owner_id=owner_id,
-            conversation_id=conversation_id,
-            lock_mode="share",
+            session, owner_id=owner_id, conversation_id=conversation_id, lock_mode="share"
         )
         new_expires_at = current_time + timedelta(seconds=lease_ttl_seconds)
         updated = await repository.conditional_renew_generation_lease(
@@ -505,11 +536,8 @@ async def commit_generation_success_phase(
         async with session_factory.begin() as session:
             completed_at = await _resolve_current_time(session, now)
             await users_service.ensure_user_active_in_session(
-                session,
-                user_id=prepared.owner_id,
-                for_share=True,
+                session, user_id=prepared.owner_id, for_share=True
             )
-
             conversation = await _load_accessible_conversation_in_session(
                 session,
                 owner_id=prepared.owner_id,
@@ -645,21 +673,13 @@ async def get_generation_for_owner(
     async with session_factory() as session:
         await users_service.ensure_user_active_in_session(session, user_id=owner_id)
         await _load_readable_conversation_in_session(
-            session,
-            owner_id=owner_id,
-            conversation_id=conversation_id,
+            session, owner_id=owner_id, conversation_id=conversation_id
         )
         generation = await repository.get_generation_for_owner(
-            session,
-            owner_id=owner_id,
-            conversation_id=conversation_id,
-            generation_id=generation_id,
+            session, owner_id=owner_id, conversation_id=conversation_id, generation_id=generation_id
         )
         if generation is None:
-            raise NotFoundError(
-                code="generation_not_found",
-                message="generation not found",
-            )
+            raise NotFoundError(code="generation_not_found", message="generation not found")
         return GenerationRecord.model_validate(generation)
 
 
@@ -673,13 +693,10 @@ async def list_conversation_messages_for_owner(
     async with session_factory() as session:
         await users_service.ensure_user_active_in_session(session, user_id=owner_id)
         await _load_readable_conversation_in_session(
-            session,
-            owner_id=owner_id,
-            conversation_id=conversation_id,
+            session, owner_id=owner_id, conversation_id=conversation_id
         )
         rows = await repository.list_all_messages_for_conversation(
-            session,
-            conversation_id=conversation_id,
+            session, conversation_id=conversation_id
         )
         return [MessageRecord.model_validate(row) for row in rows]
 
@@ -697,9 +714,7 @@ async def persist_recalled_memories_phase(
         async with session_factory.begin() as session:
             current_time = await _resolve_current_time(session, now)
             await users_service.ensure_user_active_in_session(
-                session,
-                user_id=prepared.owner_id,
-                for_share=True,
+                session, user_id=prepared.owner_id, for_share=True
             )
             await _load_accessible_conversation_in_session(
                 session,
@@ -720,7 +735,6 @@ async def persist_recalled_memories_phase(
                     code="generation_lease_lost",
                     message="generation lease is no longer active or has expired",
                 )
-
             user_message = await repository.get_message_for_conversation(
                 session,
                 conversation_id=prepared.conversation_id,
@@ -730,10 +744,8 @@ async def persist_recalled_memories_phase(
             )
             if user_message is None:
                 raise NotFoundError(
-                    code="message_not_found",
-                    message="generation user message not found",
+                    code="message_not_found", message="generation user message not found"
                 )
-
             filtered = (
                 await filter_in_session(session, candidates)
                 if (candidates and filter_in_session is not None)
@@ -741,20 +753,15 @@ async def persist_recalled_memories_phase(
             )
             if not filtered:
                 return (), []
-
             rows = await repository.create_recalled_memory_references(
                 session,
                 user_message_id=user_message.id,
                 items=filtered,
                 recalled_at=current_time,
             )
-            records = [RecalledMemoryReferenceRecord.model_validate(row) for row in rows]
-            return tuple(filtered), records
+            return tuple(filtered), [RecalledMemoryReferenceRecord.model_validate(r) for r in rows]
     except IntegrityError as exc:
-        if is_unique_violation(
-            exc,
-            constraint_name=MESSAGE_RECALLED_MEMORY_UNIQUE_CONSTRAINT,
-        ):
+        if is_unique_violation(exc, constraint_name=MESSAGE_RECALLED_MEMORY_UNIQUE_CONSTRAINT):
             raise ConflictError(
                 code="recalled_memory_conflict",
                 message="recalled memory reference already recorded for this message",
@@ -773,23 +780,14 @@ async def list_recalled_memories_for_message_for_owner(
     async with session_factory() as session:
         await users_service.ensure_user_active_in_session(session, user_id=owner_id)
         await _load_readable_conversation_in_session(
-            session,
-            owner_id=owner_id,
-            conversation_id=conversation_id,
+            session, owner_id=owner_id, conversation_id=conversation_id
         )
         user_message = await repository.get_message_for_conversation(
-            session,
-            conversation_id=conversation_id,
-            message_id=user_message_id,
-            role="user",
+            session, conversation_id=conversation_id, message_id=user_message_id, role="user"
         )
         if user_message is None:
-            raise NotFoundError(
-                code="message_not_found",
-                message="message not found",
-            )
+            raise NotFoundError(code="message_not_found", message="message not found")
         rows = await repository.list_recalled_memories_for_user_message(
-            session,
-            user_message_id=user_message.id,
+            session, user_message_id=user_message.id
         )
         return [RecalledMemoryReferenceRecord.model_validate(row) for row in rows]

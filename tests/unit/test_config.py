@@ -357,3 +357,38 @@ def test_chat_memory_recall_budget_settings_validation() -> None:
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None, app_env="test", chat_prompt_max_chars=100)
+
+
+def test_worker_and_job_retention_settings_validation() -> None:
+    defaults = Settings(_env_file=None, app_env="test")
+    assert defaults.worker_concurrency == 4
+    assert defaults.worker_poll_interval_seconds == 1.0
+    assert defaults.worker_claim_batch_size == 10
+    assert defaults.worker_lease_ttl_seconds == 60
+    assert defaults.worker_lease_renew_interval_seconds == 20.0
+    assert defaults.worker_max_attempts == 5
+    assert defaults.worker_backoff_base_seconds == 2.0
+    assert defaults.worker_backoff_max_seconds == 300.0
+    assert defaults.worker_backoff_jitter_ratio == 0.2
+    assert defaults.worker_reconcile_delay_seconds == 10.0
+    assert defaults.worker_shutdown_grace_seconds == 15.0
+    assert defaults.job_attempt_retention_days == 30
+
+    with pytest.raises(ValidationError, match="worker_lease_renew_interval_seconds"):
+        Settings(
+            _env_file=None,
+            app_env="test",
+            worker_lease_ttl_seconds=10,
+            worker_lease_renew_interval_seconds=10.0,
+        )
+
+    with pytest.raises(ValidationError, match="worker_backoff_base_seconds"):
+        Settings(
+            _env_file=None,
+            app_env="test",
+            worker_backoff_base_seconds=60.0,
+            worker_backoff_max_seconds=30.0,
+        )
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, app_env="test", job_attempt_retention_days=0)

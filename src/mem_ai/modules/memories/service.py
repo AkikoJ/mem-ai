@@ -18,6 +18,7 @@ from mem_ai.contracts.memory_provider import (
     MemoryWriteInput,
     MemoryWriteResult,
 )
+from mem_ai.contracts.persona_provider import MemoryPolicy
 from mem_ai.core.exceptions import (
     AppError,
     BadGatewayError,
@@ -29,7 +30,20 @@ from mem_ai.core.exceptions import (
     UnprocessableEntityError,
 )
 from mem_ai.modules.jobs import service as jobs_service
+from mem_ai.modules.jobs.schemas import JobRecord
 from mem_ai.modules.memories import repository
+from mem_ai.modules.memories.jobs import (
+    JOB_TYPE_MEMORY_EXPLICIT_CREATE as JOB_TYPE_MEMORY_EXPLICIT_CREATE,
+)
+from mem_ai.modules.memories.jobs import (
+    JOB_TYPE_MEMORY_TURN_WRITE as JOB_TYPE_MEMORY_TURN_WRITE,
+)
+from mem_ai.modules.memories.jobs import (
+    TurnContentLoader as TurnContentLoader,
+)
+from mem_ai.modules.memories.jobs import (
+    TurnContentRecord as TurnContentRecord,
+)
 from mem_ai.modules.memories.recall import (
     MemoryBarrierState as MemoryBarrierState,
 )
@@ -71,7 +85,6 @@ from mem_ai.modules.users import service as users_service
 
 logger = logging.getLogger("mem_ai.memories")
 
-JOB_TYPE_MEMORY_EXPLICIT_CREATE = "memory_explicit_create"
 OPERATION_TYPE_MEMORY_EXPLICIT_CREATE = "memory_explicit_create"
 
 
@@ -532,3 +545,75 @@ async def _record_failed_write(
             error_code=error_code,
             error_summary=error_summary,
         )
+
+
+async def enqueue_turn_memory_write_in_session(
+    session: AsyncSession,
+    *,
+    provider_id: str,
+    owner_id: UUID,
+    conversation_id: UUID,
+    generation_id: UUID,
+    user_message_id: UUID,
+    assistant_message_id: UUID,
+    memory_epoch: int,
+    memory_policy: MemoryPolicy,
+    max_attempts: int = 5,
+    now: datetime | None = None,
+) -> JobRecord | None:
+    """Enqueue a `memory_turn_write` job inside the generation success commit transaction.
+
+    Honors pinned `memory_policy.enabled`, `memory_policy.write_enabled`, and
+    `memory_policy.write_scope` (`user` default or `conversation`), suppresses stale-epoch or
+    barrier-blocked writes without failing the committed reply, and never persists raw message
+    content in `jobs.metadata_json`.
+    """
+    if not memory_policy.enabled or not memory_policy.write_enabled:
+        return None
+
+    scope_row = await repository.get_scope(
+        session,
+        user_id=owner_id,
+        provider_id=provider_id,
+        for_share=True,
+    )
+    if scope_row is not None and (
+        scope_row.barrier_state != "idle" or scope_row.epoch != memory_epoch
+    ):
+        logger.info(
+            "Suppressed turn memory write job due to active clearing barrier or epoch change",
+            extra={
+                "extra_fields": {
+                    "provider": provider_id,
+                    "captured_epoch": memory_epoch,
+                    "current_epoch": scope_row.epoch,
+                    "barrier_state": scope_row.barrier_state,
+                }
+            },
+        )
+        return None
+
+    write_scope: MemoryScope = memory_policy.write_scope
+    write_id = f"mtw_{generation_id.hex}"
+    dedupe_key = f"{JOB_TYPE_MEMORY_TURN_WRITE}:{generation_id}"
+    job, _ = await jobs_service.enqueue_job_in_session(
+        session,
+        job_type=JOB_TYPE_MEMORY_TURN_WRITE,
+        business_id=str(generation_id),
+        user_id=owner_id,
+        dedupe_key=dedupe_key,
+        max_attempts=max_attempts,
+        now=now,
+        metadata_json={
+            "write_id": write_id,
+            "provider_id": provider_id,
+            "scope": write_scope,
+            "conversation_id": str(conversation_id),
+            "generation_id": str(generation_id),
+            "user_message_id": str(user_message_id),
+            "assistant_message_id": str(assistant_message_id),
+            "memory_epoch": memory_epoch,
+            "dispatch_state": "pending",
+        },
+    )
+    return job

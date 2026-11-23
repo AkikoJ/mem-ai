@@ -1,4 +1,4 @@
-.PHONY: help sync db-up db-down db-ps migrate migrate-check sync-models api api-prod test check
+.PHONY: help sync db-up db-down db-ps migrate migrate-check sync-models api api-prod worker test check
 
 APP_HOST ?= 127.0.0.1
 APP_PORT ?= 8000
@@ -14,6 +14,7 @@ help:
 	@echo "  make sync-models   Idempotently sync server model registry config into PostgreSQL"
 	@echo "  make api           Start FastAPI dev server with --reload"
 	@echo "  make api-prod      Start FastAPI server without --reload"
+	@echo "  make worker        Start standalone background Worker process"
 	@echo "  make test          Run pytest suite"
 	@echo "  make check         Run Ruff lint/format, mypy, and architecture checks"
 
@@ -43,6 +44,9 @@ api:
 
 api-prod:
 	uv run uvicorn mem_ai.main:app --host $(APP_HOST) --port $(APP_PORT)
+
+worker:
+	uv run python -m mem_ai.workers.main
 
 test:
 	uv run pytest

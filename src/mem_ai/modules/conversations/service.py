@@ -43,11 +43,17 @@ from mem_ai.modules.conversations.generation import BeforeCommitHook
 from mem_ai.modules.conversations.prompt import compile_chat_context
 from mem_ai.modules.conversations.schemas import (
     CommittedChatResult,
+    GenerationRecord,
+    MessageRecord,
     PreparedContext,
     PreparedGeneration,
 )
 from mem_ai.modules.memories import service as memories_service
-from mem_ai.modules.memories.service import MemoryRecallPolicy, TombstoneLookup
+from mem_ai.modules.memories.service import (
+    MemoryRecallPolicy,
+    TombstoneLookup,
+    TurnContentRecord,
+)
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelRoutingPolicy
 from mem_ai.modules.users import service as users_service
@@ -80,6 +86,7 @@ class SyncChatOptions:
     memory_max_items: int = 10
     memory_context_max_chars: int = 2000
     prompt_max_chars: int | None = 24000
+    memory_write_max_attempts: int = 5
     tombstone_lookup: TombstoneLookup | None = None
     task_registry: SyncGenerationTaskRegistry | None = None
     before_commit_hook: BeforeCommitHook | None = None
@@ -106,6 +113,7 @@ def sync_chat_options_from_settings(
         memory_max_items=settings.chat_memory_max_items,
         memory_context_max_chars=settings.chat_memory_context_max_chars,
         prompt_max_chars=settings.chat_prompt_max_chars,
+        memory_write_max_attempts=settings.worker_max_attempts,
         task_registry=task_registry,
     )
 
@@ -228,6 +236,78 @@ class DatabaseConversationAccessChecker:
             owner_id=owner_id,
             conversation_id=conversation_id,
         )
+
+
+class DatabaseTurnContentLoader:
+    """Read-only `TurnContentLoader` delegating to `conversations.generation`."""
+
+    def __init__(self, *, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def load_turn_for_memory_write(
+        self,
+        *,
+        owner_id: UUID,
+        conversation_id: UUID,
+        generation_id: UUID,
+    ) -> TurnContentRecord | None:
+        """Load committed user/assistant turn messages via `conversations.generation`."""
+        return await generation_store.load_turn_for_memory_write(
+            self._session_factory,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            generation_id=generation_id,
+        )
+
+    async def is_conversation_active_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        owner_id: UUID,
+        conversation_id: UUID,
+    ) -> bool:
+        """Re-check conversation ownership and `active` status (`FOR SHARE`) inside caller's Tx."""
+        return await generation_store.is_conversation_active_in_session(
+            session,
+            owner_id=owner_id,
+            conversation_id=conversation_id,
+            for_share=True,
+        )
+
+
+def build_turn_memory_enqueue_hook(
+    *,
+    prepared: PreparedGeneration,
+    memory_provider: MemoryProvider | None,
+    max_attempts: int = 5,
+    extra_hook: BeforeCommitHook | None = None,
+) -> BeforeCommitHook | None:
+    """Build the Tx 2 `before_commit_hook` shared by sync and streaming generation commits."""
+    if memory_provider is None and extra_hook is None:
+        return None
+
+    async def _before_commit(
+        session: AsyncSession,
+        generation_record: GenerationRecord,
+        assistant_record: MessageRecord,
+    ) -> None:
+        if memory_provider is not None:
+            await memories_service.enqueue_turn_memory_write_in_session(
+                session,
+                provider_id=memory_provider.provider_id,
+                owner_id=prepared.owner_id,
+                conversation_id=prepared.conversation_id,
+                generation_id=generation_record.id,
+                user_message_id=prepared.user_message_id,
+                assistant_message_id=assistant_record.id,
+                memory_epoch=prepared.memory_epoch,
+                memory_policy=prepared.persona.memory_policy,
+                max_attempts=max_attempts,
+            )
+        if extra_hook is not None:
+            await extra_hook(session, generation_record, assistant_record)
+
+    return _before_commit
 
 
 async def prepare_generation(
@@ -591,6 +671,12 @@ async def complete_prepared_sync_generation(
                 message="model generation failed",
             ) from None
 
+        tx2_before_commit = build_turn_memory_enqueue_hook(
+            prepared=prepared,
+            memory_provider=memory_provider,
+            max_attempts=resolved_options.memory_write_max_attempts,
+            extra_hook=effective_before_commit,
+        )
         try:
             return await generation_store.commit_generation_success_phase(
                 session_factory,
@@ -598,7 +684,7 @@ async def complete_prepared_sync_generation(
                 assistant_content=model_response.content,
                 usage=model_response.usage,
                 finish_reason=model_response.finish_reason,
-                before_commit_hook=effective_before_commit,
+                before_commit_hook=tx2_before_commit,
             )
         except AppError as exc:
             await _safe_converge_failure(

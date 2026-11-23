@@ -23,12 +23,15 @@ async def get_scope(
     *,
     user_id: UUID,
     provider_id: str,
+    for_share: bool = False,
 ) -> MemoryScopeState | None:
-    """Read the current `(user_id, provider_id)` scope state without locking."""
+    """Read the current `(user_id, provider_id)` scope state, optionally with `FOR SHARE`."""
     stmt = select(MemoryScopeState).where(
         MemoryScopeState.user_id == user_id,
         MemoryScopeState.provider_id == provider_id,
     )
+    if for_share:
+        stmt = stmt.with_for_update(read=True)
     return (await session.execute(stmt)).scalar_one_or_none()
 
 

@@ -2,15 +2,31 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, MetaData, func
+from sqlalchemy import DateTime, MetaData, func, select
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 _PG_UNIQUE_VIOLATION_SQLSTATE = "23505"
+
+
+def normalize_utc(value: datetime) -> datetime:
+    """Normalize a datetime to timezone-aware UTC."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+async def get_database_now(session: AsyncSession) -> datetime:
+    """Return PostgreSQL's authoritative UTC transaction timestamp (`SELECT now()`)."""
+    db_now = await session.scalar(select(func.now()))
+    if not isinstance(db_now, datetime):
+        return datetime.now(UTC)
+    return normalize_utc(db_now)
 
 
 def is_unique_violation(exc: IntegrityError, *, constraint_name: str) -> bool:

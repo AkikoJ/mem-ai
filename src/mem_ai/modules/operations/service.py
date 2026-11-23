@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -69,3 +69,31 @@ async def get_operation_for_owner(
                 message="operation not found",
             )
         return OperationRecord.model_validate(row)
+
+
+async def transition_operation_in_session(
+    session: AsyncSession,
+    *,
+    operation_id: UUID,
+    status: OperationStatus,
+    progress: dict[str, Any] | None = None,
+    result_summary: dict[str, Any] | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    now: datetime | None = None,
+) -> OperationRecord | None:
+    """Conditionally advance a non-terminal operation inside caller's transaction."""
+    current_time = now if now is not None else datetime.now(UTC)
+    completed_at = current_time if status in ("succeeded", "failed") else None
+    updated = await repository.conditional_transition_operation(
+        session,
+        operation_id=operation_id,
+        new_status=status,
+        progress=progress,
+        result_summary=result_summary,
+        error_code=error_code,
+        error_message=error_message,
+        completed_at=completed_at,
+        updated_at=current_time,
+    )
+    return OperationRecord.model_validate(updated) if updated is not None else None

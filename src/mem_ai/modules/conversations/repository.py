@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
@@ -12,6 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from mem_ai.contracts.memory_provider import MemoryRecallItem
 from mem_ai.contracts.model_provider import ModelUsage
+from mem_ai.db.base import get_database_now as get_database_now
+from mem_ai.db.base import normalize_utc as normalize_utc
 from mem_ai.modules.conversations.models import (
     Conversation,
     Generation,
@@ -19,21 +21,6 @@ from mem_ai.modules.conversations.models import (
     MessageRecalledMemory,
 )
 from mem_ai.modules.conversations.schemas import MessageRole
-
-
-def normalize_utc(value: datetime) -> datetime:
-    """Normalize a datetime to timezone-aware UTC."""
-    if value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
-    return value.astimezone(UTC)
-
-
-async def get_database_now(session: AsyncSession) -> datetime:
-    """Return PostgreSQL's authoritative UTC transaction timestamp (`SELECT now()`)."""
-    db_now = await session.scalar(select(func.now()))
-    if not isinstance(db_now, datetime):
-        return datetime.now(UTC)
-    return normalize_utc(db_now)
 
 
 def _active_lease_conditions(

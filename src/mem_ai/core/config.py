@@ -246,6 +246,20 @@ class Settings(BaseSettings):
     chat_memory_context_max_chars: int = Field(default=2000, ge=0, le=32000)
     chat_prompt_max_chars: int = Field(default=24000, ge=256, le=200000)
 
+    # Background worker and durable job budgets
+    worker_concurrency: int = Field(default=4, ge=1, le=100)
+    worker_poll_interval_seconds: float = Field(default=1.0, gt=0.0, le=60.0)
+    worker_claim_batch_size: int = Field(default=10, ge=1, le=200)
+    worker_lease_ttl_seconds: int = Field(default=60, ge=5, le=600)
+    worker_lease_renew_interval_seconds: float = Field(default=20.0, gt=0.0, le=300.0)
+    worker_max_attempts: int = Field(default=5, ge=1, le=50)
+    worker_backoff_base_seconds: float = Field(default=2.0, gt=0.0, le=300.0)
+    worker_backoff_max_seconds: float = Field(default=300.0, gt=0.0, le=86400.0)
+    worker_backoff_jitter_ratio: float = Field(default=0.2, ge=0.0, le=1.0)
+    worker_reconcile_delay_seconds: float = Field(default=10.0, gt=0.0, le=3600.0)
+    worker_shutdown_grace_seconds: float = Field(default=15.0, gt=0.0, le=300.0)
+    job_attempt_retention_days: int = Field(default=30, ge=1, le=365)
+
     @model_validator(mode="after")
     def validate_production_boundaries(self) -> Settings:
         password = self.postgres_password.get_secret_value().strip()
@@ -341,6 +355,18 @@ class Settings(BaseSettings):
             raise ValueError(
                 "chat_lease_renew_interval_seconds must be strictly less than "
                 "chat_lease_ttl_seconds"
+            )
+
+        if self.worker_lease_renew_interval_seconds >= self.worker_lease_ttl_seconds:
+            raise ValueError(
+                "worker_lease_renew_interval_seconds must be strictly less than "
+                "worker_lease_ttl_seconds"
+            )
+
+        if self.worker_backoff_base_seconds > self.worker_backoff_max_seconds:
+            raise ValueError(
+                "worker_backoff_base_seconds must be less than or equal to "
+                "worker_backoff_max_seconds"
             )
 
         _validate_model_registry_entries(self.model_registry_entries)
