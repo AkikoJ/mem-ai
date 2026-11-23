@@ -41,6 +41,7 @@ from mem_ai.modules.operations.audit import (
     DeletionAuditArchiver,
     build_deletion_audit_archiver,
 )
+from mem_ai.modules.users.cleanup import JOB_TYPE_USER_DELETE, UserCleanupJobHandler
 from mem_ai.workers.runner import (
     JobHandlerRegistry,
     PeriodicJobSpec,
@@ -95,6 +96,10 @@ def build_worker_registry(
 ) -> JobHandlerRegistry:
     """Assemble typed Worker job handlers with unidirectional module dependencies."""
     registry = JobHandlerRegistry()
+    registry.register(
+        JOB_TYPE_USER_DELETE,
+        UserCleanupJobHandler(session_factory=session_factory, audit_archiver=audit_archiver),
+    )
     registry.register(
         JOB_TYPE_CONVERSATION_DELETE,
         ConversationCleanupJobHandler(

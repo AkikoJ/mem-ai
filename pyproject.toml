@@ -55,7 +55,7 @@ warn_unused_configs = true
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
-addopts = ["-ra", "--strict-markers"]
+addopts = ["-ra", "--strict-markers", "--import-mode=importlib"]
 markers = [
     "integration: tests that require a live PostgreSQL instance",
 ]

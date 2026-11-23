@@ -14,8 +14,18 @@ from mem_ai.contracts.model_provider import ModelProvider
 from mem_ai.contracts.persona_provider import PersonaProvider
 from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import ServiceUnavailableError
+from mem_ai.modules.operations.audit import DeletionAuditArchiver, NoopDeletionAuditArchiver
 
 _ProviderT = TypeVar("_ProviderT")
+_DEFAULT_DELETION_AUDIT_ARCHIVER = NoopDeletionAuditArchiver()
+
+
+def get_deletion_audit_archiver(request: Request) -> DeletionAuditArchiver:
+    """Return the assembled independent deletion audit sink shared by resource APIs."""
+    configured = getattr(request.app.state, "deletion_audit_archiver", None)
+    if isinstance(configured, DeletionAuditArchiver):
+        return configured
+    return _DEFAULT_DELETION_AUDIT_ARCHIVER
 
 
 def _require_provider(provider: _ProviderT | None, *, name: str) -> _ProviderT:  # noqa: UP047
@@ -82,3 +92,4 @@ ModelProviderDep = Annotated[ModelProvider, Depends(get_model_provider)]
 MemoryProviderDep = Annotated[MemoryProvider, Depends(get_memory_provider)]
 OptionalMemoryProviderDep = Annotated[MemoryProvider | None, Depends(get_optional_memory_provider)]
 PersonaProviderDep = Annotated[PersonaProvider, Depends(get_persona_provider)]
+DeletionAuditArchiverDep = Annotated[DeletionAuditArchiver, Depends(get_deletion_audit_archiver)]

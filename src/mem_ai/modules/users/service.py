@@ -129,6 +129,9 @@ async def set_user_status(
 ) -> UserRecord:
     """Transition a local user's lifecycle status in a short transaction."""
     async with session_factory.begin() as session:
+        existing = await repository.get_user_by_id(session, user_id=user_id, for_update=True)
+        if existing is not None and existing.status == "deleting" and status != "deleting":
+            raise ConflictError(code="user_deleting", message="user deletion cannot be reversed")
         updated = await repository.update_user_status(
             session,
             user_id=user_id,

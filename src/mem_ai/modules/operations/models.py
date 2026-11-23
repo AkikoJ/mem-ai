@@ -25,8 +25,20 @@ class Operation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "status IN ('pending', 'running', 'reconciling', 'succeeded', 'failed')",
             name="status_valid",
         ),
+        CheckConstraint(
+            "deletion_receipt_digest IS NULL OR "
+            "(operation_type = 'user_delete' AND expires_at IS NOT NULL "
+            "AND length(deletion_receipt_digest) = 64)",
+            name="deletion_receipt_binding_valid",
+        ),
         Index("ix_operations_owner_id_created_at", "owner_id", "created_at"),
         Index("ix_operations_status_updated_at", "status", "updated_at"),
+        Index(
+            "uq_operations_user_delete_owner",
+            "owner_id",
+            unique=True,
+            postgresql_where=text("operation_type = 'user_delete' AND owner_id IS NOT NULL"),
+        ),
     )
 
     owner_id: Mapped[UUID | None] = mapped_column(
@@ -62,5 +74,9 @@ class Operation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
     error_message: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    deletion_receipt_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    deletion_receipt_revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

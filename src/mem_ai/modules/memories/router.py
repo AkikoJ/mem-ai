@@ -8,7 +8,15 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Path, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 
-from mem_ai.api.dependencies import MemoryProviderDep, SessionFactoryDep, SettingsDep
+from mem_ai.api.dependencies import (
+    DeletionAuditArchiverDep,
+    MemoryProviderDep,
+    SessionFactoryDep,
+    SettingsDep,
+)
+from mem_ai.api.dependencies import (
+    get_deletion_audit_archiver as get_deletion_audit_archiver,
+)
 from mem_ai.api.pagination import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, PaginatedResponse
 from mem_ai.api.responses import ApiResponse, ok_response
 from mem_ai.contracts.memory_provider import MemoryScope
@@ -27,14 +35,12 @@ from mem_ai.modules.memories.service import (
     NoopRecalledMemoryReferenceMarker,
     RecalledMemoryReferenceMarker,
 )
-from mem_ai.modules.operations.audit import DeletionAuditArchiver, NoopDeletionAuditArchiver
 from mem_ai.modules.operations.schemas import OperationAcceptedResponse
 
 router = APIRouter(prefix="/memories", tags=["memories"])
 
 _DEFAULT_CONVERSATION_ACCESS_CHECKER = DefaultConversationAccessChecker()
 _DEFAULT_RECALLED_MEMORY_MARKER = NoopRecalledMemoryReferenceMarker()
-_DEFAULT_DELETION_AUDIT_ARCHIVER = NoopDeletionAuditArchiver()
 
 
 def get_conversation_access_checker(request: Request) -> ConversationAccessChecker:
@@ -53,14 +59,6 @@ def get_recalled_memory_marker(request: Request) -> RecalledMemoryReferenceMarke
     return _DEFAULT_RECALLED_MEMORY_MARKER
 
 
-def get_deletion_audit_archiver(request: Request) -> DeletionAuditArchiver:
-    """Return the assembled independent deletion audit archiver (overridable in tests)."""
-    configured = getattr(request.app.state, "deletion_audit_archiver", None)
-    if isinstance(configured, DeletionAuditArchiver):
-        return configured
-    return _DEFAULT_DELETION_AUDIT_ARCHIVER
-
-
 ConversationAccessCheckerDep = Annotated[
     ConversationAccessChecker,
     Depends(get_conversation_access_checker),
@@ -68,10 +66,6 @@ ConversationAccessCheckerDep = Annotated[
 RecalledMemoryMarkerDep = Annotated[
     RecalledMemoryReferenceMarker,
     Depends(get_recalled_memory_marker),
-]
-DeletionAuditArchiverDep = Annotated[
-    DeletionAuditArchiver,
-    Depends(get_deletion_audit_archiver),
 ]
 MemoryIdPath = Annotated[str, Path(alias="memoryId", min_length=1, max_length=255)]
 

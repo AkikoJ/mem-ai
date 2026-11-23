@@ -12,8 +12,23 @@ from uuid import UUID, uuid4
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mem_ai.core.exceptions import ConflictError, NotFoundError
-from mem_ai.core.logging import sanitize_log_value
 from mem_ai.modules.jobs import repository
+from mem_ai.modules.jobs.cleanup import _sanitize_summary_dict
+from mem_ai.modules.jobs.cleanup import (
+    cleanup_user_jobs_in_session as cleanup_user_jobs_in_session,
+)
+from mem_ai.modules.jobs.cleanup import (
+    has_user_jobs_in_session as has_user_jobs_in_session,
+)
+from mem_ai.modules.jobs.cleanup import (
+    list_user_job_metadata_values_in_session as list_user_job_metadata_values_in_session,
+)
+from mem_ai.modules.jobs.cleanup import (
+    list_user_jobs_in_session as list_user_jobs_in_session,
+)
+from mem_ai.modules.jobs.cleanup import (
+    patch_job_metadata_in_session as patch_job_metadata_in_session,
+)
 from mem_ai.modules.jobs.models import Job
 from mem_ai.modules.jobs.schemas import (
     ClaimedJob,
@@ -42,11 +57,6 @@ def _sanitize_error_summary(summary: str | None) -> str | None:
     if not cleaned:
         return None
     return cleaned[:_MAX_ERROR_SUMMARY_CHARS]
-
-
-def _sanitize_summary_dict(summary: dict[str, Any]) -> dict[str, Any]:
-    sanitized = sanitize_log_value(None, summary)
-    return sanitized if isinstance(sanitized, dict) else {}
 
 
 def _merge_sanitized_metadata(
@@ -605,29 +615,6 @@ async def requeue_failed_job(
     return record
 
 
-async def list_user_jobs_in_session(
-    session: AsyncSession,
-    *,
-    user_id: UUID,
-    job_types: Sequence[str],
-    statuses: Sequence[str],
-    for_update: bool = False,
-    metadata_match: dict[str, Any] | None = None,
-    limit: int | None = None,
-) -> list[JobRecord]:
-    """List user jobs matching `job_types` and `statuses` inside the caller's transaction."""
-    rows = await repository.list_jobs_for_user_and_types(
-        session,
-        user_id=user_id,
-        job_types=job_types,
-        statuses=statuses,
-        for_update=for_update,
-        metadata_match=metadata_match,
-        limit=limit,
-    )
-    return [JobRecord.model_validate(row) for row in rows]
-
-
 async def cancel_matching_jobs_in_session(
     session: AsyncSession,
     *,
@@ -640,6 +627,8 @@ async def cancel_matching_jobs_in_session(
     metadata_patch: dict[str, Any] | None = None,
     now: datetime | None = None,
     metadata_match: dict[str, Any] | None = None,
+    metadata_exclude: dict[str, Any] | None = None,
+    job_ids: Sequence[UUID] | None = None,
     limit: int | None = None,
     skip_locked: bool = False,
 ) -> list[JobRecord]:
@@ -653,6 +642,8 @@ async def cancel_matching_jobs_in_session(
         statuses=allowed_statuses,
         for_update=True,
         metadata_match=metadata_match,
+        metadata_exclude=metadata_exclude,
+        job_ids=job_ids,
         limit=limit,
         skip_locked=skip_locked,
     )
@@ -695,6 +686,12 @@ async def update_reconciling_job_in_session(
     current_time = await _resolve_current_time(session, now)
     existing = await repository.get_job_by_id(session, job_id=job_id, for_update=True)
     if existing is None or existing.status not in allowed_statuses:
+        return None
+    if (
+        existing.status == "running"
+        and existing.lease_expires_at is not None
+        and existing.lease_expires_at > current_time
+    ):
         return None
     merged_metadata = _merge_sanitized_metadata(existing.metadata_json, metadata_patch)
     next_run = (

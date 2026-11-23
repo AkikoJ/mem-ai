@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, column, func, or_, select, table, update
+from sqlalchemy import and_, column, delete, func, or_, select, table, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -180,6 +180,10 @@ async def list_jobs_for_user_and_types(
     statuses: Sequence[str],
     for_update: bool = False,
     metadata_match: dict[str, Any] | None = None,
+    metadata_exclude: dict[str, Any] | None = None,
+    job_ids: Sequence[UUID] | None = None,
+    after_job_id: UUID | None = None,
+    order_by_job_id: bool = False,
     limit: int | None = None,
     skip_locked: bool = False,
 ) -> list[Job]:
@@ -197,11 +201,86 @@ async def list_jobs_for_user_and_types(
     )
     if metadata_match:
         stmt = stmt.where(Job.metadata_json.contains(metadata_match))
+    if metadata_exclude:
+        stmt = stmt.where(~Job.metadata_json.contains(metadata_exclude))
+    if job_ids is not None:
+        stmt = stmt.where(Job.id.in_(tuple(job_ids)))
+    if order_by_job_id:
+        stmt = stmt.order_by(None).order_by(Job.id.asc())
+    if after_job_id is not None:
+        stmt = stmt.where(Job.id > after_job_id)
     if limit is not None:
         stmt = stmt.limit(limit)
     if for_update:
         stmt = stmt.with_for_update(skip_locked=skip_locked)
     return list((await session.execute(stmt)).scalars().all())
+
+
+async def list_user_job_metadata_values(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    job_types: Sequence[str],
+    field: str,
+) -> list[str]:
+    """Project distinct nonempty string metadata values without loading historical jobs."""
+    value = Job.metadata_json[field].as_string()
+    stmt = (
+        select(value)
+        .where(
+            Job.user_id == user_id,
+            Job.job_type.in_(tuple(job_types)),
+            func.jsonb_typeof(Job.metadata_json[field]) == "string",
+            value != "",
+        )
+        .distinct()
+        .order_by(value)
+    )
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def has_user_jobs(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    job_types: Sequence[str],
+    statuses: Sequence[str],
+    metadata_match: dict[str, Any] | None = None,
+    metadata_exclude: dict[str, Any] | None = None,
+    active_lease_at: datetime | None = None,
+) -> bool:
+    """Check for matching jobs in SQL, including rows skipped by a bounded locked batch."""
+    stmt = select(Job.id).where(
+        Job.user_id == user_id,
+        Job.job_type.in_(tuple(job_types)),
+        Job.status.in_(tuple(statuses)),
+    )
+    if metadata_match:
+        stmt = stmt.where(Job.metadata_json.contains(metadata_match))
+    if metadata_exclude:
+        stmt = stmt.where(~Job.metadata_json.contains(metadata_exclude))
+    if active_lease_at is not None:
+        stmt = stmt.where(Job.status == "running", Job.lease_expires_at > active_lease_at)
+    return bool(await session.scalar(select(stmt.exists())))
+
+
+async def patch_job_metadata(
+    session: AsyncSession,
+    *,
+    job_id: UUID,
+    metadata_patch: dict[str, Any],
+    current_time: datetime,
+) -> None:
+    """Merge metadata without changing the execution status or lease of the locked job."""
+    await session.execute(
+        update(Job)
+        .where(Job.id == job_id)
+        .values(
+            metadata_json=Job.metadata_json.concat(metadata_patch),
+            updated_at=current_time,
+        )
+        .execution_options(synchronize_session=False)
+    )
 
 
 async def conditional_transition_job_by_status(
@@ -620,3 +699,35 @@ async def get_job_status_aggregates(
     }
     oldest_due = (await session.execute(due_stmt)).scalar_one_or_none()
     return counts, normalize_utc(oldest_due) if oldest_due is not None else None
+
+
+async def delete_terminal_user_job_batch(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    exclude_job_id: UUID,
+    batch_size: int,
+    current_time: datetime,
+) -> bool:
+    """Delete a bounded terminal batch, leaving live or unexpired leased jobs intact."""
+    owned_jobs = (Job.user_id == user_id, Job.id != exclude_job_id)
+    batch = (
+        select(Job.id)
+        .where(
+            *owned_jobs,
+            Job.status.in_(("succeeded", "failed", "cancelled")),
+            or_(
+                and_(Job.lease_token.is_(None), Job.lease_expires_at.is_(None)),
+                Job.lease_expires_at <= current_time,
+            ),
+        )
+        .order_by(Job.created_at.asc(), Job.id.asc())
+        .limit(max(1, min(100, batch_size)))
+        .with_for_update(skip_locked=True)
+    )
+    job_ids = list((await session.execute(batch)).scalars().all())
+    if job_ids:
+        # Attempts cascade with their job; operation references independently become NULL.
+        await session.execute(delete(Job).where(Job.id.in_(job_ids)))
+    remaining = select(Job.id).where(*owned_jobs).limit(1)
+    return (await session.execute(remaining)).scalar_one_or_none() is None

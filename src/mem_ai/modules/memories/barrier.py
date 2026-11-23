@@ -352,6 +352,7 @@ async def cancel_queued_and_list_unsettled_writes_in_session(
     max_epoch: int,
     cancel_summary: str,
     now: datetime,
+    include_live_leases: bool = False,
 ) -> tuple[list[JobRecord], list[JobRecord]]:
     """Cancel queued old-epoch write jobs and return `(cancelled_queued, unsettled_inflight)`."""
     cancelled_queued = await jobs_service.cancel_matching_jobs_in_session(
@@ -376,8 +377,18 @@ async def cancel_queued_and_list_unsettled_writes_in_session(
         job
         for job in active_writes
         if is_old_epoch_write_job(job, provider_id=provider_id, max_epoch=max_epoch)
-        and not is_write_job_settled_for_clear(job)
-        and not is_write_job_already_audited_for_clear(job)
+        and (
+            (
+                include_live_leases
+                and job.status == "running"
+                and job.lease_expires_at is not None
+                and job.lease_expires_at > now
+            )
+            or (
+                not is_write_job_settled_for_clear(job)
+                and not is_write_job_already_audited_for_clear(job)
+            )
+        )
     ]
     return cancelled_queued, unsettled
 
@@ -489,6 +500,7 @@ async def finalize_clear_barrier_in_session(
     recalled_memory_marker: RecalledMemoryReferenceMarker | None = None,
     unsettled_audit_job_ids: tuple[UUID, ...] = (),
     compensation_executed: bool = False,
+    defer_user_cleanup: bool = False,
     now: datetime | None = None,
 ) -> OperationRecord | None:
     """Atomically release barrier, verify tombstone, supersede old writes, and succeed op."""
@@ -512,62 +524,67 @@ async def finalize_clear_barrier_in_session(
             now=current_time,
         )
 
-    cancelled_settled = await jobs_service.cancel_matching_jobs_in_session(
-        session,
-        user_id=user_id,
-        job_types=WRITE_JOB_TYPES,
-        allowed_statuses=("pending", "retry_wait", "reconciling", "running"),
-        predicate=lambda job: (
-            is_old_epoch_write_job(job, provider_id=provider_id, max_epoch=previous_epoch)
-            and (job.status in ("pending", "retry_wait") or is_write_job_settled_for_clear(job))
-        ),
-        error_code="memory_scope_cleared",
-        error_summary="memory write superseded by completed scope clear",
-        metadata_patch={"superseded_by_clear_operation_id": str(operation_id)},
-        now=current_time,
-    )
-    for cancelled_job in cancelled_settled:
-        await fail_superseded_explicit_operation_in_session(
+    # User deletion settles prior jobs and drops local memory state in bounded
+    # owner-controlled phases after this remote confirmation commits.
+    if not defer_user_cleanup:
+        cancelled_settled = await jobs_service.cancel_matching_jobs_in_session(
             session,
-            job=cancelled_job,
+            user_id=user_id,
+            job_types=WRITE_JOB_TYPES,
+            allowed_statuses=("pending", "retry_wait", "reconciling", "running"),
+            predicate=lambda job: (
+                is_old_epoch_write_job(job, provider_id=provider_id, max_epoch=previous_epoch)
+                and (job.status in ("pending", "retry_wait") or is_write_job_settled_for_clear(job))
+            ),
+            error_code="memory_scope_cleared",
+            error_summary="memory write superseded by completed scope clear",
+            metadata_patch={"superseded_by_clear_operation_id": str(operation_id)},
+            now=current_time,
+        )
+        for cancelled_job in cancelled_settled:
+            await fail_superseded_explicit_operation_in_session(
+                session,
+                job=cancelled_job,
+                provider_id=provider_id,
+                clear_operation_id=operation_id,
+                error_message="memory scope was cleared while creation was in flight",
+                now=current_time,
+            )
+
+        for job_id in unsettled_audit_job_ids:
+            await jobs_service.update_reconciling_job_in_session(
+                session,
+                job_id=job_id,
+                allowed_statuses=("reconciling", "running"),
+                error_code="memory_inflight_settle_timeout",
+                error_summary=(
+                    "old-epoch write exceeded settle timeout; retained for audit after clear"
+                ),
+                metadata_patch={
+                    "superseded_by_clear_operation_id": str(operation_id),
+                    "clear_settle_timeout_alerted": True,
+                },
+                defer_next_run_seconds=AUDIT_RECONCILING_DEFER_SECONDS,
+                now=current_time,
+            )
+
+        marker = (
+            recalled_memory_marker
+            if recalled_memory_marker is not None
+            else NoopRecalledMemoryReferenceMarker()
+        )
+        await marker.mark_user_memories_deleted_in_session(
+            session,
+            owner_id=user_id,
             provider_id=provider_id,
-            clear_operation_id=operation_id,
-            error_message="memory scope was cleared while creation was in flight",
-            now=current_time,
+            max_memory_epoch=previous_epoch,
+            deleted_at=current_time,
         )
-
-    for job_id in unsettled_audit_job_ids:
-        await jobs_service.update_reconciling_job_in_session(
+        await repository.delete_list_snapshots_for_scope(
             session,
-            job_id=job_id,
-            allowed_statuses=("reconciling", "running"),
-            error_code="memory_inflight_settle_timeout",
-            error_summary="old-epoch write exceeded settle timeout; retained for audit after clear",
-            metadata_patch={
-                "superseded_by_clear_operation_id": str(operation_id),
-                "clear_settle_timeout_alerted": True,
-            },
-            defer_next_run_seconds=AUDIT_RECONCILING_DEFER_SECONDS,
-            now=current_time,
+            user_id=user_id,
+            provider_id=provider_id,
         )
-
-    marker = (
-        recalled_memory_marker
-        if recalled_memory_marker is not None
-        else NoopRecalledMemoryReferenceMarker()
-    )
-    await marker.mark_user_memories_deleted_in_session(
-        session,
-        owner_id=user_id,
-        provider_id=provider_id,
-        max_memory_epoch=previous_epoch,
-        deleted_at=current_time,
-    )
-    await repository.delete_list_snapshots_for_scope(
-        session,
-        user_id=user_id,
-        provider_id=provider_id,
-    )
 
     result_summary: dict[str, Any] = {
         "provider_id": provider_id,

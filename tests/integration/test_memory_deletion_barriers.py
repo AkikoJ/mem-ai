@@ -57,7 +57,7 @@ from mem_ai.modules.operations.audit import JsonlDeletionAuditArchiver
 from mem_ai.modules.personas.provider import LocalPersonaProvider
 from mem_ai.modules.users import service as users_service
 from mem_ai.workers.main import build_worker_registry
-from mem_ai.workers.runner import WorkerConfig, WorkerRunner
+from mem_ai.workers.runner import JobHandlerRegistry, WorkerConfig, WorkerRunner
 from tests.conftest import FakeModelProvider
 
 
@@ -273,6 +273,7 @@ def _make_worker(
     compensation_delay_seconds: float = 30.0,
     audit_archiver: JsonlDeletionAuditArchiver | None = None,
     clock: Any = None,
+    job_types: tuple[str, ...] | None = None,
 ) -> WorkerRunner:
     registry = build_worker_registry(
         session_factory,
@@ -282,6 +283,13 @@ def _make_worker(
         audit_archiver=audit_archiver,
         clock=clock,
     )
+    if job_types is not None:
+        filtered_registry = JobHandlerRegistry()
+        for job_type in job_types:
+            handler = registry.get(job_type)
+            assert handler is not None
+            filtered_registry.register(job_type, handler)
+        registry = filtered_registry
     return WorkerRunner(
         session_factory=session_factory,
         registry=registry,
@@ -751,8 +759,12 @@ async def test_clear_verifies_lost_response_write_and_handles_no_verify_settle_t
         assert isinstance(clear_a, AcceptedMemoryDeletionOutcome)
 
         now_ref_a = [t0 + timedelta(seconds=1)]
+        # Only clear polls here so concurrent write polling cannot consume scripted responses.
         worker_a = _make_worker(
-            session_factory, memory_provider=provider_a, clock=lambda: now_ref_a[0]
+            session_factory,
+            memory_provider=provider_a,
+            clock=lambda: now_ref_a[0],
+            job_types=(JOB_TYPE_MEMORY_CLEAR,),
         )
         # Poll 1: verify_operation returns reconciling -> barrier stays reconciling, clear NOT run.
         await worker_a.run_once(now=now_ref_a[0])
@@ -761,6 +773,7 @@ async def test_clear_verifies_lost_response_write_and_handles_no_verify_settle_t
         )
         assert op_a1.status == "reconciling"
         assert provider_a.clears == []
+        assert provider_a.verifies == [(user_a, provider_a.writes[0].write_id)]
 
         # Poll 2: verify_operation returns succeeded (settling the lost-response write) ->
         # subsequent clear cycle runs final clear & releases barrier!
@@ -774,6 +787,7 @@ async def test_clear_verifies_lost_response_write_and_handles_no_verify_settle_t
         assert op_a2.status == "succeeded"
         assert len(provider_a.clears) == 1
         assert provider_a.records == {}
+        assert provider_a.verifies == [(user_a, provider_a.writes[0].write_id)] * 2
 
         # Scenario B: Provider WITHOUT per-write status verification reaches
         # `memory_inflight_settle_timeout`, logs reconciling alert, runs first clear + delayed

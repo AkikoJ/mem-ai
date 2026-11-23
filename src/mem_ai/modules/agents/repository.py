@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, func, select, tuple_, update
+from sqlalchemy import and_, delete, exists, func, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from mem_ai.modules.agents.models import Agent, PersonaVersion
@@ -341,3 +341,35 @@ async def conditional_retire_agent(
         .returning(Agent)
     )
     return await session.scalar(stmt, execution_options={"populate_existing": True})
+
+
+async def delete_user_agent_batch(
+    session: AsyncSession, *, owner_id: UUID, batch_size: int
+) -> bool:
+    """Remove one bounded version batch and its empty Agent; return whether none remain."""
+    agent = await session.scalar(
+        select(Agent)
+        .where(Agent.owner_id == owner_id)
+        .order_by(Agent.id)
+        .limit(1)
+        .with_for_update()
+    )
+    if agent is None:
+        return True
+    # The published pointer is a restrictive composite FK back into persona_versions.
+    agent.current_published_version_id = None
+    await session.flush()
+    version_ids = list(
+        await session.scalars(
+            select(PersonaVersion.id)
+            .where(PersonaVersion.agent_id == agent.id)
+            .order_by(PersonaVersion.id)
+            .limit(max(1, min(100, batch_size)))
+        )
+    )
+    if version_ids:
+        await session.execute(delete(PersonaVersion).where(PersonaVersion.id.in_(version_ids)))
+    if not await session.scalar(select(exists().where(PersonaVersion.agent_id == agent.id))):
+        await session.delete(agent)
+        await session.flush()
+    return not bool(await session.scalar(select(exists().where(Agent.owner_id == owner_id))))

@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from mem_ai.modules.operations.models import Operation
@@ -149,3 +149,80 @@ async def conditional_transition_operation(
         .execution_options(populate_existing=True)
     )
     return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def set_deletion_receipt(
+    session: AsyncSession,
+    *,
+    operation_id: UUID,
+    digest: str,
+) -> None:
+    """Bind a protected receipt digest without exposing it in application DTOs."""
+    await session.execute(
+        update(Operation)
+        .where(Operation.id == operation_id, Operation.operation_type == "user_delete")
+        .values(deletion_receipt_digest=digest)
+    )
+
+
+async def revoke_deletion_receipt(
+    session: AsyncSession, *, operation_id: UUID, revoked_at: datetime
+) -> bool:
+    """Permanently revoke a user deletion receipt inside the caller's transaction."""
+    changed = await session.scalar(
+        update(Operation)
+        .where(
+            Operation.id == operation_id,
+            Operation.operation_type == "user_delete",
+            Operation.deletion_receipt_revoked_at.is_(None),
+        )
+        .values(deletion_receipt_revoked_at=revoked_at)
+        .returning(Operation.id)
+    )
+    return changed is not None
+
+
+async def finalize_user_operations(
+    session: AsyncSession, *, owner_id: UUID, deletion_operation_id: UUID, batch_size: int = 50
+) -> bool:
+    """Remove settled business operation payloads, preserving the minimal deletion receipt."""
+    deletion = await get_operation_by_id(
+        session, operation_id=deletion_operation_id, for_update=True
+    )
+    if (
+        deletion is None
+        or deletion.owner_id != owner_id
+        or deletion.operation_type != "user_delete"
+    ):
+        return False
+    other_operations = (
+        Operation.owner_id == owner_id,
+        Operation.id != deletion_operation_id,
+    )
+    unsettled = await session.scalar(
+        select(Operation.id)
+        .where(*other_operations, Operation.status.not_in(("succeeded", "failed")))
+        .limit(1)
+    )
+    if unsettled is not None:
+        return False
+    batch = list(
+        await session.scalars(
+            select(Operation.id)
+            .where(*other_operations)
+            .order_by(Operation.id)
+            .limit(max(1, min(100, batch_size)))
+            .with_for_update(skip_locked=True)
+        )
+    )
+    if batch:
+        await session.execute(delete(Operation).where(Operation.id.in_(batch)))
+    remaining = await session.scalar(select(Operation.id).where(*other_operations).limit(1))
+    if remaining is not None:
+        return False
+    deletion.target_id = None
+    deletion.result_summary = {}
+    deletion.error_code = None
+    deletion.error_message = None
+    await session.flush()
+    return True

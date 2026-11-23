@@ -40,6 +40,7 @@ from mem_ai.modules.memories.clear_jobs import (
 from mem_ai.modules.memories.deletions import (
     MemoryDeleteJobHandler as MemoryDeleteJobHandler,
 )
+from mem_ai.modules.memories.user_cleanup import defer_write_to_user_cleanup
 from mem_ai.modules.operations import service as operations_service
 from mem_ai.modules.users import service as users_service
 
@@ -308,6 +309,11 @@ class TurnMemoryWriteJobHandler:
         self._turn_loader = turn_loader
 
     async def handle(self, ctx: JobExecutionContext) -> JobHandlerOutcome:
+        return await defer_write_to_user_cleanup(
+            self._session_factory, job=ctx.job, outcome=await self._handle(ctx)
+        )
+
+    async def _handle(self, ctx: JobExecutionContext) -> JobHandlerOutcome:
         """Dispatch or verify one durable `memory_turn_write` attempt."""
         raw_meta = dict(ctx.job.metadata_json)
         if "generation_id" not in raw_meta and ctx.job.business_id is not None:
@@ -647,6 +653,11 @@ class ExplicitMemoryReconcileJobHandler:
         self._turn_loader = turn_loader
 
     async def handle(self, ctx: JobExecutionContext) -> JobHandlerOutcome:
+        return await defer_write_to_user_cleanup(
+            self._session_factory, job=ctx.job, outcome=await self._handle(ctx)
+        )
+
+    async def _handle(self, ctx: JobExecutionContext) -> JobHandlerOutcome:
         """Verify an async or uncertain explicit memory write with atomic operation transition."""
         try:
             meta = ExplicitMemoryJobMetadata.model_validate(ctx.job.metadata_json)

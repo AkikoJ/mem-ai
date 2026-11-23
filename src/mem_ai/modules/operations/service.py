@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import hashlib
+import hmac
+import re
+import secrets
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from mem_ai.core.exceptions import NotFoundError
+from mem_ai.core.config import Settings
+from mem_ai.core.exceptions import NotFoundError, UnauthorizedError
+from mem_ai.db.base import normalize_utc
 from mem_ai.modules.operations import repository
-from mem_ai.modules.operations.schemas import OperationRecord, OperationStatus
+from mem_ai.modules.operations.schemas import (
+    DeletionReceiptResponse,
+    OperationRecord,
+    OperationStatus,
+)
 from mem_ai.modules.users import service as users_service
 
 # Explicit Engineering Design §11.3.1 state machine for `operations.status`.
@@ -21,6 +31,107 @@ ALLOWED_OPERATION_TRANSITIONS: dict[OperationStatus, frozenset[OperationStatus]]
     "succeeded": frozenset(),
     "failed": frozenset(),
 }
+_RECEIPT_PATTERN = re.compile(r"[A-Za-z0-9_-]{43}\Z")
+
+
+def _receipt_digest(*, settings: Settings, operation_id: UUID, receipt: str) -> str:
+    return hmac.new(
+        settings.deletion_receipt_signing_key(),
+        f"user_delete:{operation_id}:{receipt}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+async def create_user_deletion_operation_in_session(
+    session: AsyncSession,
+    *,
+    owner_id: UUID,
+    settings: Settings,
+    now: datetime | None = None,
+) -> tuple[OperationRecord, DeletionReceiptResponse]:
+    """Accept one deletion with a one-time receipt in the caller's user-lock transaction."""
+    current_time = normalize_utc(now) if now is not None else datetime.now(UTC)
+    expires_at = current_time + timedelta(seconds=settings.deletion_receipt_ttl_seconds)
+    receipt = secrets.token_urlsafe(32)
+    record = await create_operation_in_session(
+        session,
+        owner_id=owner_id,
+        operation_type="user_delete",
+        status="pending",
+        target_type="user",
+        target_id=str(owner_id),
+        progress={"local_complete": False, "remote_complete": False},
+        expires_at=expires_at,
+    )
+    await repository.set_deletion_receipt(
+        session,
+        operation_id=record.id,
+        digest=_receipt_digest(settings=settings, operation_id=record.id, receipt=receipt),
+    )
+    return record, DeletionReceiptResponse(
+        operation_id=record.id,
+        status=record.status,
+        status_url=record.status_url,
+        deletion_receipt=receipt,
+        expires_at=expires_at,
+    )
+
+
+async def get_operation_for_deletion_receipt(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    operation_id: UUID,
+    receipt: str,
+    settings: Settings,
+    now: datetime | None = None,
+) -> OperationRecord:
+    """Authenticate a single operation-scoped receipt after the business user is disabled."""
+    if _RECEIPT_PATTERN.fullmatch(receipt) is None:
+        raise UnauthorizedError(code="invalid_deletion_receipt", message="invalid deletion receipt")
+    current_time = normalize_utc(now) if now is not None else datetime.now(UTC)
+    async with session_factory() as session:
+        row = await repository.get_operation_by_id(session, operation_id=operation_id)
+        expected_digest = row.deletion_receipt_digest if row is not None else None
+        matches = hmac.compare_digest(
+            expected_digest or "0" * 64,
+            _receipt_digest(settings=settings, operation_id=operation_id, receipt=receipt),
+        )
+        if (
+            row is None
+            or row.operation_type != "user_delete"
+            or expected_digest is None
+            or not matches
+            or row.expires_at is None
+            or normalize_utc(row.expires_at) <= current_time
+            or row.deletion_receipt_revoked_at is not None
+        ):
+            raise UnauthorizedError(
+                code="invalid_deletion_receipt", message="invalid deletion receipt"
+            )
+        return OperationRecord.model_validate(row)
+
+
+async def revoke_user_deletion_receipt_in_session(
+    session: AsyncSession, *, operation_id: UUID, now: datetime | None = None
+) -> bool:
+    """Revoke receipt access without changing the ongoing deletion lifecycle."""
+    return await repository.revoke_deletion_receipt(
+        session,
+        operation_id=operation_id,
+        revoked_at=normalize_utc(now) if now is not None else datetime.now(UTC),
+    )
+
+
+async def finalize_user_operations_in_session(
+    session: AsyncSession, *, owner_id: UUID, deletion_operation_id: UUID, batch_size: int = 50
+) -> bool:
+    """Join outstanding child operations and remove their settled business payloads."""
+    return await repository.finalize_user_operations(
+        session,
+        owner_id=owner_id,
+        deletion_operation_id=deletion_operation_id,
+        batch_size=batch_size,
+    )
 
 
 def is_valid_operation_transition(current: OperationStatus, target: OperationStatus) -> bool:

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from mem_ai.modules.users.models import User, UserIdentity
@@ -17,10 +17,13 @@ async def get_user_by_id(
     *,
     user_id: UUID,
     for_share: bool = False,
+    for_update: bool = False,
 ) -> User | None:
-    """Fetch a local user row by primary key, optionally acquiring a `FOR SHARE` row lock."""
+    """Fetch a local user row with an optional shared or exclusive transaction lock."""
     stmt = select(User).where(User.id == user_id)
-    if for_share:
+    if for_update:
+        stmt = stmt.with_for_update()
+    elif for_share:
         stmt = stmt.with_for_update(read=True)
     return await session.scalar(stmt)
 
@@ -73,7 +76,7 @@ async def update_user_status(
     deleted_at: datetime | None = None,
 ) -> User | None:
     """Update a user's lifecycle status within the caller's session."""
-    user = await get_user_by_id(session, user_id=user_id)
+    user = await get_user_by_id(session, user_id=user_id, for_update=True)
     if user is None:
         return None
     user.status = status
@@ -82,3 +85,13 @@ async def update_user_status(
     await session.flush()
     await session.refresh(user)
     return user
+
+
+async def delete_user_and_identities(session: AsyncSession, *, user_id: UUID) -> None:
+    """Remove the deleting root last, after resource owners have confirmed cleanup."""
+    await session.execute(delete(UserIdentity).where(UserIdentity.user_id == user_id))
+    removed = await session.scalar(
+        delete(User).where(User.id == user_id, User.status == "deleting").returning(User.id)
+    )
+    if removed is None:
+        raise RuntimeError("user cleanup lost its deleting root")

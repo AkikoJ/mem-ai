@@ -214,6 +214,10 @@ class Settings(BaseSettings):
     auth_gateway_actor_header: str = Field(default="X-Auth-Actor-Id", min_length=1)
     auth_gateway_permissions_header: str = Field(default="X-Auth-Permissions", min_length=1)
 
+    # Account deletion receipts; HMAC keys must remain stable throughout receipt retention.
+    deletion_receipt_secret: SecretStr | None = None
+    deletion_receipt_ttl_seconds: int = Field(default=2592000, ge=60, le=31536000)
+
     # Memory provider (MemOS Cloud)
     memory_provider_mode: MemoryProviderMode = "disabled"
     memos_base_url: str = Field(
@@ -273,6 +277,15 @@ class Settings(BaseSettings):
             raise ValueError("postgres_password must not be empty")
 
         is_production = self.app_env == "production"
+
+        if self.deletion_receipt_secret is not None:
+            receipt_secret = self.deletion_receipt_secret.get_secret_value().strip()
+            if not receipt_secret:
+                raise ValueError("deletion_receipt_secret must not be blank when set")
+            if is_production and len(receipt_secret) < _MIN_PRODUCTION_SECRET_LENGTH:
+                raise ValueError(
+                    "deletion_receipt_secret must be at least 32 characters in production"
+                )
 
         # Validate CIDR / IP syntax for any configured trusted proxy entries.
         parsed_proxies: list[ProxyNetwork] = []
@@ -395,6 +408,17 @@ class Settings(BaseSettings):
         return tuple(
             ipaddress.ip_network(entry.strip(), strict=False) for entry in self.auth_trusted_proxies
         )
+
+    def deletion_receipt_signing_key(self) -> bytes:
+        """Use an independent key when configured, otherwise the active stable server secret."""
+        secret = self.deletion_receipt_secret
+        if secret is None and self.auth_mode == "jwt_hs256":
+            secret = self.auth_jwt_hs256_secret
+        if secret is None and self.auth_mode == "trusted_gateway":
+            secret = self.auth_gateway_shared_secret
+        if secret is None:
+            secret = self.postgres_password
+        return secret.get_secret_value().encode("utf-8")
 
     def gateway_headers(self) -> GatewayHeaders:
         """Return the configured trusted-gateway header bundle."""

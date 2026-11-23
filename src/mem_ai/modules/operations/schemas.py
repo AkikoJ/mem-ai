@@ -69,6 +69,13 @@ class OperationAcceptedResponse(BaseModel):
         )
 
 
+class DeletionReceiptResponse(OperationAcceptedResponse):
+    """One-time receipt returned when accepting account deletion; never persisted verbatim."""
+
+    deletion_receipt: str = Field(serialization_alias="deletionReceipt", repr=False)
+    expires_at: datetime = Field(serialization_alias="expiresAt")
+
+
 class OperationResponse(BaseModel):
     """Detailed operation status payload returned by `GET /v1/operations/{operationId}`."""
 

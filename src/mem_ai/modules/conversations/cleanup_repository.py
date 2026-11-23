@@ -79,3 +79,41 @@ async def delete_empty_conversation(session: AsyncSession, *, conversation_id: U
             Conversation.id == conversation_id, Conversation.status == "deleting"
         )
     )
+
+
+async def first_user_conversation_id(session: AsyncSession, *, owner_id: UUID) -> UUID | None:
+    """Choose the next root without locking ahead of its durable cleanup job."""
+    return await session.scalar(
+        select(Conversation.id)
+        .where(Conversation.owner_id == owner_id)
+        .order_by(Conversation.id)
+        .limit(1)
+    )
+
+
+async def has_user_conversations(session: AsyncSession, *, owner_id: UUID) -> bool:
+    """Keep the deleting owner until every owned conversation job has removed its root."""
+    return bool(await session.scalar(select(exists().where(Conversation.owner_id == owner_id))))
+
+
+async def list_user_running_generation_conversations(
+    session: AsyncSession, *, owner_id: UUID, batch_size: int
+) -> list[UUID]:
+    """Read a bounded lease inventory before user-wide remote cleanup can begin."""
+    return list(
+        await session.scalars(
+            select(Generation.conversation_id)
+            .where(Generation.owner_id == owner_id, Generation.status == "running")
+            .order_by(Generation.conversation_id)
+            .limit(max(1, min(100, batch_size)))
+        )
+    )
+
+
+async def has_user_running_generations(session: AsyncSession, *, owner_id: UUID) -> bool:
+    """Keep the final memory clear behind every unfinished generation lease."""
+    return bool(
+        await session.scalar(
+            select(exists().where(Generation.owner_id == owner_id, Generation.status == "running"))
+        )
+    )

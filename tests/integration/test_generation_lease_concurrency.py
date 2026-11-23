@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from mem_ai.contracts.model_provider import (
     ModelRequest,
@@ -23,7 +23,7 @@ from mem_ai.modules.agents import service as agents_service
 from mem_ai.modules.agents.schemas import AgentCreateRequest
 from mem_ai.modules.conversations import generation as generation_store
 from mem_ai.modules.conversations import service as conversations_service
-from mem_ai.modules.conversations.models import Conversation, Generation
+from mem_ai.modules.conversations.models import Conversation, Generation, Message
 from mem_ai.modules.conversations.service import ChatOptions
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
@@ -824,24 +824,24 @@ async def test_lease_renewal_heartbeat_keeps_slow_generation_alive_and_handles_r
             await asyncio.wait_for(deleting_task, timeout=2.0)
         assert del_err.value.code == "user_deleting"
 
-        # Re-enable user temporarily to verify no running generation remains and no reply persisted.
-        await users_service.set_user_status(session_factory, user_id=alice_id, status="active")
-        msgs_final = await generation_store.list_conversation_messages_for_owner(
-            session_factory,
-            owner_id=alice_id,
-            conversation_id=seed.conversation_id,
-        )
-        assert "reply:aborted-on-user-delete" not in [m.content for m in msgs_final]
-        # Lease was released, so a new turn succeeds immediately without 409.
-        after_delete_turn = await conversations_service.run_sync_chat(
-            session_factory,
-            persona_provider=persona_provider,
-            model_provider=provider,
-            owner_id=alice_id,
-            agent_id=agent_id,
-            conversation_id=seed.conversation_id,
-            user_message="post-release-check",
-        )
-        assert after_delete_turn.assistant_message.content == "reply:post-release-check"
+        # Deletion is irreversible; inspect persisted lease/output without reactivating the user.
+        async with session_factory() as session:
+            running_id = await session.scalar(
+                select(Generation.id).where(
+                    Generation.conversation_id == seed.conversation_id,
+                    Generation.status == "running",
+                )
+            )
+            stale_reply = await session.scalar(
+                select(Message.id).where(
+                    Message.conversation_id == seed.conversation_id,
+                    Message.content == "reply:aborted-on-user-delete",
+                )
+            )
+        assert running_id is None
+        assert stale_reply is None
+        with pytest.raises(ConflictError) as irreversible:
+            await users_service.set_user_status(session_factory, user_id=alice_id, status="active")
+        assert irreversible.value.code == "user_deleting"
     finally:
         await engine.dispose()

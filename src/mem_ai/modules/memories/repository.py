@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select, union, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -357,7 +357,11 @@ async def list_provider_ids(session: AsyncSession, *, user_id: UUID) -> list[str
     """Find persisted provider scopes, including providers unavailable in the current process."""
     return list(
         await session.scalars(
-            select(MemoryScopeState.provider_id).where(MemoryScopeState.user_id == user_id)
+            union(
+                select(MemoryScopeState.provider_id).where(MemoryScopeState.user_id == user_id),
+                select(MemoryTombstone.provider_id).where(MemoryTombstone.user_id == user_id),
+                select(MemoryListSnapshot.provider_id).where(MemoryListSnapshot.user_id == user_id),
+            ).order_by("provider_id")
         )
     )
 
@@ -393,3 +397,28 @@ async def load_tombstoned_conversation_ids(
             )
         )
     )
+
+
+async def delete_user_memory_state(
+    session: AsyncSession, *, user_id: UUID, batch_size: int = 50
+) -> bool:
+    """Remove a finite batch after remote confirmation; remaining rows defer completion."""
+    remaining = max(1, min(100, batch_size))
+    for model in (MemoryListSnapshot, MemoryTombstone, MemoryScopeState):
+        selected = list(
+            await session.scalars(
+                select(model.id)
+                .where(model.user_id == user_id)
+                .order_by(model.id)
+                .limit(remaining)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        if selected:
+            await session.execute(delete(model).where(model.id.in_(selected)))
+            remaining -= len(selected)
+        if await session.scalar(select(select(model.id).where(model.user_id == user_id).exists())):
+            return False
+        if remaining == 0:
+            return False
+    return True

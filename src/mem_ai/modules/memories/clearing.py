@@ -28,6 +28,7 @@ from mem_ai.modules.memories.barrier import (
     NoopRecalledMemoryReferenceMarker,
     RecalledMemoryReferenceMarker,
     cancel_queued_and_list_unsettled_writes_in_session,
+    fail_superseded_explicit_operation_in_session,
     finalize_clear_barrier_in_session,
     invoke_provider_delete_call,
     is_retryable_memory_provider_error,
@@ -67,6 +68,215 @@ class _PreparedClearScope:
     audit_events: tuple[DeletionAuditEvent, ...] = ()
 
 
+async def prepare_clear_scope_in_session(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    provider_id: str,
+    marker: RecalledMemoryReferenceMarker,
+    max_attempts: int,
+    current_time: datetime,
+    force_async: bool = False,
+    user_cleanup_operation_id: UUID | None = None,
+) -> _PreparedClearScope:
+    """Prepare a clear under the caller's resource-status policy.
+
+    Request paths lock an active user before entering. User deletion owns the
+    irreversible deleting transition and retains the user until cleanup completes.
+    """
+    scope_row = await repository.get_or_create_scope_for_update(
+        session, user_id=user_id, provider_id=provider_id
+    )
+    if scope_row.barrier_state != "idle" and scope_row.barrier_operation_id is not None:
+        existing_op = await operations_service.get_operation_in_session(
+            session, operation_id=scope_row.barrier_operation_id
+        )
+        if existing_op is not None and existing_op.status in (
+            "pending",
+            "running",
+            "reconciling",
+        ):
+            existing_is_cleanup = user_cleanup_operation_id is None
+            if user_cleanup_operation_id is not None:
+                existing_is_cleanup = bool(
+                    await jobs_service.list_user_jobs_in_session(
+                        session,
+                        user_id=user_id,
+                        job_types=(JOB_TYPE_MEMORY_CLEAR,),
+                        statuses=("pending", "running", "retry_wait", "reconciling", "failed"),
+                        metadata_match={
+                            "operation_id": str(existing_op.id),
+                            "user_cleanup_operation_id": str(user_cleanup_operation_id),
+                        },
+                        limit=1,
+                    )
+                )
+            if existing_is_cleanup:
+                return _PreparedClearScope(
+                    shortcut=AcceptedMemoryDeletionOutcome(operation=existing_op)
+                )
+
+    if scope_row.barrier_state == "idle":
+        previous_epoch, new_epoch = scope_row.epoch, scope_row.epoch + 1
+        next_barrier: MemoryBarrierState = "clearing"
+    else:
+        new_epoch, previous_epoch = scope_row.epoch, max(0, scope_row.epoch - 1)
+        next_barrier = cast(MemoryBarrierState, scope_row.barrier_state)
+
+    cancelled_queued: list[JobRecord] = []
+    unsettled: list[JobRecord] = []
+    if user_cleanup_operation_id is None:
+        cancelled_queued, unsettled = await cancel_queued_and_list_unsettled_writes_in_session(
+            session,
+            user_id=user_id,
+            provider_id=provider_id,
+            max_epoch=previous_epoch,
+            cancel_summary="queued memory write cancelled by scope clearing barrier",
+            now=current_time,
+        )
+    unsettled_count = len(unsettled)
+    initial_status: OperationStatus = "pending" if force_async or unsettled_count > 0 else "running"
+
+    operation = await operations_service.create_operation_in_session(
+        session,
+        owner_id=user_id,
+        operation_type=OPERATION_TYPE_MEMORY_CLEAR,
+        status=initial_status,
+        target_type="memory_scope",
+        target_id=f"{user_id}:{provider_id}",
+        progress={
+            "phase": "await_inflight" if unsettled_count > 0 else "clearing",
+            "provider_id": provider_id,
+            "previous_epoch": previous_epoch,
+            "new_epoch": new_epoch,
+            "barrier_state": next_barrier,
+            "cancelled_queued_writes": len(cancelled_queued),
+            "inflight_writes_remaining": unsettled_count,
+            "compensation_scheduled": False,
+        },
+    )
+    await transition_scope_barrier_in_session(
+        session,
+        user_id=user_id,
+        provider_id=provider_id,
+        new_barrier_state=next_barrier,
+        new_epoch=new_epoch,
+        barrier_operation_id=operation.id,
+        now=current_time,
+    )
+    tombstone = await repository.create_tombstone(
+        session,
+        user_id=user_id,
+        provider_id=provider_id,
+        target_kind="user",
+        memory_epoch=previous_epoch,
+        operation_id=operation.id,
+        status="pending",
+    )
+    clear_meta = {
+        "operation_id": str(operation.id),
+        "tombstone_id": str(tombstone.id),
+        "provider_id": provider_id,
+        "previous_epoch": previous_epoch,
+        "new_epoch": new_epoch,
+        "barrier_started_at": current_time.isoformat(),
+        "clear_phase": (
+            "await_inflight" if force_async or unsettled_count > 0 else "clear_dispatched"
+        ),
+        "settle_timeout_exceeded": False,
+        "compensation_scheduled": False,
+    }
+    if user_cleanup_operation_id is not None:
+        clear_meta["user_cleanup_operation_id"] = str(user_cleanup_operation_id)
+    for cancelled in cancelled_queued:
+        await fail_superseded_explicit_operation_in_session(
+            session,
+            job=cancelled,
+            provider_id=provider_id,
+            clear_operation_id=operation.id,
+            error_message="memory creation was superseded by scope clearing",
+            now=current_time,
+        )
+    sync_job: JobRecord | None = None
+    if force_async or unsettled_count > 0:
+        enqueued, _ = await jobs_service.enqueue_job_in_session(
+            session,
+            job_type=JOB_TYPE_MEMORY_CLEAR,
+            business_id=str(operation.id),
+            user_id=user_id,
+            dedupe_key=f"{JOB_TYPE_MEMORY_CLEAR}:{operation.id}",
+            max_attempts=max_attempts,
+            now=current_time,
+            metadata_json=clear_meta,
+        )
+        job_id = enqueued.id
+    else:
+        sync_job = await jobs_service.register_and_claim_sync_job_in_session(
+            session,
+            job_type=JOB_TYPE_MEMORY_CLEAR,
+            business_id=str(operation.id),
+            user_id=user_id,
+            dedupe_key=f"{JOB_TYPE_MEMORY_CLEAR}:{operation.id}",
+            max_attempts=max_attempts,
+            now=current_time,
+            metadata_json=clear_meta,
+        )
+        job_id = sync_job.id
+
+    attached = await operations_service.attach_job_in_session(
+        session, operation_id=operation.id, job_id=job_id, now=current_time
+    )
+    final_op = attached or operation
+    if user_cleanup_operation_id is None:
+        await marker.mark_user_memories_deleted_in_session(
+            session,
+            owner_id=user_id,
+            provider_id=provider_id,
+            max_memory_epoch=previous_epoch,
+            deleted_at=current_time,
+        )
+        await repository.delete_list_snapshots_for_scope(
+            session, user_id=user_id, provider_id=provider_id
+        )
+    events = (
+        make_clear_audit_event(
+            "operation_accepted",
+            user_id=user_id,
+            operation_id=final_op.id,
+            provider_id=provider_id,
+            memory_epoch=new_epoch,
+            barrier_state=next_barrier,
+            status=final_op.status,
+            occurred_at=current_time,
+            metadata={
+                "previous_epoch": previous_epoch,
+                "cancelled_queued_writes": len(cancelled_queued),
+                "inflight_writes_remaining": unsettled_count,
+            },
+        ),
+        make_clear_audit_event(
+            "memory_epoch_advanced",
+            user_id=user_id,
+            operation_id=final_op.id,
+            provider_id=provider_id,
+            memory_epoch=new_epoch,
+            barrier_state=next_barrier,
+            occurred_at=current_time,
+            metadata={"previous_epoch": previous_epoch},
+        ),
+    )
+    return _PreparedClearScope(
+        shortcut=None,
+        operation=final_op,
+        tombstone_id=tombstone.id,
+        sync_job=sync_job,
+        previous_epoch=previous_epoch,
+        new_epoch=new_epoch,
+        unsettled_count=unsettled_count,
+        audit_events=events,
+    )
+
+
 async def _prepare_clear_scope_tx1(
     session_factory: async_sessionmaker[AsyncSession],
     *,
@@ -79,163 +289,13 @@ async def _prepare_clear_scope_tx1(
     async with session_factory.begin() as session:
         current_time = await resolve_current_time(session, now)
         await users_service.ensure_user_active_in_session(session, user_id=user_id, for_share=True)
-        scope_row = await repository.get_or_create_scope_for_update(
-            session, user_id=user_id, provider_id=provider_id
-        )
-        if scope_row.barrier_state != "idle" and scope_row.barrier_operation_id is not None:
-            existing_op = await operations_service.get_operation_in_session(
-                session, operation_id=scope_row.barrier_operation_id
-            )
-            if existing_op is not None and existing_op.status in (
-                "pending",
-                "running",
-                "reconciling",
-            ):
-                return _PreparedClearScope(
-                    shortcut=AcceptedMemoryDeletionOutcome(operation=existing_op)
-                )
-
-        if scope_row.barrier_state == "idle":
-            previous_epoch, new_epoch = scope_row.epoch, scope_row.epoch + 1
-            next_barrier: MemoryBarrierState = "clearing"
-        else:
-            new_epoch, previous_epoch = scope_row.epoch, max(0, scope_row.epoch - 1)
-            next_barrier = cast(MemoryBarrierState, scope_row.barrier_state)
-
-        cancelled_queued, unsettled = await cancel_queued_and_list_unsettled_writes_in_session(
+        return await prepare_clear_scope_in_session(
             session,
             user_id=user_id,
             provider_id=provider_id,
-            max_epoch=previous_epoch,
-            cancel_summary="queued memory write cancelled by scope clearing barrier",
-            now=current_time,
-        )
-        unsettled_count = len(unsettled)
-        initial_status: OperationStatus = "pending" if unsettled_count > 0 else "running"
-
-        operation = await operations_service.create_operation_in_session(
-            session,
-            owner_id=user_id,
-            operation_type=OPERATION_TYPE_MEMORY_CLEAR,
-            status=initial_status,
-            target_type="memory_scope",
-            target_id=f"{user_id}:{provider_id}",
-            progress={
-                "phase": "await_inflight" if unsettled_count > 0 else "clearing",
-                "provider_id": provider_id,
-                "previous_epoch": previous_epoch,
-                "new_epoch": new_epoch,
-                "barrier_state": next_barrier,
-                "cancelled_queued_writes": len(cancelled_queued),
-                "inflight_writes_remaining": unsettled_count,
-                "compensation_scheduled": False,
-            },
-        )
-        await transition_scope_barrier_in_session(
-            session,
-            user_id=user_id,
-            provider_id=provider_id,
-            new_barrier_state=next_barrier,
-            new_epoch=new_epoch,
-            barrier_operation_id=operation.id,
-            now=current_time,
-        )
-        tombstone = await repository.create_tombstone(
-            session,
-            user_id=user_id,
-            provider_id=provider_id,
-            target_kind="user",
-            memory_epoch=previous_epoch,
-            operation_id=operation.id,
-            status="pending",
-        )
-        clear_meta = {
-            "operation_id": str(operation.id),
-            "tombstone_id": str(tombstone.id),
-            "provider_id": provider_id,
-            "previous_epoch": previous_epoch,
-            "new_epoch": new_epoch,
-            "barrier_started_at": current_time.isoformat(),
-            "clear_phase": "await_inflight" if unsettled_count > 0 else "clear_dispatched",
-            "settle_timeout_exceeded": False,
-            "compensation_scheduled": False,
-        }
-        sync_job: JobRecord | None = None
-        if unsettled_count > 0:
-            enqueued, _ = await jobs_service.enqueue_job_in_session(
-                session,
-                job_type=JOB_TYPE_MEMORY_CLEAR,
-                business_id=str(operation.id),
-                user_id=user_id,
-                dedupe_key=f"{JOB_TYPE_MEMORY_CLEAR}:{operation.id}",
-                max_attempts=max_attempts,
-                now=current_time,
-                metadata_json=clear_meta,
-            )
-            job_id = enqueued.id
-        else:
-            sync_job = await jobs_service.register_and_claim_sync_job_in_session(
-                session,
-                job_type=JOB_TYPE_MEMORY_CLEAR,
-                business_id=str(operation.id),
-                user_id=user_id,
-                dedupe_key=f"{JOB_TYPE_MEMORY_CLEAR}:{operation.id}",
-                max_attempts=max_attempts,
-                now=current_time,
-                metadata_json=clear_meta,
-            )
-            job_id = sync_job.id
-
-        attached = await operations_service.attach_job_in_session(
-            session, operation_id=operation.id, job_id=job_id, now=current_time
-        )
-        final_op = attached or operation
-        await marker.mark_user_memories_deleted_in_session(
-            session,
-            owner_id=user_id,
-            provider_id=provider_id,
-            max_memory_epoch=previous_epoch,
-            deleted_at=current_time,
-        )
-        await repository.delete_list_snapshots_for_scope(
-            session, user_id=user_id, provider_id=provider_id
-        )
-        events = (
-            make_clear_audit_event(
-                "operation_accepted",
-                user_id=user_id,
-                operation_id=final_op.id,
-                provider_id=provider_id,
-                memory_epoch=new_epoch,
-                barrier_state=next_barrier,
-                status=final_op.status,
-                occurred_at=current_time,
-                metadata={
-                    "previous_epoch": previous_epoch,
-                    "cancelled_queued_writes": len(cancelled_queued),
-                    "inflight_writes_remaining": unsettled_count,
-                },
-            ),
-            make_clear_audit_event(
-                "memory_epoch_advanced",
-                user_id=user_id,
-                operation_id=final_op.id,
-                provider_id=provider_id,
-                memory_epoch=new_epoch,
-                barrier_state=next_barrier,
-                occurred_at=current_time,
-                metadata={"previous_epoch": previous_epoch},
-            ),
-        )
-        return _PreparedClearScope(
-            shortcut=None,
-            operation=final_op,
-            tombstone_id=tombstone.id,
-            sync_job=sync_job,
-            previous_epoch=previous_epoch,
-            new_epoch=new_epoch,
-            unsettled_count=unsettled_count,
-            audit_events=events,
+            marker=marker,
+            max_attempts=max_attempts,
+            current_time=current_time,
         )
 
 

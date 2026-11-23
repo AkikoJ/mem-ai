@@ -159,7 +159,7 @@ async def create_agent(
         memory_policy=data.memory_policy.to_contract(),
     )
     async with session_factory.begin() as session:
-        await users_service.ensure_user_active_in_session(session, user_id=owner_id)
+        await users_service.ensure_user_active_in_session(session, user_id=owner_id, for_share=True)
         agent = await repository.create_agent(
             session,
             owner_id=owner_id,
@@ -254,7 +254,7 @@ async def update_agent_draft(
     """Update only the draft fields on `agents` without mutating any published persona snapshot."""
     provided = data.model_fields_set
     async with session_factory.begin() as session:
-        await users_service.ensure_user_active_in_session(session, user_id=owner_id)
+        await users_service.ensure_user_active_in_session(session, user_id=owner_id, for_share=True)
         found = await repository.get_agent_with_published_version(
             session,
             owner_id=owner_id,
@@ -318,7 +318,9 @@ async def create_persona_version(
     """Snapshot the current Agent draft into a new immutable version without publishing it."""
     try:
         async with session_factory.begin() as session:
-            await users_service.ensure_user_active_in_session(session, user_id=owner_id)
+            await users_service.ensure_user_active_in_session(
+                session, user_id=owner_id, for_share=True
+            )
             agent = await repository.get_agent_for_owner(
                 session,
                 owner_id=owner_id,
@@ -374,7 +376,9 @@ async def publish_agent(
     request = data if data is not None else AgentPublishRequest()
     try:
         async with session_factory.begin() as session:
-            await users_service.ensure_user_active_in_session(session, user_id=owner_id)
+            await users_service.ensure_user_active_in_session(
+                session, user_id=owner_id, for_share=True
+            )
             agent = await repository.get_agent_for_owner(
                 session,
                 owner_id=owner_id,
@@ -450,7 +454,7 @@ async def retire_agent(
 ) -> AgentRecord:
     """Idempotently retire an owned private Agent while preserving published persona snapshots."""
     async with session_factory.begin() as session:
-        await users_service.ensure_user_active_in_session(session, user_id=owner_id)
+        await users_service.ensure_user_active_in_session(session, user_id=owner_id, for_share=True)
         found = await repository.get_agent_with_published_version(
             session,
             owner_id=owner_id,
@@ -522,3 +526,16 @@ async def get_persona_version_for_owner(
             version_id=version_id,
         )
         return _to_persona_version_record(row) if row is not None else None
+
+
+async def cleanup_user_agents_in_session(
+    session: AsyncSession, *, owner_id: UUID, batch_size: int = 50
+) -> bool:
+    """Delete versions/Agents in bounded FK order for the irreversible deleting owner.
+
+    Called by users only after its conversations are removed; public Agent mutations continue
+    to enforce the active-user policy and cannot recreate these resources during cleanup.
+    """
+    return await repository.delete_user_agent_batch(
+        session, owner_id=owner_id, batch_size=batch_size
+    )

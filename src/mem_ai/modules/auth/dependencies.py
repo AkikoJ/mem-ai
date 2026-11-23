@@ -7,6 +7,7 @@ from typing import Annotated, cast
 from fastapi import Depends, Request
 
 from mem_ai.api.dependencies import SessionFactoryDep
+from mem_ai.core.exceptions import UnauthorizedError
 from mem_ai.core.logging import bind_log_context
 from mem_ai.modules.auth.adapters import AuthRequest, CredentialVerifier
 from mem_ai.modules.auth.context import AuthenticationContext
@@ -27,6 +28,15 @@ async def get_auth_context(
     session_factory: SessionFactoryDep,
 ) -> AuthenticationContext:
     """Authenticate incoming credentials and resolve an active local user context."""
+    if any(
+        header.split(maxsplit=1)[0].lower() == "deletionreceipt"
+        for header in request.headers.getlist("authorization")
+        if header.strip()
+    ):
+        raise UnauthorizedError(
+            code="invalid_auth_scheme",
+            message="deletion receipts can only query their deletion operation",
+        )
     client_host = request.client.host if request.client is not None else None
     raw_headers = tuple(
         (key.decode("latin-1"), value.decode("latin-1")) for key, value in request.headers.raw
