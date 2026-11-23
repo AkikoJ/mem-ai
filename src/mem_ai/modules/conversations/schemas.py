@@ -254,6 +254,19 @@ class ChatAcceptedResult(BaseModel):
 ChatTurnOutcome = CommittedChatResult | ChatAcceptedResult
 
 
+class StreamGenerationFailure(BaseModel):
+    """Sanitized failure outcome returned after attempting DB convergence for a streamed turn."""
+
+    model_config = ConfigDict(frozen=True)
+
+    code: str
+    message: str
+    converged: bool
+
+
+StreamGenerationOutcome = CommittedChatResult | StreamGenerationFailure
+
+
 class ChatRequest(BaseModel):
     """Strict HTTP request body for `POST /v1/chat`."""
 

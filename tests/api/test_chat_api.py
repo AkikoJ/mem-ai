@@ -224,7 +224,8 @@ async def test_chat_start_continue_pinned_persona_rejections_and_isolation(
                     "stream": True,
                 },
             )
-            assert res_stream.status_code == 422
+            assert res_stream.status_code == 409
+            assert res_stream.json()["code"] == "model_unavailable"
             assert len(model_provider.requests) == 0
 
             # 3. Start a new conversation (omitting conversationId): pins v1 persona & returns IDs.

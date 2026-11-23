@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 from collections.abc import AsyncIterator, Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -43,6 +44,41 @@ from mem_ai.core.config import Settings
 from mem_ai.db.engine import create_sync_engine_from_settings
 from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
 from mem_ai.modules.auth.context import VerifiedPrincipal
+
+
+@dataclass(frozen=True)
+class ParsedSseEvent:
+    """Decoded SSE frame used across unit, integration, and API streaming tests."""
+
+    event_id: str | None
+    event: str
+    data: dict[str, Any]
+
+
+def parse_sse_text(raw: str) -> list[ParsedSseEvent]:
+    """Parse one or more SSE frames separated by blank lines into structured events."""
+    events: list[ParsedSseEvent] = []
+    for block in raw.split("\n\n"):
+        if not block.strip():
+            continue
+        event_id: str | None = None
+        event_name: str | None = None
+        data_lines: list[str] = []
+        for line in block.split("\n"):
+            if line.startswith("id: "):
+                event_id = line[4:]
+            elif line.startswith("event: "):
+                event_name = line[7:]
+            elif line.startswith("data: "):
+                data_lines.append(line[6:])
+            else:
+                raise AssertionError(f"Unexpected SSE line: {line!r}")
+        assert event_name is not None, f"Missing event name in SSE block: {block!r}"
+        assert len(data_lines) == 1, f"Expected single data line in SSE block: {block!r}"
+        payload = json.loads(data_lines[0])
+        assert isinstance(payload, dict)
+        events.append(ParsedSseEvent(event_id=event_id, event=event_name, data=payload))
+    return events
 
 
 class FakeModelProvider:

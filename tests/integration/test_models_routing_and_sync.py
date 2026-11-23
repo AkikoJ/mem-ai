@@ -20,7 +20,7 @@ from mem_ai.core.exceptions import (
 from mem_ai.db.engine import create_async_engine_from_settings, create_session_factory
 from mem_ai.modules.conversations import generation as generation_store
 from mem_ai.modules.conversations import service as conversations_service
-from mem_ai.modules.conversations.service import SyncChatOptions
+from mem_ai.modules.conversations.service import ChatOptions
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelRoutingPolicy
 from mem_ai.modules.models.sync import main as sync_cli_main
@@ -413,7 +413,7 @@ async def test_model_routing_precedence_permissions_capabilities_and_shared_stre
                 agent_id=agent_id,
                 conversation_id=None,
                 user_message="Try streaming on batch model",
-                options=SyncChatOptions(
+                options=ChatOptions(
                     user_permissions=frozenset({"chat:use"}),
                     require_streaming=True,
                 ),
@@ -428,7 +428,7 @@ async def test_model_routing_precedence_permissions_capabilities_and_shared_stre
             agent_id=agent_id,
             conversation_id=None,
             user_message="Sync works on batch model",
-            options=SyncChatOptions(
+            options=ChatOptions(
                 user_permissions=frozenset({"chat:use"}),
                 require_streaming=False,
             ),

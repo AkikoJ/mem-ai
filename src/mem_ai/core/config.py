@@ -237,6 +237,8 @@ class Settings(BaseSettings):
     model_sync_on_startup: bool = True
     model_registry_entries: list[dict[str, Any]] = Field(default_factory=list)
     chat_generation_timeout_seconds: float = Field(default=60.0, gt=0.0)
+    chat_stream_timeout_seconds: float = Field(default=120.0, gt=0.0, le=3600.0)
+    chat_stream_heartbeat_interval_seconds: float = Field(default=15.0, gt=0.0, le=300.0)
     chat_history_message_limit: int = Field(default=20, ge=0, le=200)
     chat_lease_ttl_seconds: int = Field(default=60, ge=5, le=600)
     chat_lease_renew_interval_seconds: float = Field(default=20.0, gt=0.0, le=300.0)
@@ -356,6 +358,12 @@ class Settings(BaseSettings):
             raise ValueError(
                 "chat_lease_renew_interval_seconds must be strictly less than "
                 "chat_lease_ttl_seconds"
+            )
+
+        if self.chat_stream_heartbeat_interval_seconds >= self.chat_stream_timeout_seconds:
+            raise ValueError(
+                "chat_stream_heartbeat_interval_seconds must be strictly less than "
+                "chat_stream_timeout_seconds"
             )
 
         if self.worker_lease_renew_interval_seconds >= self.worker_lease_ttl_seconds:

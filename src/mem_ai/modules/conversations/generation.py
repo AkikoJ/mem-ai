@@ -627,6 +627,55 @@ async def converge_generation_failure_phase(
         )
 
 
+async def converge_generation_failure_safely(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    prepared: PreparedGeneration,
+    error_code: str,
+    error_message: str,
+    target_status: Literal["failed", "cancelled"] = "failed",
+    error_status_code: int | None = None,
+    idempotency_retention_seconds: float = idempotency.DEFAULT_IDEMPOTENCY_RETENTION_SECONDS,
+) -> GenerationRecord | None:
+    """Converge failure/cancellation in DB and return the confirmed terminal record (or None).
+
+    Per Engineering Design §5.2, a stale executor that lost its lease (`generation_lease_lost`)
+    never writes terminal state itself; it only checks whether takeover/Worker recovery already
+    converged the generation so SSE never emits an unconfirmed `conversation.failed`.
+    """
+    try:
+        if error_code != "generation_lease_lost":
+            converged = await converge_generation_failure_phase(
+                session_factory,
+                generation_id=prepared.generation_id,
+                owner_id=prepared.owner_id,
+                conversation_id=prepared.conversation_id,
+                lease_token=prepared.lease_token,
+                target_status=target_status,
+                error_code=error_code,
+                error_message=error_message,
+                error_status_code=error_status_code,
+                idempotency_retention_seconds=idempotency_retention_seconds,
+            )
+            if converged is not None:
+                return converged
+        existing = await queries.get_generation_for_owner(
+            session_factory,
+            owner_id=prepared.owner_id,
+            conversation_id=prepared.conversation_id,
+            generation_id=prepared.generation_id,
+        )
+        if existing is not None and existing.status in {"failed", "cancelled"}:
+            return existing
+        return None
+    except Exception:
+        logger.exception(
+            "Failed to converge generation to terminal error state",
+            extra={"extra_fields": {"error_code": error_code, "target_status": target_status}},
+        )
+        return None
+
+
 async def recover_expired_generations_phase(
     session_factory: async_sessionmaker[AsyncSession],
     *,

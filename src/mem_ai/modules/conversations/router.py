@@ -20,17 +20,17 @@ from mem_ai.core.exceptions import UnprocessableEntityError
 from mem_ai.modules.auth.dependencies import AuthContextDep
 from mem_ai.modules.conversations import queries as conversation_queries
 from mem_ai.modules.conversations import service as conversations_service
+from mem_ai.modules.conversations import stream as conversations_stream
+from mem_ai.modules.conversations.execution import SyncGenerationTaskRegistry
 from mem_ai.modules.conversations.schemas import (
     ChatAcceptedResponse,
     ChatAcceptedResult,
     ChatRequest,
     ChatResponse,
     GenerationResponse,
+    PreparedGeneration,
 )
-from mem_ai.modules.conversations.service import (
-    SyncGenerationTaskRegistry,
-    sync_chat_options_from_settings,
-)
+from mem_ai.modules.conversations.service import chat_options_from_settings
 
 router = APIRouter(tags=["chat"])
 
@@ -69,10 +69,21 @@ SyncTaskRegistryDep = Annotated[
     response_model=ApiResponse[ChatResponse],
     openapi_extra=_IDEMPOTENCY_OPENAPI_EXTRA,
     responses={
+        status.HTTP_200_OK: {
+            "content": {
+                "text/event-stream": {
+                    "schema": {"type": "string"},
+                }
+            },
+            "description": (
+                "Committed JSON response for sync chat or idempotent replay, "
+                "or Server-Sent Events stream for new `stream=true` turns."
+            ),
+        },
         status.HTTP_202_ACCEPTED: {
             "model": ApiResponse[ChatAcceptedResponse],
             "description": "Idempotent retry matched a generation that is still running.",
-        }
+        },
     },
 )
 async def post_chat(
@@ -86,17 +97,22 @@ async def post_chat(
     memory_provider: OptionalMemoryProviderDep,
     task_registry: SyncTaskRegistryDep,
 ) -> ApiResponse[ChatResponse] | Response:
-    """Start, continue, or idempotently replay a conversation turn."""
+    """Start, continue, stream, or idempotently replay a conversation turn."""
     idempotency_key = request.headers.get("Idempotency-Key")
     if idempotency_key is None:
         raise UnprocessableEntityError(
             code="idempotency_key_required",
             message="Idempotency-Key header is required",
         )
-    outcome = await conversations_service.run_sync_chat(
+    options = chat_options_from_settings(
+        settings,
+        user_permissions=auth.permissions,
+        require_streaming=payload.stream,
+        task_registry=task_registry,
+    )
+    prepared_or_replay = await conversations_service.prepare_chat_turn(
         session_factory,
         persona_provider=persona_provider,
-        model_provider=model_provider,
         memory_provider=memory_provider,
         owner_id=auth.user_id,
         agent_id=payload.agent_id,
@@ -105,19 +121,35 @@ async def post_chat(
         idempotency_key=idempotency_key,
         requested_model_id=payload.model_id,
         stream=payload.stream,
-        options=sync_chat_options_from_settings(
-            settings,
-            user_permissions=auth.permissions,
-            task_registry=task_registry,
-        ),
+        allow_streaming=True,
+        options=options,
     )
-    if isinstance(outcome, ChatAcceptedResult):
-        accepted = ok_response(ChatAcceptedResponse.from_result(outcome))
+    if isinstance(prepared_or_replay, ChatAcceptedResult):
+        accepted = ok_response(ChatAcceptedResponse.from_result(prepared_or_replay))
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
             content=accepted.model_dump(mode="json", by_alias=True),
-            headers={"Location": outcome.status_url},
+            headers={"Location": prepared_or_replay.status_url},
         )
+    if not isinstance(prepared_or_replay, PreparedGeneration):
+        return ok_response(ChatResponse.from_result(prepared_or_replay))
+
+    if payload.stream:
+        return conversations_stream.build_chat_sse_response(
+            session_factory,
+            model_provider=model_provider,
+            prepared=prepared_or_replay,
+            memory_provider=memory_provider,
+            options=options,
+        )
+
+    outcome = await conversations_service.execute_prepared_sync_chat(
+        session_factory,
+        model_provider=model_provider,
+        memory_provider=memory_provider,
+        prepared=prepared_or_replay,
+        options=options,
+    )
     return ok_response(ChatResponse.from_result(outcome))
 
 

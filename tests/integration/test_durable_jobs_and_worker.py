@@ -45,7 +45,7 @@ from mem_ai.modules.conversations import generation as generation_store
 from mem_ai.modules.conversations import service as conversations_service
 from mem_ai.modules.conversations.queries import DatabaseTurnContentLoader
 from mem_ai.modules.conversations.schemas import GenerationRecord, MessageRecord
-from mem_ai.modules.conversations.service import SyncChatOptions
+from mem_ai.modules.conversations.service import ChatOptions
 from mem_ai.modules.jobs import service as jobs_service
 from mem_ai.modules.jobs.schemas import (
     JobBackoffPolicy,
@@ -522,7 +522,7 @@ async def test_worker_retries_exhaustion_reconciling_verification_and_log_redact
             agent_id=agent_id,
             conversation_id=None,
             user_message="CONFIDENTIAL_USER_BODY_XYZ api_key=sk-secret-999",
-            options=SyncChatOptions(memory_write_max_attempts=3),
+            options=ChatOptions(memory_write_max_attempts=3),
         )
         registry_fail = build_worker_registry(
             session_factory,
@@ -1141,7 +1141,7 @@ async def test_review_regressions_reconcile_budget_confirmed_clear_requeue_and_a
             agent_id=agent_id,
             conversation_id=None,
             user_message="Async extraction budget test",
-            options=SyncChatOptions(memory_write_max_attempts=2),
+            options=ChatOptions(memory_write_max_attempts=2),
         )
         runner = WorkerRunner(
             session_factory=session_factory,

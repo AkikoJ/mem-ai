@@ -173,3 +173,192 @@ async def test_openai_compatible_generate_maps_upstream_and_malformed_errors_wit
     raw_logs = log_buffer.getvalue()
     assert "sk-secret-do-not-log" not in raw_logs
     assert "private message body" not in raw_logs
+
+
+class _ChunkedAsyncStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+        self.closed = False
+
+    async def __aiter__(self) -> Any:
+        for chunk in self._chunks:
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.anyio
+async def test_openai_compatible_stream_generate_parses_deltas_usage_and_done() -> None:
+    captured: dict[str, Any] = {}
+    sse_payload = b"".join(
+        [
+            b": keep-alive comment\n\n",
+            b'data: {"id":"cmpl-1","choices":[{"index":0,"delta":{"role":"assistant"},'
+            b'"finish_reason":null}]}\n\n',
+            b'data: {"id":"cmpl-1","choices":[{"index":0,"delta":{"content":"Hello "},'
+            b'"finish_reason":null}]}\n\n',
+            b'data: {"id":"cmpl-1","choices":[{"index":0,"delta":{"content":"stream!"},'
+            b'"finish_reason":"stop"}]}\n\n',
+            b'data: {"id":"cmpl-1","choices":[],"usage":{"prompt_tokens":11,'
+            b'"completion_tokens":4,"total_tokens":15}}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["url"] = str(request.url)
+        captured["authorization"] = request.headers.get("authorization")
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_ChunkedAsyncStream([sse_payload[:90], sse_payload[90:]]),
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        adapter = OpenAICompatibleModelProvider(
+            http_client=http_client,
+            base_url="https://llm.example.test/v1/",
+            api_key=SecretStr("sk-stream-secret"),
+            upstream_model_map={"registered-fast": "vendor-fast-v1"},
+        )
+        chunks = [
+            chunk
+            async for chunk in adapter.stream_generate(
+                ModelRequest(
+                    model_id="registered-fast",
+                    messages=[ModelMessage(role="user", content="Hi")],
+                    max_output_tokens=64,
+                )
+            )
+        ]
+
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://llm.example.test/v1/chat/completions"
+    assert captured["authorization"] == "Bearer sk-stream-secret"
+    assert captured["body"] == {
+        "model": "vendor-fast-v1",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "max_tokens": 64,
+    }
+    assert [(c.sequence, c.text, c.is_final) for c in chunks] == [
+        (1, "Hello ", False),
+        (2, "stream!", False),
+        (3, "", True),
+    ]
+    assert chunks[-1].finish_reason == "stop"
+    assert chunks[-1].usage == ModelUsage(input_tokens=11, output_tokens=4, total_tokens=15)
+
+
+@pytest.mark.anyio
+async def test_openai_compatible_stream_generate_maps_truncated_http_and_timeout_errors() -> None:
+    partial_frame = (
+        b'data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n'
+    )
+
+    def truncated_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_ChunkedAsyncStream([partial_frame]),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(truncated_handler)) as http_client:
+        adapter = OpenAICompatibleModelProvider(
+            http_client=http_client,
+            base_url="https://llm.example.test/v1",
+            api_key=SecretStr("sk-stream-secret"),
+        )
+        seen: list[str] = []
+        with pytest.raises(BadGatewayError) as exc_info:
+            async for chunk in adapter.stream_generate(
+                ModelRequest(
+                    model_id="gpt-4o-mini",
+                    messages=[ModelMessage(role="user", content="Hi")],
+                )
+            ):
+                seen.append(chunk.text)
+        assert seen == ["partial"]
+        assert exc_info.value.code == "model_upstream_error"
+
+    def error_status_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, json={"error": {"message": "vendor leak sk-stream-secret"}})
+
+    error_transport = httpx.MockTransport(error_status_handler)
+    async with httpx.AsyncClient(transport=error_transport) as http_client:
+        adapter = OpenAICompatibleModelProvider(
+            http_client=http_client,
+            base_url="https://llm.example.test/v1",
+            api_key=SecretStr("sk-stream-secret"),
+        )
+        with pytest.raises(BadGatewayError) as exc_info:
+            async for _ in adapter.stream_generate(
+                ModelRequest(
+                    model_id="gpt-4o-mini",
+                    messages=[ModelMessage(role="user", content="sensitive body")],
+                )
+            ):
+                pass
+        assert exc_info.value.code == "model_upstream_error"
+        assert "sk-stream-secret" not in exc_info.value.message
+        assert "sensitive body" not in exc_info.value.message
+
+    def timeout_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("stream timed out", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(timeout_handler)) as http_client:
+        adapter = OpenAICompatibleModelProvider(
+            http_client=http_client,
+            base_url="https://llm.example.test/v1",
+            api_key=SecretStr("sk-stream-secret"),
+        )
+        with pytest.raises(GatewayTimeoutError) as exc_info:
+            async for _ in adapter.stream_generate(
+                ModelRequest(
+                    model_id="gpt-4o-mini",
+                    messages=[ModelMessage(role="user", content="Hi")],
+                )
+            ):
+                pass
+        assert exc_info.value.code == "generation_timeout"
+
+
+@pytest.mark.anyio
+async def test_openai_compatible_stream_generate_closes_upstream_stream_on_cancel() -> None:
+    first_frame = (
+        b'data: {"choices":[{"index":0,"delta":{"content":"first"},"finish_reason":null}]}\n\n'
+    )
+    second_frame = (
+        b'data: {"choices":[{"index":0,"delta":{"content":"second"},"finish_reason":"stop"}]}\n\n'
+    )
+    stream = _ChunkedAsyncStream([first_frame, second_frame, b"data: [DONE]\n\n"])
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=stream,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        adapter = OpenAICompatibleModelProvider(
+            http_client=http_client,
+            base_url="https://llm.example.test/v1",
+            api_key=SecretStr("sk-stream-secret"),
+        )
+        agen = adapter.stream_generate(
+            ModelRequest(
+                model_id="gpt-4o-mini",
+                messages=[ModelMessage(role="user", content="Hi")],
+            )
+        )
+        first_chunk = await agen.__anext__()
+        assert first_chunk.text == "first"
+        await agen.aclose()
+
+    assert stream.closed is True

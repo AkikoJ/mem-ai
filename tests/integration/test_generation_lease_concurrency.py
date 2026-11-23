@@ -24,7 +24,7 @@ from mem_ai.modules.agents.schemas import AgentCreateRequest
 from mem_ai.modules.conversations import generation as generation_store
 from mem_ai.modules.conversations import service as conversations_service
 from mem_ai.modules.conversations.models import Conversation, Generation
-from mem_ai.modules.conversations.service import SyncChatOptions
+from mem_ai.modules.conversations.service import ChatOptions
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
 from mem_ai.modules.personas.provider import LocalPersonaProvider
@@ -647,7 +647,7 @@ async def test_lease_renewal_heartbeat_keeps_slow_generation_alive_and_handles_r
         )
 
         # 1. Slow turn with TTL=0.35s and renewal every 0.08s survives a 0.55s pause!
-        renewed_options = SyncChatOptions(
+        renewed_options = ChatOptions(
             lease_ttl_seconds=0.35,
             lease_renew_interval_seconds=0.08,
             timeout_seconds=3.0,
@@ -698,7 +698,7 @@ async def test_lease_renewal_heartbeat_keeps_slow_generation_alive_and_handles_r
             raise RuntimeError("simulated transient DB outage during lease renewal")
 
         monkeypatch.setattr(generation_store, "renew_generation_lease_phase", _failing_renew)
-        failing_renew_options = SyncChatOptions(
+        failing_renew_options = ChatOptions(
             lease_ttl_seconds=0.2,
             lease_renew_interval_seconds=0.05,
             timeout_seconds=3.0,
@@ -751,7 +751,7 @@ async def test_lease_renewal_heartbeat_keeps_slow_generation_alive_and_handles_r
 
         # 3. Mid-flight lease expiry detected inside `_run_loop` aborts model_task promptly
         #    with `generation_lease_lost` (well before the 5s model timeout).
-        midflight_options = SyncChatOptions(
+        midflight_options = ChatOptions(
             lease_ttl_seconds=2.0,
             lease_renew_interval_seconds=0.05,
             timeout_seconds=5.0,
@@ -797,7 +797,7 @@ async def test_lease_renewal_heartbeat_keeps_slow_generation_alive_and_handles_r
 
         # 4. User entering `deleting` mid-flight is caught by lease renewal heartbeat:
         #    model execution aborts promptly and lease is released immediately.
-        deleting_options = SyncChatOptions(
+        deleting_options = ChatOptions(
             lease_ttl_seconds=2.0,
             lease_renew_interval_seconds=0.05,
             timeout_seconds=5.0,

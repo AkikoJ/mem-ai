@@ -396,3 +396,40 @@ def test_worker_and_job_retention_settings_validation() -> None:
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None, app_env="test", idempotency_retention_hours=0)
+
+
+def test_chat_stream_timeout_and_heartbeat_settings_validation() -> None:
+    defaults = Settings(_env_file=None, app_env="test")
+    assert defaults.chat_stream_timeout_seconds == 120.0
+    assert defaults.chat_stream_heartbeat_interval_seconds == 15.0
+
+    custom = Settings(
+        _env_file=None,
+        app_env="test",
+        chat_stream_timeout_seconds=0.5,
+        chat_stream_heartbeat_interval_seconds=0.05,
+    )
+    assert custom.chat_stream_timeout_seconds == 0.5
+    assert custom.chat_stream_heartbeat_interval_seconds == 0.05
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, app_env="test", chat_stream_timeout_seconds=0.0)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, app_env="test", chat_stream_heartbeat_interval_seconds=0.0)
+
+    with pytest.raises(ValidationError, match="chat_stream_heartbeat_interval_seconds"):
+        Settings(
+            _env_file=None,
+            app_env="test",
+            chat_stream_timeout_seconds=10.0,
+            chat_stream_heartbeat_interval_seconds=10.0,
+        )
+
+    with pytest.raises(ValidationError, match="chat_stream_heartbeat_interval_seconds"):
+        Settings(
+            _env_file=None,
+            app_env="test",
+            chat_stream_timeout_seconds=10.0,
+            chat_stream_heartbeat_interval_seconds=15.0,
+        )

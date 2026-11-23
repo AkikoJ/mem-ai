@@ -41,7 +41,7 @@ from mem_ai.modules.agents.schemas import AgentCreateRequest
 from mem_ai.modules.conversations import generation as generation_store
 from mem_ai.modules.conversations import service as conversations_service
 from mem_ai.modules.conversations.models import MessageRecalledMemory
-from mem_ai.modules.conversations.service import SyncChatOptions
+from mem_ai.modules.conversations.service import ChatOptions
 from mem_ai.modules.memories.models import MemoryScopeState
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
@@ -508,7 +508,7 @@ async def test_persist_recalled_memories_enforces_lease_midflight_barrier_and_to
             session_factory,
             prepared=prepared_tomb,
             memory_provider=recall_provider,
-            options=SyncChatOptions(tombstone_lookup=_tombstone_lookup),
+            options=ChatOptions(tombstone_lookup=_tombstone_lookup),
         )
         assert [m.memory_id for m in ctx_tomb.recalled_memories] == ["mem_survivor"]
         assert "Must be filtered at Tx 1.5" not in ctx_tomb.compiled_messages[0].content
@@ -636,7 +636,7 @@ async def test_persist_recalled_memories_enforces_lease_midflight_barrier_and_to
                 model_provider=model_provider,
                 memory_provider=recall_provider,
                 prepared=prepared_barrier,
-                options=SyncChatOptions(tombstone_lookup=_crashing_tombstone_lookup),
+                options=ChatOptions(tombstone_lookup=_crashing_tombstone_lookup),
             )
         assert ctx_err.value.code == "generation_context_failed"
         assert model_provider.requests == []
