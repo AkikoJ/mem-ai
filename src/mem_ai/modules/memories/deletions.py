@@ -102,6 +102,7 @@ async def _prepare_single_delete_tx1(
     memory_id: str,
     marker: RecalledMemoryReferenceMarker,
     max_attempts: int,
+    attempt_retention_days: int,
     now: datetime | None,
 ) -> _PreparedSingleDelete:
     for _ in range(2):
@@ -187,6 +188,7 @@ async def _prepare_single_delete_tx1(
                     user_id=user_id,
                     dedupe_key=f"{JOB_TYPE_MEMORY_DELETE}:{operation.id}",
                     max_attempts=max_attempts,
+                    attempt_retention_days=attempt_retention_days,
                     now=current_time,
                     metadata_json={
                         "operation_id": str(operation.id),
@@ -263,6 +265,7 @@ async def delete_single_memory(
     audit_archiver: DeletionAuditArchiver | None = None,
     max_attempts: int = 5,
     reconcile_delay_seconds: float = 10.0,
+    attempt_retention_days: int = jobs_service.DEFAULT_JOB_ATTEMPT_RETENTION_DAYS,
     now: datetime | None = None,
 ) -> MemoryDeletionOutcome:
     """Persist tombstone + operation, invoke provider delete outside Tx, and converge outcome."""
@@ -282,6 +285,7 @@ async def delete_single_memory(
         memory_id=normalized_id,
         marker=marker,
         max_attempts=max_attempts,
+        attempt_retention_days=attempt_retention_days,
         now=now,
     )
     if prepared.shortcut is not None:
@@ -334,6 +338,7 @@ async def delete_single_memory(
                 status="succeeded",
                 external_ref=ext_ref,
                 metadata_patch={"delete_state": "verified"},
+                attempt_retention_days=attempt_retention_days,
                 now=current_time,
             )
         final_op = completed_op or operation
@@ -402,6 +407,7 @@ async def delete_single_memory(
                 ),
                 metadata_patch={"delete_state": "reconciling" if is_rec else "accepted"},
                 next_run_at=current_time + timedelta(seconds=reconcile_delay_seconds),
+                attempt_retention_days=attempt_retention_days,
                 now=current_time,
             )
         final_op = updated_op or operation
@@ -446,6 +452,7 @@ async def delete_single_memory(
             error_code=mapped_error.code,
             error_summary="memory provider rejected single memory deletion",
             metadata_patch={"delete_state": "failed"},
+            attempt_retention_days=attempt_retention_days,
             now=current_time,
         )
     await export_deletion_audit_events_safely(

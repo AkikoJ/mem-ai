@@ -368,6 +368,7 @@ async def finish_job_attempt(
     external_ref: str | None,
     error_code: str | None,
     result_summary: dict[str, Any],
+    expires_at: datetime | None = None,
 ) -> JobAttempt | None:
     """Conditionally finalize an open `running` attempt row."""
     conditions = [
@@ -376,16 +377,19 @@ async def finish_job_attempt(
     ]
     if lease_token is not None:
         conditions.append(JobAttempt.lease_token == lease_token)
+    values: dict[str, Any] = {
+        "status": status,
+        "finished_at": finished_at,
+        "external_ref": external_ref,
+        "error_code": error_code,
+        "result_summary": dict(result_summary),
+    }
+    if expires_at is not None:
+        values["expires_at"] = func.greatest(JobAttempt.expires_at, normalize_utc(expires_at))
     stmt = (
         update(JobAttempt)
         .where(*conditions)
-        .values(
-            status=status,
-            finished_at=finished_at,
-            external_ref=external_ref,
-            error_code=error_code,
-            result_summary=dict(result_summary),
-        )
+        .values(**values)
         .returning(JobAttempt)
         .execution_options(populate_existing=True)
     )
@@ -402,8 +406,18 @@ async def finish_running_attempts_for_lease(
     external_ref: str | None = None,
     error_code: str | None = None,
     result_summary: dict[str, Any] | None = None,
+    expires_at: datetime | None = None,
 ) -> None:
     """Close any open `running` attempt rows matching `(job_id, lease_token)`."""
+    values: dict[str, Any] = {
+        "status": status,
+        "finished_at": finished_at,
+        "external_ref": external_ref,
+        "error_code": error_code,
+        "result_summary": dict(result_summary) if result_summary is not None else {},
+    }
+    if expires_at is not None:
+        values["expires_at"] = func.greatest(JobAttempt.expires_at, normalize_utc(expires_at))
     stmt = (
         update(JobAttempt)
         .where(
@@ -411,13 +425,7 @@ async def finish_running_attempts_for_lease(
             JobAttempt.lease_token == lease_token,
             JobAttempt.status == "running",
         )
-        .values(
-            status=status,
-            finished_at=finished_at,
-            external_ref=external_ref,
-            error_code=error_code,
-            result_summary=dict(result_summary) if result_summary is not None else {},
-        )
+        .values(**values)
     )
     await session.execute(stmt)
 
@@ -485,6 +493,7 @@ async def claim_due_jobs(
                 external_ref=job.external_ref,
                 error_code="job_lease_expired",
                 result_summary={"reason": "lease_expired_reclaimed"},
+                expires_at=attempt_expires_at,
             )
             if job.attempt_count >= job.max_attempts and job.external_ref is None:
                 job.status = "failed"

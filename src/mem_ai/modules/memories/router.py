@@ -117,6 +117,7 @@ async def create_memory(
     session_factory: SessionFactoryDep,
     memory_provider: MemoryProviderDep,
     conversation_checker: ConversationAccessCheckerDep,
+    settings: SettingsDep,
 ) -> ApiResponse[MemoryItemResponse] | Response:
     """Explicitly create a user- or conversation-scoped long-term memory."""
     outcome = await memories_service.create_explicit_memory(
@@ -127,6 +128,7 @@ async def create_memory(
         scope=payload.scope,
         conversation_id=payload.conversation_id,
         conversation_access_checker=conversation_checker,
+        attempt_retention_days=settings.job_attempt_retention_days,
     )
     if isinstance(outcome, CreatedMemoryOutcome):
         return ok_response(MemoryItemResponse.from_record(outcome.record))
@@ -179,6 +181,7 @@ async def delete_memory(
         audit_archiver=audit_archiver,
         max_attempts=settings.worker_max_attempts,
         reconcile_delay_seconds=settings.worker_reconcile_delay_seconds,
+        attempt_retention_days=settings.job_attempt_retention_days,
     )
     return _build_deletion_response(outcome)
 
@@ -212,5 +215,6 @@ async def clear_memories(
         audit_archiver=audit_archiver,
         max_attempts=settings.worker_max_attempts,
         reconcile_delay_seconds=settings.worker_reconcile_delay_seconds,
+        attempt_retention_days=settings.job_attempt_retention_days,
     )
     return _build_deletion_response(outcome)

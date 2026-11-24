@@ -15,16 +15,17 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal
 from uuid import UUID
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, exists, func, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mem_ai.core.exceptions import AppError, ConflictError, UnprocessableEntityError
 from mem_ai.db.base import get_database_now, normalize_utc
-from mem_ai.modules.conversations.models import IdempotencyRecord
+from mem_ai.modules.conversations.models import Generation, IdempotencyRecord
 from mem_ai.modules.conversations.schemas import (
     DEFAULT_IDEMPOTENCY_RETENTION_SECONDS as DEFAULT_IDEMPOTENCY_RETENTION_SECONDS,
 )
@@ -445,3 +446,88 @@ async def get_idempotency_record_for_generation(
     async with session_factory() as session:
         row = await _get_record_by_generation_in_session(session, generation_id=generation_id)
         return IdempotencyRecordDTO.model_validate(row) if row is not None else None
+
+
+@dataclass(frozen=True, slots=True)
+class IdempotencyPurgeBatch:
+    """Result of one bounded expired-idempotency retention scan batch."""
+
+    deleted_count: int
+    scanned_count: int
+    next_cursor: tuple[datetime, UUID] | None
+    has_more: bool
+
+
+async def purge_expired_idempotency_batch_in_session(
+    session: AsyncSession,
+    *,
+    current_time: datetime,
+    batch_size: int = 100,
+    cursor: tuple[datetime, UUID] | None = None,
+) -> IdempotencyPurgeBatch:
+    """Delete one bounded batch of expired terminal idempotency rows using a stable cursor.
+
+    Active (`running`) records, unexpired terminal records, linked active generations, and all
+    parent conversations/generations/messages remain untouched.
+    """
+    utc_now = normalize_utc(current_time)
+    bounded = max(1, min(500, batch_size))
+    base_conditions = [
+        IdempotencyRecord.status.in_(("succeeded", "failed", "cancelled")),
+        IdempotencyRecord.terminal_at.is_not(None),
+        IdempotencyRecord.expires_at.is_not(None),
+        IdempotencyRecord.expires_at <= utc_now,
+        ~exists(
+            select(Generation.id).where(
+                Generation.id == IdempotencyRecord.generation_id,
+                Generation.status == "running",
+            )
+        ),
+    ]
+    conditions = list(base_conditions)
+    if cursor is not None:
+        cursor_ts, cursor_id = normalize_utc(cursor[0]), cursor[1]
+        conditions.append(
+            tuple_(IdempotencyRecord.expires_at, IdempotencyRecord.id) > (cursor_ts, cursor_id)
+        )
+
+    stmt = (
+        select(IdempotencyRecord.id, IdempotencyRecord.expires_at)
+        .where(*conditions)
+        .order_by(IdempotencyRecord.expires_at.asc(), IdempotencyRecord.id.asc())
+        .limit(bounded)
+        .with_for_update(skip_locked=True)
+    )
+    rows = list((await session.execute(stmt)).all())
+    if not rows:
+        return IdempotencyPurgeBatch(
+            deleted_count=0,
+            scanned_count=0,
+            next_cursor=None,
+            has_more=False,
+        )
+
+    ids_to_delete = [row.id for row in rows]
+    await session.execute(delete(IdempotencyRecord).where(IdempotencyRecord.id.in_(ids_to_delete)))
+
+    last_row = rows[-1]
+    assert last_row.expires_at is not None
+    next_cursor = (normalize_utc(last_row.expires_at), last_row.id)
+    has_more = bool(
+        await session.scalar(
+            select(
+                exists(
+                    select(IdempotencyRecord.id).where(
+                        *base_conditions,
+                        tuple_(IdempotencyRecord.expires_at, IdempotencyRecord.id) > next_cursor,
+                    )
+                )
+            )
+        )
+    )
+    return IdempotencyPurgeBatch(
+        deleted_count=len(ids_to_delete),
+        scanned_count=len(rows),
+        next_cursor=next_cursor if has_more else None,
+        has_more=has_more,
+    )

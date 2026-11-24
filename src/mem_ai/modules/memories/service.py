@@ -305,6 +305,7 @@ async def create_explicit_memory(
     scope: MemoryScope = "user",
     conversation_id: UUID | None = None,
     conversation_access_checker: ConversationAccessChecker | None = None,
+    attempt_retention_days: int = jobs_service.DEFAULT_JOB_ATTEMPT_RETENTION_DAYS,
 ) -> MemoryCreateOutcome:
     """Persist an explicit memory write via unified jobs and MemoryProvider outside DB tx."""
     await users_service.get_active_user(session_factory, user_id=user_id)
@@ -343,6 +344,7 @@ async def create_explicit_memory(
             business_id=write_id,
             user_id=user_id,
             dedupe_key=f"{JOB_TYPE_MEMORY_EXPLICIT_CREATE}:{write_id}",
+            attempt_retention_days=attempt_retention_days,
             metadata_json={
                 "write_id": write_id,
                 "provider_id": provider_id,
@@ -424,6 +426,7 @@ async def create_explicit_memory(
             conversation_access_checker=conversation_access_checker,
             content=content,
             result=result,
+            attempt_retention_days=attempt_retention_days,
         )
 
     if result.status in ("accepted", "reconciling") or (
@@ -468,6 +471,7 @@ async def create_explicit_memory(
                     else "accepted for async extraction; pending verification"
                 ),
                 metadata_patch={"operation_id": str(operation.id)},
+                attempt_retention_days=attempt_retention_days,
             )
         return AcceptedMemoryOutcome(operation=operation)
 
@@ -479,6 +483,7 @@ async def create_explicit_memory(
         external_ref=result.external_ref or write_id,
         error_code=result.error_code or "memory_provider_error",
         error_summary="memory provider rejected explicit write",
+        attempt_retention_days=attempt_retention_days,
     )
     raise map_memory_provider_error(
         result.error_code,
@@ -500,6 +505,7 @@ async def _commit_confirmed_write(
     conversation_access_checker: ConversationAccessChecker | None,
     content: str,
     result: MemoryWriteResult,
+    attempt_retention_days: int = jobs_service.DEFAULT_JOB_ATTEMPT_RETENTION_DAYS,
 ) -> MemoryCreateOutcome:
     """Re-verify user status and scope barrier/epoch in Tx 2 before returning 201."""
     assert result.memory_id is not None
@@ -642,6 +648,7 @@ async def _commit_confirmed_write(
                         status="succeeded",
                         external_ref=ext_ref,
                         metadata_patch={"memory_id": result.memory_id},
+                        attempt_retention_days=attempt_retention_days,
                         now=now,
                     )
     if user_inactive_error is not None:
@@ -672,6 +679,7 @@ async def _record_failed_write(
     external_ref: str | None,
     error_code: str,
     error_summary: str,
+    attempt_retention_days: int = jobs_service.DEFAULT_JOB_ATTEMPT_RETENTION_DAYS,
 ) -> None:
     async with session_factory.begin() as session:
         await jobs_service.complete_job_in_session(
@@ -682,6 +690,7 @@ async def _record_failed_write(
             external_ref=external_ref,
             error_code=error_code,
             error_summary=error_summary,
+            attempt_retention_days=attempt_retention_days,
         )
 
 

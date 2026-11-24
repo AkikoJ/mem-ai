@@ -536,6 +536,7 @@ class WorkerRunner:
                 outcome=outcome,
                 backoff_policy=self._config.backoff_policy,
                 random_fn=self._random_fn,
+                attempt_retention_days=self._config.attempt_retention_days,
                 now=now,
             )
             self._processed_count += 1

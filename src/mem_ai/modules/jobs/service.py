@@ -274,6 +274,7 @@ async def complete_job_in_session(
     error_summary: str | None = None,
     metadata_patch: dict[str, Any] | None = None,
     next_run_at: datetime | None = None,
+    attempt_retention_days: int = DEFAULT_JOB_ATTEMPT_RETENTION_DAYS,
     now: datetime | None = None,
 ) -> JobRecord:
     """Conditionally record a claimed job's execution outcome inside caller's transaction."""
@@ -316,6 +317,7 @@ async def complete_job_in_session(
         external_ref=resolved_ext_ref,
         error_code=error_code,
         result_summary={"status": status},
+        expires_at=current_time + timedelta(days=attempt_retention_days),
     )
     return JobRecord.model_validate(updated)
 
@@ -434,6 +436,7 @@ async def record_job_outcome(
     backoff_policy: JobBackoffPolicy | None = None,
     before_commit_hook: JobBeforeCommitHook | None = None,
     random_fn: Callable[[], float] | None = None,
+    attempt_retention_days: int = DEFAULT_JOB_ATTEMPT_RETENTION_DAYS,
     now: datetime | None = None,
 ) -> JobRecord | None:
     """Conditionally commit a handler outcome and optional atomic hook guarded by lease token."""
@@ -448,6 +451,7 @@ async def record_job_outcome(
         if existing is None:
             return None
 
+        attempt_expires_at = current_time + timedelta(days=attempt_retention_days)
         if existing.status != "running" or existing.lease_token != lease_token:
             await repository.finish_job_attempt(
                 session,
@@ -458,6 +462,7 @@ async def record_job_outcome(
                 external_ref=outcome.external_ref or existing.external_ref,
                 error_code="job_lease_lost",
                 result_summary={"reason": "lease_lost_before_commit"},
+                expires_at=attempt_expires_at,
             )
             return None
 
@@ -498,6 +503,7 @@ async def record_job_outcome(
                 external_ref=resolved_ext_ref,
                 error_code="job_lease_lost",
                 result_summary={"reason": "lease_expired_before_commit"},
+                expires_at=attempt_expires_at,
             )
             return None
 
@@ -510,6 +516,7 @@ async def record_job_outcome(
             external_ref=resolved_ext_ref,
             error_code=outcome.error_code,
             result_summary=sanitized_summary,
+            expires_at=attempt_expires_at,
         )
         record = JobRecord.model_validate(updated)
 
@@ -519,36 +526,28 @@ async def record_job_outcome(
     if outcome.after_commit is not None:
         await outcome.after_commit(record)
 
-    if record.status == "reconciling":
-        logger.warning(
-            "Durable job entered reconciling state; external outcome requires verification",
-            extra={
-                "extra_fields": {
-                    "alert": "job_reconciling",
-                    "job_id": str(record.id),
-                    "job_type": record.job_type,
-                    "attempt_count": record.attempt_count,
-                    "external_ref": record.external_ref,
-                    "error_code": record.last_error_code,
-                    "next_run_at": record.next_run_at.isoformat(),
-                }
-            },
-        )
-    elif record.status == "failed":
-        logger.error(
-            "Durable job reached terminal failed state",
-            extra={
-                "extra_fields": {
-                    "alert": "job_failed",
-                    "job_id": str(record.id),
-                    "job_type": record.job_type,
-                    "attempt_count": record.attempt_count,
-                    "max_attempts": record.max_attempts,
-                    "external_ref": record.external_ref,
-                    "error_code": record.last_error_code,
-                }
-            },
-        )
+    if record.status in ("reconciling", "failed"):
+        is_reconciling = record.status == "reconciling"
+        fields: dict[str, Any] = {
+            "alert": "job_reconciling" if is_reconciling else "job_failed",
+            "job_id": str(record.id),
+            "job_type": record.job_type,
+            "attempt_count": record.attempt_count,
+            "external_ref": record.external_ref,
+            "error_code": record.last_error_code,
+        }
+        if is_reconciling:
+            fields["next_run_at"] = record.next_run_at.isoformat()
+            logger.warning(
+                "Durable job entered reconciling state; external outcome requires verification",
+                extra={"extra_fields": fields},
+            )
+        else:
+            fields["max_attempts"] = record.max_attempts
+            logger.error(
+                "Durable job reached terminal failed state",
+                extra={"extra_fields": fields},
+            )
 
     return record
 

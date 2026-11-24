@@ -460,3 +460,46 @@ def test_memory_deletion_barrier_and_audit_archive_settings_validation() -> None
 
     with pytest.raises(ValidationError, match="deletion_audit_archive_path"):
         Settings(_env_file=None, app_env="test", deletion_audit_archive_path="   ")
+
+
+def test_data_retention_policy_settings_defaults_and_bounds() -> None:
+    defaults = Settings(_env_file=None, app_env="test")
+    assert defaults.conversation_retention_policy == "indefinite"
+    assert defaults.job_attempt_retention_days == 30
+    assert defaults.idempotency_retention_hours == 24
+    assert defaults.memory_list_snapshot_ttl_seconds == 600
+    assert defaults.deletion_receipt_ttl_seconds == 2592000
+    assert defaults.operation_summary_retention_days == 30
+    assert defaults.retention_cleanup_interval_seconds == 900
+    assert defaults.retention_batch_size == 100
+    assert defaults.retention_max_batches_per_run == 50
+
+    custom = Settings(
+        _env_file=None,
+        app_env="test",
+        conversation_retention_policy="indefinite",
+        operation_summary_retention_days=14,
+        retention_cleanup_interval_seconds=60,
+        retention_batch_size=25,
+        retention_max_batches_per_run=10,
+    )
+    assert custom.conversation_retention_policy == "indefinite"
+    assert custom.operation_summary_retention_days == 14
+    assert custom.retention_cleanup_interval_seconds == 60
+    assert custom.retention_batch_size == 25
+    assert custom.retention_max_batches_per_run == 10
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, app_env="test", conversation_retention_policy="30d")  # type: ignore[arg-type]
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, app_env="test", operation_summary_retention_days=0)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, app_env="test", retention_cleanup_interval_seconds=5)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, app_env="test", retention_batch_size=0)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, app_env="test", retention_max_batches_per_run=0)

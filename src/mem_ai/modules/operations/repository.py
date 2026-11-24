@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import and_, delete, exists, or_, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from mem_ai.db.base import normalize_utc
 from mem_ai.modules.operations.models import Operation
 
 
@@ -280,3 +281,161 @@ async def finalize_user_operations(
     deletion.error_message = None
     await session.flush()
     return True
+
+
+async def find_non_terminal_operation_links(
+    session: AsyncSession,
+    *,
+    job_ids: Sequence[UUID] = (),
+    operation_ids: Sequence[UUID] = (),
+) -> tuple[frozenset[UUID], frozenset[UUID]]:
+    """Return `(protected_job_ids, protected_operation_ids)` still tied to non-terminal ops."""
+    unique_jobs = tuple(set(job_ids))
+    unique_ops = tuple(set(operation_ids))
+    protected_jobs: set[UUID] = set()
+    protected_ops: set[UUID] = set()
+
+    if unique_jobs:
+        job_stmt = select(Operation.job_id).where(
+            Operation.job_id.in_(unique_jobs),
+            Operation.status.not_in(("succeeded", "failed")),
+        )
+        for job_id in (await session.scalars(job_stmt)).all():
+            if job_id is not None:
+                protected_jobs.add(job_id)
+
+    if unique_ops:
+        op_stmt = select(Operation.id).where(
+            Operation.id.in_(unique_ops),
+            Operation.status.not_in(("succeeded", "failed")),
+        )
+        protected_ops.update((await session.scalars(op_stmt)).all())
+
+    return frozenset(protected_jobs), frozenset(protected_ops)
+
+
+async def purge_expired_user_delete_operations_batch(
+    session: AsyncSession,
+    *,
+    current_time: datetime,
+    batch_size: int = 100,
+    cursor: tuple[datetime, UUID] | None = None,
+) -> tuple[int, int, tuple[datetime, UUID] | None, bool]:
+    """Delete finalized `user_delete` operations whose receipt TTL has elapsed.
+
+    Non-terminal, failed, or still-owner-bound `user_delete` operations are strictly retained.
+    """
+    utc_now = normalize_utc(current_time)
+    bounded = max(1, min(500, batch_size))
+    base_conditions = [
+        Operation.operation_type == "user_delete",
+        Operation.status == "succeeded",
+        Operation.owner_id.is_(None),
+        Operation.expires_at.is_not(None),
+        Operation.expires_at <= utc_now,
+    ]
+    conditions = list(base_conditions)
+    if cursor is not None:
+        cursor_ts, cursor_id = normalize_utc(cursor[0]), cursor[1]
+        conditions.append(tuple_(Operation.expires_at, Operation.id) > (cursor_ts, cursor_id))
+
+    stmt = (
+        select(Operation.id, Operation.expires_at)
+        .where(*conditions)
+        .order_by(Operation.expires_at.asc(), Operation.id.asc())
+        .limit(bounded)
+        .with_for_update(skip_locked=True)
+    )
+    rows = list((await session.execute(stmt)).all())
+    if not rows:
+        return 0, 0, None, False
+
+    ids_to_delete = [row.id for row in rows]
+    await session.execute(delete(Operation).where(Operation.id.in_(ids_to_delete)))
+
+    last_row = rows[-1]
+    assert last_row.expires_at is not None
+    next_cursor = (normalize_utc(last_row.expires_at), last_row.id)
+    has_more = bool(
+        await session.scalar(
+            select(
+                exists(
+                    select(Operation.id).where(
+                        *base_conditions,
+                        tuple_(Operation.expires_at, Operation.id) > next_cursor,
+                    )
+                )
+            )
+        )
+    )
+    return len(ids_to_delete), len(rows), (next_cursor if has_more else None), has_more
+
+
+async def scan_expired_operation_summaries_batch(
+    session: AsyncSession,
+    *,
+    current_time: datetime,
+    retention_days: int,
+    batch_size: int = 100,
+    cursor: tuple[datetime, UUID] | None = None,
+) -> tuple[list[tuple[UUID, UUID | None, datetime]], tuple[datetime, UUID] | None, bool]:
+    """Lock and return one bounded batch of settled non-user-delete operations for purge."""
+    utc_now = normalize_utc(current_time)
+    cutoff = utc_now - timedelta(days=retention_days)
+    bounded = max(1, min(500, batch_size))
+    base_conditions = [
+        Operation.operation_type != "user_delete",
+        Operation.status.in_(("succeeded", "failed")),
+        Operation.completed_at.is_not(None),
+        or_(
+            and_(Operation.expires_at.is_not(None), Operation.expires_at <= utc_now),
+            and_(Operation.expires_at.is_(None), Operation.completed_at <= cutoff),
+        ),
+    ]
+    conditions = list(base_conditions)
+    if cursor is not None:
+        cursor_ts, cursor_id = normalize_utc(cursor[0]), cursor[1]
+        conditions.append(tuple_(Operation.completed_at, Operation.id) > (cursor_ts, cursor_id))
+
+    stmt = (
+        select(Operation.id, Operation.job_id, Operation.completed_at)
+        .where(*conditions)
+        .order_by(Operation.completed_at.asc(), Operation.id.asc())
+        .limit(bounded)
+        .with_for_update(skip_locked=True)
+    )
+    rows = list((await session.execute(stmt)).all())
+    if not rows:
+        return [], None, False
+
+    items: list[tuple[UUID, UUID | None, datetime]] = []
+    for row in rows:
+        assert row.completed_at is not None
+        items.append((row.id, row.job_id, normalize_utc(row.completed_at)))
+
+    last_id, _, last_completed_at = items[-1]
+    next_cursor = (last_completed_at, last_id)
+    has_more = bool(
+        await session.scalar(
+            select(
+                exists(
+                    select(Operation.id).where(
+                        *base_conditions,
+                        tuple_(Operation.completed_at, Operation.id) > next_cursor,
+                    )
+                )
+            )
+        )
+    )
+    return items, (next_cursor if has_more else None), has_more
+
+
+async def delete_operations_by_ids(session: AsyncSession, *, operation_ids: Sequence[UUID]) -> int:
+    """Delete a vetted batch of operation rows by ID and return the deleted count."""
+    unique_ids = tuple(set(operation_ids))
+    if not unique_ids:
+        return 0
+    result = await session.execute(
+        delete(Operation).where(Operation.id.in_(unique_ids)).returning(Operation.id)
+    )
+    return len(result.all())

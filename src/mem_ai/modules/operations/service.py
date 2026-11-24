@@ -6,6 +6,8 @@ import hashlib
 import hmac
 import re
 import secrets
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
@@ -309,3 +311,123 @@ async def transition_operation_in_session(
         updated_at=current_time,
     )
     return OperationRecord.model_validate(updated) if updated is not None else None
+
+
+@dataclass(frozen=True, slots=True)
+class OperationPurgeBatch:
+    """Result of one bounded expired-operation retention scan batch."""
+
+    deleted_count: int
+    protected_skipped: int
+    scanned_count: int
+    next_cursor: tuple[datetime, UUID] | None
+    has_more: bool
+
+
+OperationProtectionFilter = Callable[[AsyncSession, Sequence[UUID]], Awaitable[frozenset[UUID]]]
+
+
+async def find_non_terminal_operation_links_in_session(
+    session: AsyncSession,
+    *,
+    job_ids: Sequence[UUID] = (),
+    operation_ids: Sequence[UUID] = (),
+) -> tuple[frozenset[UUID], frozenset[UUID]]:
+    """Return `(protected_job_ids, protected_operation_ids)` still tied to non-terminal ops."""
+    return await repository.find_non_terminal_operation_links(
+        session,
+        job_ids=job_ids,
+        operation_ids=operation_ids,
+    )
+
+
+async def purge_expired_user_delete_operations_batch_in_session(
+    session: AsyncSession,
+    *,
+    current_time: datetime,
+    batch_size: int = 100,
+    cursor: tuple[datetime, UUID] | None = None,
+) -> OperationPurgeBatch:
+    """Physically delete finalized `user_delete` operations whose receipt TTL has elapsed."""
+    (
+        deleted_count,
+        scanned_count,
+        next_cursor,
+        has_more,
+    ) = await repository.purge_expired_user_delete_operations_batch(
+        session,
+        current_time=current_time,
+        batch_size=batch_size,
+        cursor=cursor,
+    )
+    return OperationPurgeBatch(
+        deleted_count=deleted_count,
+        protected_skipped=0,
+        scanned_count=scanned_count,
+        next_cursor=next_cursor,
+        has_more=has_more,
+    )
+
+
+async def purge_expired_operation_summaries_batch_in_session(
+    session: AsyncSession,
+    *,
+    current_time: datetime,
+    retention_days: int = 30,
+    batch_size: int = 100,
+    cursor: tuple[datetime, UUID] | None = None,
+    protected_operation_filter: OperationProtectionFilter | None = None,
+    protected_job_filter: OperationProtectionFilter | None = None,
+) -> OperationPurgeBatch:
+    """Delete one bounded batch of settled non-user-delete operations past their retention window.
+
+    Protects non-terminal operations, operations still backing active memory barriers or
+    unverified tombstones, and operations linked to active/reconciling jobs.
+    """
+    candidates, next_cursor, has_more = await repository.scan_expired_operation_summaries_batch(
+        session,
+        current_time=current_time,
+        retention_days=retention_days,
+        batch_size=batch_size,
+        cursor=cursor,
+    )
+    if not candidates:
+        return OperationPurgeBatch(
+            deleted_count=0,
+            protected_skipped=0,
+            scanned_count=0,
+            next_cursor=None,
+            has_more=False,
+        )
+
+    protected_ops: set[UUID] = set()
+    if protected_operation_filter is not None:
+        protected_ops.update(
+            await protected_operation_filter(session, [op_id for op_id, _, _ in candidates])
+        )
+
+    protected_jobs: set[UUID] = set()
+    if protected_job_filter is not None:
+        job_ids = [job_id for _, job_id, _ in candidates if job_id is not None]
+        if job_ids:
+            protected_jobs.update(await protected_job_filter(session, job_ids))
+
+    deletable_ids: list[UUID] = []
+    protected_skipped = 0
+    for op_id, job_id, _ in candidates:
+        if op_id in protected_ops or (job_id is not None and job_id in protected_jobs):
+            protected_skipped += 1
+            continue
+        deletable_ids.append(op_id)
+
+    deleted_count = await repository.delete_operations_by_ids(
+        session,
+        operation_ids=deletable_ids,
+    )
+    return OperationPurgeBatch(
+        deleted_count=deleted_count,
+        protected_skipped=protected_skipped,
+        scanned_count=len(candidates),
+        next_cursor=next_cursor,
+        has_more=has_more,
+    )

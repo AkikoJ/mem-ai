@@ -206,3 +206,40 @@ class MemorySnapshotStore:
             else None
         )
         return MemoryListPage(items=page_items, next_cursor=next_cursor, has_more=has_more)
+
+
+@dataclass(frozen=True, slots=True)
+class MemorySnapshotPurgeBatch:
+    """Result of one bounded expired pagination snapshot cleanup batch."""
+
+    deleted_count: int
+    scanned_count: int
+    next_cursor: tuple[datetime, UUID] | None
+    has_more: bool
+
+
+async def purge_expired_list_snapshots_batch_in_session(
+    session: AsyncSession,
+    *,
+    current_time: datetime,
+    batch_size: int = 100,
+    cursor: tuple[datetime, UUID] | None = None,
+) -> MemorySnapshotPurgeBatch:
+    """Delete one bounded batch of expired `memory_list_snapshots` using a stable cursor."""
+    (
+        deleted_count,
+        scanned_count,
+        next_cursor,
+        has_more,
+    ) = await repository.purge_expired_list_snapshots_batch(
+        session,
+        current_time=current_time,
+        batch_size=batch_size,
+        cursor=cursor,
+    )
+    return MemorySnapshotPurgeBatch(
+        deleted_count=deleted_count,
+        scanned_count=scanned_count,
+        next_cursor=next_cursor,
+        has_more=has_more,
+    )

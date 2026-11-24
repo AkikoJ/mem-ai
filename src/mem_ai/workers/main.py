@@ -41,6 +41,11 @@ from mem_ai.modules.operations.audit import (
     DeletionAuditArchiver,
     build_deletion_audit_archiver,
 )
+from mem_ai.modules.retention.schemas import RetentionPolicy, retention_policy_from_settings
+from mem_ai.modules.retention.service import (
+    JOB_TYPE_RETENTION_CLEANUP,
+    RetentionCleanupJobHandler,
+)
 from mem_ai.modules.users.cleanup import JOB_TYPE_USER_DELETE, UserCleanupJobHandler
 from mem_ai.workers.runner import (
     JobHandlerRegistry,
@@ -93,6 +98,7 @@ def build_worker_registry(
     audit_archiver: DeletionAuditArchiver | None = None,
     clock: Callable[[], datetime] | None = None,
     conversation_cleanup_batch_size: int = 50,
+    retention_policy: RetentionPolicy | None = None,
 ) -> JobHandlerRegistry:
     """Assemble typed Worker job handlers with unidirectional module dependencies."""
     registry = JobHandlerRegistry()
@@ -114,6 +120,18 @@ def build_worker_registry(
         GenerationLeaseRecoveryJobHandler(
             session_factory=session_factory,
             idempotency_retention_seconds=idempotency_retention_seconds,
+        ),
+    )
+    registry.register(
+        JOB_TYPE_RETENTION_CLEANUP,
+        RetentionCleanupJobHandler(
+            session_factory=session_factory,
+            policy=retention_policy,
+            clock=clock,
+            prunable_periodic_job_types=(
+                JOB_TYPE_GENERATION_LEASE_RECOVERY,
+                JOB_TYPE_RETENTION_CLEANUP,
+            ),
         ),
     )
 
@@ -169,6 +187,11 @@ def default_periodic_jobs(settings: Settings) -> tuple[PeriodicJobSpec, ...]:
             interval_seconds=recovery_interval,
             max_attempts=3,
         ),
+        PeriodicJobSpec(
+            job_type=JOB_TYPE_RETENTION_CLEANUP,
+            interval_seconds=float(settings.retention_cleanup_interval_seconds),
+            max_attempts=3,
+        ),
     )
 
 
@@ -215,6 +238,7 @@ async def run_worker(
             resolved_settings.memory_clear_compensation_delay_seconds
         ),
         audit_archiver=audit_archiver,
+        retention_policy=retention_policy_from_settings(resolved_settings),
     )
     worker_config = (
         config_override

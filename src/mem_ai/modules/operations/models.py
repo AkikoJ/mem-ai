@@ -34,6 +34,18 @@ class Operation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_operations_owner_id_created_at", "owner_id", "created_at"),
         Index("ix_operations_status_updated_at", "status", "updated_at"),
         Index(
+            "ix_operations_expires_at_id",
+            "expires_at",
+            "id",
+            postgresql_where=text("expires_at IS NOT NULL"),
+        ),
+        Index(
+            "ix_operations_completed_at_id",
+            "completed_at",
+            "id",
+            postgresql_where=text("completed_at IS NOT NULL"),
+        ),
+        Index(
             "uq_operations_user_delete_owner",
             "owner_id",
             unique=True,

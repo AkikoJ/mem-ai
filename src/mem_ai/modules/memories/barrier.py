@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 from uuid import UUID
@@ -601,3 +601,12 @@ async def finalize_clear_barrier_in_session(
         result_summary=result_summary,
         now=current_time,
     )
+
+
+async def find_protected_operation_ids_in_session(
+    session: AsyncSession,
+    *,
+    operation_ids: Sequence[UUID],
+) -> frozenset[UUID]:
+    """Return operation IDs still referenced by an active memory barrier or unverified tombstone."""
+    return await repository.find_protected_operation_ids(session, operation_ids=operation_ids)

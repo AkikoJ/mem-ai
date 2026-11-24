@@ -78,6 +78,7 @@ async def prepare_clear_scope_in_session(
     current_time: datetime,
     force_async: bool = False,
     user_cleanup_operation_id: UUID | None = None,
+    attempt_retention_days: int = jobs_service.DEFAULT_JOB_ATTEMPT_RETENTION_DAYS,
 ) -> _PreparedClearScope:
     """Prepare a clear under the caller's resource-status policy.
 
@@ -218,6 +219,7 @@ async def prepare_clear_scope_in_session(
             user_id=user_id,
             dedupe_key=f"{JOB_TYPE_MEMORY_CLEAR}:{operation.id}",
             max_attempts=max_attempts,
+            attempt_retention_days=attempt_retention_days,
             now=current_time,
             metadata_json=clear_meta,
         )
@@ -284,6 +286,7 @@ async def _prepare_clear_scope_tx1(
     provider_id: str,
     marker: RecalledMemoryReferenceMarker,
     max_attempts: int,
+    attempt_retention_days: int,
     now: datetime | None,
 ) -> _PreparedClearScope:
     async with session_factory.begin() as session:
@@ -296,6 +299,7 @@ async def _prepare_clear_scope_tx1(
             marker=marker,
             max_attempts=max_attempts,
             current_time=current_time,
+            attempt_retention_days=attempt_retention_days,
         )
 
 
@@ -309,6 +313,7 @@ async def clear_user_memories(
     audit_archiver: DeletionAuditArchiver | None = None,
     max_attempts: int = 5,
     reconcile_delay_seconds: float = 10.0,
+    attempt_retention_days: int = jobs_service.DEFAULT_JOB_ATTEMPT_RETENTION_DAYS,
     now: datetime | None = None,
 ) -> MemoryDeletionOutcome:
     """Atomically bump epoch, establish clearing barrier, cancel queued writes, and clear."""
@@ -326,6 +331,7 @@ async def clear_user_memories(
         provider_id=provider_id,
         marker=marker,
         max_attempts=max_attempts,
+        attempt_retention_days=attempt_retention_days,
         now=now,
     )
     if prepared.shortcut is not None:
@@ -374,6 +380,7 @@ async def clear_user_memories(
                 status="succeeded",
                 external_ref=ext_ref,
                 metadata_patch={"clear_phase": "completed"},
+                attempt_retention_days=attempt_retention_days,
                 now=current_time,
             )
         final_op = completed_op or operation
@@ -488,6 +495,7 @@ async def clear_user_memories(
                 if job_status in ("reconciling", "retry_wait")
                 else None
             ),
+            attempt_retention_days=attempt_retention_days,
             now=current_time,
         )
 

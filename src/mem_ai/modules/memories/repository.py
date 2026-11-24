@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import delete, select, union, update
+from sqlalchemy import delete, exists, select, tuple_, union, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -450,3 +450,82 @@ async def delete_user_memory_state(
         models=(MemoryListSnapshot, MemoryTombstone, MemoryScopeState),
         batch_size=batch_size,
     )
+
+
+async def purge_expired_list_snapshots_batch(
+    session: AsyncSession,
+    *,
+    current_time: datetime,
+    batch_size: int = 100,
+    cursor: tuple[datetime, UUID] | None = None,
+) -> tuple[int, int, tuple[datetime, UUID] | None, bool]:
+    """Delete one bounded batch of expired `memory_list_snapshots` ordered by `(expires_at, id)`."""
+    utc_now = normalize_utc(current_time)
+    bounded = max(1, min(500, batch_size))
+    base_conditions = [MemoryListSnapshot.expires_at <= utc_now]
+    conditions = list(base_conditions)
+    if cursor is not None:
+        cursor_ts, cursor_id = normalize_utc(cursor[0]), cursor[1]
+        conditions.append(
+            tuple_(MemoryListSnapshot.expires_at, MemoryListSnapshot.id) > (cursor_ts, cursor_id)
+        )
+
+    stmt = (
+        select(MemoryListSnapshot.id, MemoryListSnapshot.expires_at)
+        .where(*conditions)
+        .order_by(MemoryListSnapshot.expires_at.asc(), MemoryListSnapshot.id.asc())
+        .limit(bounded)
+        .with_for_update(skip_locked=True)
+    )
+    rows = list((await session.execute(stmt)).all())
+    if not rows:
+        return 0, 0, None, False
+
+    ids_to_delete = [row.id for row in rows]
+    await session.execute(
+        delete(MemoryListSnapshot).where(MemoryListSnapshot.id.in_(ids_to_delete))
+    )
+
+    last_row = rows[-1]
+    next_cursor = (normalize_utc(last_row.expires_at), last_row.id)
+    has_more = bool(
+        await session.scalar(
+            select(
+                exists(
+                    select(MemoryListSnapshot.id).where(
+                        *base_conditions,
+                        tuple_(MemoryListSnapshot.expires_at, MemoryListSnapshot.id) > next_cursor,
+                    )
+                )
+            )
+        )
+    )
+    return len(ids_to_delete), len(rows), (next_cursor if has_more else None), has_more
+
+
+async def find_protected_operation_ids(
+    session: AsyncSession,
+    *,
+    operation_ids: Sequence[UUID],
+) -> frozenset[UUID]:
+    """Return operation IDs still protecting an active barrier or unverified tombstone."""
+    unique_ids = tuple(set(operation_ids))
+    if not unique_ids:
+        return frozenset()
+
+    scope_stmt = select(MemoryScopeState.barrier_operation_id).where(
+        MemoryScopeState.barrier_operation_id.in_(unique_ids),
+        MemoryScopeState.barrier_state != "idle",
+    )
+    tombstone_stmt = select(MemoryTombstone.operation_id).where(
+        MemoryTombstone.operation_id.in_(unique_ids),
+        MemoryTombstone.status != "verified",
+    )
+    protected: set[UUID] = set()
+    for op_id in (await session.scalars(scope_stmt)).all():
+        if op_id is not None:
+            protected.add(op_id)
+    for op_id in (await session.scalars(tombstone_stmt)).all():
+        if op_id is not None:
+            protected.add(op_id)
+    return frozenset(protected)

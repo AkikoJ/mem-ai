@@ -267,8 +267,13 @@ class Settings(BaseSettings):
     worker_backoff_jitter_ratio: float = Field(default=0.2, ge=0.0, le=1.0)
     worker_reconcile_delay_seconds: float = Field(default=10.0, gt=0.0, le=3600.0)
     worker_shutdown_grace_seconds: float = Field(default=15.0, gt=0.0, le=300.0)
+    conversation_retention_policy: Literal["indefinite"] = "indefinite"
     job_attempt_retention_days: int = Field(default=30, ge=1, le=365)
     idempotency_retention_hours: int = Field(default=24, ge=1, le=720)
+    operation_summary_retention_days: int = Field(default=30, ge=1, le=365)
+    retention_cleanup_interval_seconds: int = Field(default=900, ge=10, le=86400)
+    retention_batch_size: int = Field(default=100, ge=1, le=500)
+    retention_max_batches_per_run: int = Field(default=50, ge=1, le=1000)
 
     @model_validator(mode="after")
     def validate_production_boundaries(self) -> Settings:
