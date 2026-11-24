@@ -62,6 +62,14 @@ class JobRecord(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+    def has_active_lease(self, now: datetime) -> bool:
+        """Return True when this job currently holds an unexpired running lease."""
+        return (
+            self.status == "running"
+            and self.lease_expires_at is not None
+            and self.lease_expires_at > now
+        )
+
 
 class JobAttemptRecord(BaseModel):
     """Immutable snapshot of a sanitized job execution attempt summary."""

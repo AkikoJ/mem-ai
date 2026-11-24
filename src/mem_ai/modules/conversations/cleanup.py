@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mem_ai.contracts.memory_provider import MemoryProvider
-from mem_ai.core.exceptions import NotFoundError
+from mem_ai.core.exceptions import ForbiddenError, NotFoundError
 from mem_ai.db.base import get_database_now
 from mem_ai.modules.conversations import cleanup_repository, generation, repository
 from mem_ai.modules.jobs import service as jobs_service
@@ -131,6 +131,7 @@ class ConversationCleanupJobHandler:
         phase = "settling_generation"
         patch: dict[str, object] = {}
         ready = False
+        user_deleting = False
         async with self._session_factory.begin() as session:
             # Match the job outcome hook's lock order, including after lease reclamation.
             await jobs_service.mark_job_dispatched_in_session(
@@ -139,45 +140,71 @@ class ConversationCleanupJobHandler:
                 lease_token=ctx.lease_token,
                 external_ref=f"conversation:{meta.conversation_id}",
             )
-            conversation = await repository.get_conversation_for_update(
-                session,
-                owner_id=owner,
-                conversation_id=meta.conversation_id,
-            )
-            now = await get_database_now(session)
-            if conversation is None or conversation.status != "deleting":
-                return JobHandlerOutcome(outcome="failed", error_code="conversation_not_deleting")
-            running = await repository.get_running_generation_for_conversation(
-                session,
-                conversation_id=meta.conversation_id,
-            )
-            if (
-                running is not None
-                and running.lease_expires_at is not None
-                and running.lease_expires_at <= now
-            ):
-                await generation.converge_generation_failure_in_session(
+            try:
+                await users_service.ensure_user_active_in_session(session, user_id=owner)
+            except ForbiddenError as exc:
+                if exc.code in ("user_deleting", "user_not_active"):
+                    user_deleting = True
+            if not user_deleting:
+                conversation = await repository.get_conversation_for_update(
                     session,
                     owner_id=owner,
                     conversation_id=meta.conversation_id,
-                    generation_id=running.id,
-                    lease_token=None,
-                    error_code="generation_lease_lost",
-                    error_message="generation lease expired",
-                    current_time=now,
-                    expired_only=True,
                 )
-                running = None
-            if running is None:
-                phase = "settling_memory_writes"
-                ready = await memories_service.settle_conversation_writes_in_session(
+                now = await get_database_now(session)
+                if conversation is None or conversation.status != "deleting":
+                    return JobHandlerOutcome(
+                        outcome="failed", error_code="conversation_not_deleting"
+                    )
+                if await _settle_running_generation_in_session(
                     session,
-                    user_id=owner,
+                    owner_id=owner,
                     conversation_id=meta.conversation_id,
-                    operation_id=meta.operation_id,
-                    batch_size=self._batch_size,
                     now=now,
+                    expired_message="generation lease expired",
+                ):
+                    phase = "settling_memory_writes"
+                    ready = await memories_service.settle_conversation_writes_in_session(
+                        session,
+                        user_id=owner,
+                        conversation_id=meta.conversation_id,
+                        operation_id=meta.operation_id,
+                        batch_size=self._batch_size,
+                        now=now,
+                    )
+        if user_deleting:
+
+            async def mark_superseded(session: AsyncSession, _job: JobRecord) -> None:
+                op = await operations_service.get_operation_in_session(
+                    session, operation_id=meta.operation_id, for_update=True
                 )
+                if op is None or op.status in ("succeeded", "failed"):
+                    return
+                now = await get_database_now(session)
+                if op.status == "pending":
+                    await operations_service.transition_operation_in_session(
+                        session, operation_id=op.id, status="running", now=now
+                    )
+                if not op.progress.get("local_complete"):
+                    await operations_service.transition_operation_in_session(
+                        session,
+                        operation_id=op.id,
+                        status="reconciling",
+                        progress={
+                            "phase": "awaiting_user_remote_memories",
+                            "local_complete": False,
+                            "remote_complete": False,
+                        },
+                        now=now,
+                    )
+
+            return JobHandlerOutcome(
+                outcome="cancelled",
+                error_code="user_deleting",
+                error_summary="conversation cleanup joined user deletion",
+                metadata_patch={"superseded_by_user_delete": True},
+                before_commit=mark_superseded,
+            )
         completed = False
         local_batch = False
         if ready and meta.provider_index < len(meta.provider_ids):
@@ -247,6 +274,36 @@ class ConversationCleanupJobHandler:
         )
 
 
+async def _settle_running_generation_in_session(
+    session: AsyncSession,
+    *,
+    owner_id: UUID,
+    conversation_id: UUID,
+    now: datetime,
+    expired_message: str,
+) -> bool:
+    """Converge an expired running generation in place; return False if a live lease remains."""
+    running = await repository.get_running_generation_for_conversation(
+        session, conversation_id=conversation_id
+    )
+    if running is None:
+        return True
+    if running.lease_expires_at is None or running.lease_expires_at > now:
+        return False
+    settled = await generation.converge_generation_failure_in_session(
+        session,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        generation_id=running.id,
+        lease_token=None,
+        error_code="generation_lease_lost",
+        error_message=expired_message,
+        current_time=now,
+        expired_only=True,
+    )
+    return settled is not None
+
+
 async def settle_user_generations_in_session(
     session: AsyncSession,
     *,
@@ -266,24 +323,14 @@ async def settle_user_generations_in_session(
         await repository.get_conversation_for_update(
             session, owner_id=owner_id, conversation_id=conversation_id
         )
-        running = await repository.get_running_generation_for_conversation(
-            session, conversation_id=conversation_id
-        )
-        if running is None:
-            continue
-        if running.lease_expires_at is None or running.lease_expires_at > now:
-            return False
-        await generation.converge_generation_failure_in_session(
+        if not await _settle_running_generation_in_session(
             session,
             owner_id=owner_id,
             conversation_id=conversation_id,
-            generation_id=running.id,
-            lease_token=None,
-            error_code="generation_lease_lost",
-            error_message="generation lease expired during user deletion",
-            current_time=now,
-            expired_only=True,
-        )
+            now=now,
+            expired_message="generation lease expired during user deletion",
+        ):
+            return False
     return not await cleanup_repository.has_user_running_generations(session, owner_id=owner_id)
 
 
@@ -294,10 +341,11 @@ async def cleanup_user_conversations_in_session(
     batch_size: int = 50,
     now: datetime,
 ) -> bool:
-    """Remove one bounded local batch after the user-wide remote barrier is confirmed.
+    """Remove one bounded local batch after generation leases settled and barriers installed.
 
     The caller has persisted the irreversible deleting state. Conversation jobs are superseded only
-    after their valid leases expire; their operation succeeds when the local root is removed.
+    after their valid leases expire; superseded operations stay reconciling until remote user
+    memory deletion is confirmed.
     """
     conversation_id = await cleanup_repository.first_user_conversation_id(
         session, owner_id=owner_id
@@ -306,11 +354,6 @@ async def cleanup_user_conversations_in_session(
         return True
     matching = {"conversation_id": str(conversation_id)}
 
-    def can_supersede(job: JobRecord) -> bool:
-        return job.status != "running" or (
-            job.lease_expires_at is not None and job.lease_expires_at <= now
-        )
-
     # Preserve the shared handler's job -> conversation lock order. A live job must finish
     # its attempt before this coordinator owns the graph; SKIP LOCKED also avoids lease races.
     await jobs_service.cancel_matching_jobs_in_session(
@@ -318,7 +361,7 @@ async def cleanup_user_conversations_in_session(
         user_id=owner_id,
         job_types=(JOB_TYPE_CONVERSATION_DELETE,),
         allowed_statuses=("pending", "retry_wait", "running", "reconciling"),
-        predicate=can_supersede,
+        predicate=lambda job: not job.has_active_lease(now),
         error_code="user_deleting",
         error_summary="conversation cleanup joined user deletion",
         metadata_patch={"superseded_by_user_delete": True},
@@ -345,25 +388,14 @@ async def cleanup_user_conversations_in_session(
     conversation.status = "deleting"
     conversation.deleted_at = conversation.deleted_at or now
     conversation.updated_at = now
-    running = await repository.get_running_generation_for_conversation(
-        session, conversation_id=conversation_id
-    )
-    if running is not None:
-        if running.lease_expires_at is None or running.lease_expires_at > now:
-            return False
-        settled = await generation.converge_generation_failure_in_session(
-            session,
-            owner_id=owner_id,
-            conversation_id=conversation_id,
-            generation_id=running.id,
-            lease_token=None,
-            error_code="generation_lease_lost",
-            error_message="generation lease expired during user deletion",
-            current_time=now,
-            expired_only=True,
-        )
-        if settled is None:
-            return False
+    if not await _settle_running_generation_in_session(
+        session,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+        now=now,
+        expired_message="generation lease expired during user deletion",
+    ):
+        return False
     if await cleanup_repository.has_children(session, conversation_id=conversation_id):
         await cleanup_repository.delete_batch(
             session, conversation_id=conversation_id, batch_size=max(1, min(100, batch_size))
@@ -376,13 +408,98 @@ async def cleanup_user_conversations_in_session(
         operation_type=JOB_TYPE_CONVERSATION_DELETE,
         target_id=str(conversation_id),
     )
-    if operation is not None:
+    if operation is not None and operation.status not in ("succeeded", "failed"):
+        if operation.status == "pending":
+            await operations_service.transition_operation_in_session(
+                session,
+                operation_id=operation.id,
+                status="running",
+                now=now,
+            )
+        await operations_service.transition_operation_in_session(
+            session,
+            operation_id=operation.id,
+            status="reconciling",
+            progress={
+                "phase": "awaiting_user_remote_memories",
+                "local_complete": True,
+                "remote_complete": False,
+            },
+            now=now,
+        )
+    return not await cleanup_repository.has_user_conversations(session, owner_id=owner_id)
+
+
+async def settle_user_conversation_operations_in_session(
+    session: AsyncSession,
+    *,
+    owner_id: UUID,
+    batch_size: int = 50,
+    now: datetime,
+) -> bool:
+    """Confirm superseded conversation deletions only after whole-user remote cleanup succeeds."""
+    if await jobs_service.has_user_jobs_in_session(
+        session,
+        user_id=owner_id,
+        job_types=(JOB_TYPE_CONVERSATION_DELETE,),
+        statuses=("running",),
+        active_lease_at=now,
+    ):
+        return False
+    bounded = max(1, min(100, batch_size))
+    await jobs_service.cancel_matching_jobs_in_session(
+        session,
+        user_id=owner_id,
+        job_types=(JOB_TYPE_CONVERSATION_DELETE,),
+        allowed_statuses=("pending", "retry_wait", "running", "reconciling"),
+        predicate=lambda job: not job.has_active_lease(now),
+        error_code="user_deleting",
+        error_summary="conversation cleanup confirmed by verified user deletion",
+        metadata_patch={"superseded_by_user_delete": True},
+        limit=bounded,
+        skip_locked=True,
+        now=now,
+    )
+    if await jobs_service.has_user_jobs_in_session(
+        session,
+        user_id=owner_id,
+        job_types=(JOB_TYPE_CONVERSATION_DELETE,),
+        statuses=("pending", "retry_wait", "running", "reconciling"),
+    ):
+        return False
+    operations = await operations_service.list_non_terminal_operations_in_session(
+        session,
+        owner_id=owner_id,
+        operation_type=JOB_TYPE_CONVERSATION_DELETE,
+        batch_size=bounded,
+    )
+    for operation in operations:
+        if operation.status == "pending":
+            await operations_service.transition_operation_in_session(
+                session,
+                operation_id=operation.id,
+                status="running",
+                now=now,
+            )
+        summary: dict[str, object] = {"deleted_with_user": True}
+        if operation.target_id is not None:
+            summary["conversation_id"] = operation.target_id
         await operations_service.transition_operation_in_session(
             session,
             operation_id=operation.id,
             status="succeeded",
-            progress={"phase": "succeeded"},
-            result_summary={"conversation_id": str(conversation_id), "deleted_with_user": True},
+            progress={
+                "phase": "succeeded",
+                "local_complete": True,
+                "remote_complete": True,
+            },
+            result_summary=summary,
             now=now,
         )
-    return not await cleanup_repository.has_user_conversations(session, owner_id=owner_id)
+    remaining = await operations_service.list_non_terminal_operations_in_session(
+        session,
+        owner_id=owner_id,
+        operation_type=JOB_TYPE_CONVERSATION_DELETE,
+        batch_size=1,
+    )
+    return not remaining

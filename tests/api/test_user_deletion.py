@@ -410,3 +410,47 @@ async def test_receipt_and_authorization_are_redacted_from_structured_logs(
     assert probe["Authorization"] == REDACTED_VALUE
     assert probe["response"]["deletionReceipt"] == REDACTED_VALUE
     assert probe["response"]["operationId"] == data["operationId"]
+
+
+async def test_operations_route_honors_get_auth_context_dependency_override(
+    migrated_pg_settings: Settings,
+    test_auth_adapter: StaticTokenAuthAdapter,
+) -> None:
+    from mem_ai.modules.auth.context import AuthenticationContext
+    from mem_ai.modules.auth.dependencies import get_auth_context
+
+    app = create_app(
+        migrated_pg_settings,
+        credential_verifier=test_auth_adapter,
+    )
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client,
+    ):
+        me = await client.get("/v1/users/me", headers=_ALICE_HEADERS)
+        assert me.status_code == 200
+        alice_id = UUID(me.json()["data"]["userId"])
+        async with app.state.session_factory.begin() as session:
+            op = await operations_service.create_operation_in_session(
+                session,
+                owner_id=alice_id,
+                operation_type="memory_delete",
+                status="running",
+                target_type="memory",
+                target_id="mem-override",
+            )
+        app.dependency_overrides[get_auth_context] = lambda: AuthenticationContext(
+            actor_id="override-actor",
+            user_id=alice_id,
+            auth_method="override",
+            permissions=frozenset(),
+        )
+        try:
+            response = await client.get(f"/v1/operations/{op.id}")
+        finally:
+            app.dependency_overrides.clear()
+        assert response.status_code == 200, response.text
+        assert response.json()["data"]["operationId"] == str(op.id)

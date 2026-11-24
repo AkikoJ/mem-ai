@@ -182,6 +182,68 @@ async def revoke_deletion_receipt(
     return changed is not None
 
 
+def _clamp_batch_size(batch_size: int) -> int:
+    return max(1, min(100, batch_size))
+
+
+def _other_user_operations_filter(owner_id: UUID, deletion_operation_id: UUID) -> tuple[Any, Any]:
+    return (
+        Operation.owner_id == owner_id,
+        Operation.id != deletion_operation_id,
+    )
+
+
+async def _has_unsettled_user_operations(
+    session: AsyncSession, other_operations: tuple[Any, Any]
+) -> bool:
+    unsettled = await session.scalar(
+        select(Operation.id)
+        .where(*other_operations, Operation.status.not_in(("succeeded", "failed")))
+        .limit(1)
+    )
+    return unsettled is not None
+
+
+async def list_non_terminal_operations_for_owner(
+    session: AsyncSession,
+    *,
+    owner_id: UUID,
+    operation_type: str,
+    batch_size: int = 50,
+) -> list[Operation]:
+    """Read one bounded batch of non-terminal operations owned by `owner_id`."""
+    stmt = (
+        select(Operation)
+        .where(
+            Operation.owner_id == owner_id,
+            Operation.operation_type == operation_type,
+            Operation.status.not_in(("succeeded", "failed")),
+        )
+        .order_by(Operation.id)
+        .limit(_clamp_batch_size(batch_size))
+        .with_for_update(skip_locked=True)
+    )
+    return list((await session.scalars(stmt)).all())
+
+
+async def can_finalize_user_operations_in_batch(
+    session: AsyncSession,
+    *,
+    owner_id: UUID,
+    deletion_operation_id: UUID,
+    batch_size: int = 50,
+) -> bool:
+    """Return True iff all remaining child operations are settled and fit in one batch."""
+    other_operations = _other_user_operations_filter(owner_id, deletion_operation_id)
+    if await _has_unsettled_user_operations(session, other_operations):
+        return False
+    bounded = _clamp_batch_size(batch_size)
+    extra = list(
+        await session.scalars(select(Operation.id).where(*other_operations).limit(bounded + 1))
+    )
+    return len(extra) <= bounded
+
+
 async def finalize_user_operations(
     session: AsyncSession, *, owner_id: UUID, deletion_operation_id: UUID, batch_size: int = 50
 ) -> bool:
@@ -195,23 +257,15 @@ async def finalize_user_operations(
         or deletion.operation_type != "user_delete"
     ):
         return False
-    other_operations = (
-        Operation.owner_id == owner_id,
-        Operation.id != deletion_operation_id,
-    )
-    unsettled = await session.scalar(
-        select(Operation.id)
-        .where(*other_operations, Operation.status.not_in(("succeeded", "failed")))
-        .limit(1)
-    )
-    if unsettled is not None:
+    other_operations = _other_user_operations_filter(owner_id, deletion_operation_id)
+    if await _has_unsettled_user_operations(session, other_operations):
         return False
     batch = list(
         await session.scalars(
             select(Operation.id)
             .where(*other_operations)
             .order_by(Operation.id)
-            .limit(max(1, min(100, batch_size)))
+            .limit(_clamp_batch_size(batch_size))
             .with_for_update(skip_locked=True)
         )
     )

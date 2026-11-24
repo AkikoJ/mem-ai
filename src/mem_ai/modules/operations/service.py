@@ -122,6 +122,22 @@ async def revoke_user_deletion_receipt_in_session(
     )
 
 
+async def can_finalize_user_operations_in_batch_in_session(
+    session: AsyncSession,
+    *,
+    owner_id: UUID,
+    deletion_operation_id: UUID,
+    batch_size: int = 50,
+) -> bool:
+    """Check whether remaining child operations can be cleared in one final batch."""
+    return await repository.can_finalize_user_operations_in_batch(
+        session,
+        owner_id=owner_id,
+        deletion_operation_id=deletion_operation_id,
+        batch_size=batch_size,
+    )
+
+
 async def finalize_user_operations_in_session(
     session: AsyncSession, *, owner_id: UUID, deletion_operation_id: UUID, batch_size: int = 50
 ) -> bool:
@@ -228,6 +244,23 @@ async def find_operation_for_target_in_session(
         session, owner_id=owner_id, operation_type=operation_type, target_id=target_id
     )
     return OperationRecord.model_validate(row) if row is not None else None
+
+
+async def list_non_terminal_operations_in_session(
+    session: AsyncSession,
+    *,
+    owner_id: UUID,
+    operation_type: str,
+    batch_size: int = 50,
+) -> list[OperationRecord]:
+    """Read one bounded batch of non-terminal operations of a given type for an owner."""
+    rows = await repository.list_non_terminal_operations_for_owner(
+        session,
+        owner_id=owner_id,
+        operation_type=operation_type,
+        batch_size=batch_size,
+    )
+    return [OperationRecord.model_validate(row) for row in rows]
 
 
 async def attach_job_in_session(

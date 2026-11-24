@@ -352,7 +352,6 @@ async def cancel_queued_and_list_unsettled_writes_in_session(
     max_epoch: int,
     cancel_summary: str,
     now: datetime,
-    include_live_leases: bool = False,
 ) -> tuple[list[JobRecord], list[JobRecord]]:
     """Cancel queued old-epoch write jobs and return `(cancelled_queued, unsettled_inflight)`."""
     cancelled_queued = await jobs_service.cancel_matching_jobs_in_session(
@@ -377,18 +376,8 @@ async def cancel_queued_and_list_unsettled_writes_in_session(
         job
         for job in active_writes
         if is_old_epoch_write_job(job, provider_id=provider_id, max_epoch=max_epoch)
-        and (
-            (
-                include_live_leases
-                and job.status == "running"
-                and job.lease_expires_at is not None
-                and job.lease_expires_at > now
-            )
-            or (
-                not is_write_job_settled_for_clear(job)
-                and not is_write_job_already_audited_for_clear(job)
-            )
-        )
+        and not is_write_job_settled_for_clear(job)
+        and not is_write_job_already_audited_for_clear(job)
     ]
     return cancelled_queued, unsettled
 

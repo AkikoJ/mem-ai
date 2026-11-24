@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
@@ -17,6 +18,16 @@ from mem_ai.modules.memories.barrier import (
 )
 from mem_ai.modules.operations import service as operations_service
 from mem_ai.modules.operations.schemas import OperationStatus
+
+logger = logging.getLogger("mem_ai.memories.clear_state")
+
+
+def log_clear_alert(
+    alert: str, message: str, *, level: int = logging.WARNING, **fields: Any
+) -> None:
+    """Emit a structured operational alert for memory clear barrier convergence."""
+    logger.log(level, message, extra={"extra_fields": {"alert": alert, **fields}})
+
 
 MemoryClearPhase = Literal[
     "await_inflight",
@@ -115,6 +126,17 @@ def make_hold_barrier_hook(
                 external_ref=tombstone_external_ref,
                 now=current_time,
             )
+        if effective_status == "reconciling":
+            current_op = await operations_service.get_operation_in_session(
+                session, operation_id=meta.operation_id
+            )
+            if current_op is not None and current_op.status == "pending":
+                await operations_service.transition_operation_in_session(
+                    session,
+                    operation_id=meta.operation_id,
+                    status="running",
+                    now=current_time,
+                )
         await operations_service.transition_operation_in_session(
             session,
             operation_id=meta.operation_id,

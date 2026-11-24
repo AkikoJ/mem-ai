@@ -767,9 +767,11 @@ V1 认证实现止于上述接缝及部署配置。内置注册、登录、刷�
 
 用户删除由 `users/cleanup.py` 统一协调：`DELETE /v1/users/me` 在同一事务中锁定用户、置为 `deleting`、创建唯一用户删除操作及回执摘要，并入队 `user_delete` 任务。普通业务凭证立即返回 `403`，`user_identities` 持续绑定以阻止删除期间静默重建新用户；一次性明文回执在事务提交后返回。
 
-Worker 从父删除操作的持久化进度恢复阶段。先由 `conversations.settle_user_generations_in_session` 等待有效生成租约并分批收敛过期生成，未稳定时保留 `await_generation_leases` 阶段。随后 `memories/user_cleanup.py` 枚举当前配置、范围记录和既有任务中的全部提供方，经共享 `prepare_clear_scope_in_session` 安装用户级代次屏障，将提供方与用户删除专属的最终子清空操作绑定持久化。各提供方的 `memory_clear` 处理器按持久化游标分批取消和核验旧任务，全部批次稳定后才最终远程清空；用户身份和必要映射在远程确认前保留。既有写入、单条删除、清空以及会话删除任务一并核验，有效租约及未知远程结果阻止最终完成。子任务达到失败终态时，删除操作保留 `reconciling` / `awaiting_retry` 与告警，修复提供方问题后通过既有 `jobs.requeue_failed_job` 受控恢复。
+Worker 从父删除任务（`jobs.metadata_json`）与操作的持久化状态恢复阶段。先由 `conversations.settle_user_generations_in_session` 等待有效生成租约并分批收敛过期生成，未稳定时保留 `await_generation_leases` 阶段。随后 `memories/user_cleanup.py` 枚举当前配置、范围记录和既有任务中的全部提供方，经共享 `prepare_clear_scope_in_session` 安装用户级代次屏障，将提供方与用户删除专属的最终子清空操作映射保存在父任务内部元数据中（不通过回执响应暴露内部子操作 ID）。
 
-远程记忆全部确认后，协调器按有界批次调用 `conversations.cleanup_user_conversations_in_session`、`agents.cleanup_user_agents_in_session` 与 `jobs.cleanup_user_jobs_in_session`，由资源所有者清理会话、消息、引用、生成、幂等数据、Agent、人设版本及已稳定任务；父删除任务保持可恢复。本地数据清理与远程记忆清理分别暴露进度。记忆所有者再次确认远程状态并分批移除快照、tombstone 和范围映射后，协调器保存 `finalizing_identity` 阶段，操作所有者再分批汇总并清除子操作，重启后直接恢复该阶段。全部批次完成才在最终事务移除 `user_identities` 与用户业务记录、清空父操作的业务目标和临时映射并标记成功，仅保留最小脱敏操作摘要和回执保护摘要。回执到期立即拒绝访问；到期摘要的周期物理清理由 16 保留期切片承接。
+屏障安装完成后，协调器立即按有界批次调用 `conversations.cleanup_user_conversations_in_session`、`agents.cleanup_user_agents_in_session` 与 `memories.cleanup_user_memory_snapshots_in_session` 清理本地会话、消息、引用、生成、幂等数据、Agent、人设版本与分页快照（`memory_list_snapshots`），完成后将 `local_complete` 置为 `true`；被用户删除接管的既有 `conversation_delete` 操作在远程记忆确认前保持 `reconciling`，期间持续保留 `users`、`user_identities`、最小远程映射（`memory_scopes`/`memory_tombstones`）及任务与操作摘要。各提供方的 `memory_clear` 处理器按持久化游标分批取消和核验旧任务，全部批次稳定后才最终远程清空（超时路径记录告警与待核验任务 ID 并执行延迟补偿）。远程未完成前，操作进度明确区分 `local_complete: true` 与 `remote_complete: false`；子任务达到失败终态或历史提供方不可用时，父删除操作汇总 `awaiting_retry` / `provider_unavailable`、错误摘要与告警，并退避轮询间隔避免高频写库，修复提供方问题后通过既有 `jobs.requeue_failed_job` 受控恢复。
+
+远程记忆全部确认后，资源所有者先将既有 `conversation_delete` 子操作收敛为 `succeeded`（`conversations.settle_user_conversation_operations_in_session`），再分批清理已稳定任务（`jobs.cleanup_user_jobs_in_session`）与记忆范围映射（`memories.finalize_user_memory_cleanup_in_session`），进入 `finalizing_identity` 阶段分批清除子操作；全部子操作清除后，在最终原子事务中移除 `user_identities` 与用户业务记录、清空父操作业务目标并同步将父操作与父任务置为 `succeeded`（同时通过审计归档接缝导出终态事件），仅保留最小脱敏操作摘要和回执保护摘要。回执到期立即拒绝访问；到期摘要的周期物理清理由 16 保留期切片承接。
 
 两类删除在清理关联表前遇到仍在有效期内的活跃生成租约时：由于用户或会话已置为 `deleting`，在途生成的续期与最终提交都会在复查状态时立即失败收敛；若旧执行者已失联，清理任务等待其租约自然过期并先按 `generation_lease_lost` 接管收敛，再推进数据清理与最终远程清空。
 

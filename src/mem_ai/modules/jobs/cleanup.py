@@ -105,7 +105,8 @@ async def has_user_jobs_in_session(
     )
 
 
-def _sanitize_summary_dict(summary: dict[str, Any]) -> dict[str, Any]:
+def sanitize_summary_dict(summary: dict[str, Any]) -> dict[str, Any]:
+    """Sanitize a JSON summary or metadata mapping before persisting it on a job."""
     sanitized = sanitize_log_value(None, summary)
     return sanitized if isinstance(sanitized, dict) else {}
 
@@ -124,6 +125,6 @@ async def patch_job_metadata_in_session(
     await repository.patch_job_metadata(
         session,
         job_id=job_id,
-        metadata_patch=_sanitize_summary_dict(metadata_patch),
+        metadata_patch=sanitize_summary_dict(metadata_patch),
         current_time=current_time,
     )

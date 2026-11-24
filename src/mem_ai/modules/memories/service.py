@@ -524,7 +524,10 @@ async def _commit_confirmed_write(
                 external_ref=ext_ref,
                 error_code=exc.code,
                 error_summary="user became inactive mid-flight; pending reconciliation",
-                metadata_patch={"memory_id": result.memory_id},
+                metadata_patch={
+                    "memory_id": result.memory_id,
+                    "dispatch_state": "confirmed_during_clear",
+                },
                 now=now,
             )
             user_inactive_error = exc

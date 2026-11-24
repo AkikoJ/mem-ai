@@ -13,7 +13,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mem_ai.core.exceptions import ConflictError, NotFoundError
 from mem_ai.modules.jobs import repository
-from mem_ai.modules.jobs.cleanup import _sanitize_summary_dict
 from mem_ai.modules.jobs.cleanup import (
     cleanup_user_jobs_in_session as cleanup_user_jobs_in_session,
 )
@@ -28,6 +27,9 @@ from mem_ai.modules.jobs.cleanup import (
 )
 from mem_ai.modules.jobs.cleanup import (
     patch_job_metadata_in_session as patch_job_metadata_in_session,
+)
+from mem_ai.modules.jobs.cleanup import (
+    sanitize_summary_dict as _sanitize_summary_dict,
 )
 from mem_ai.modules.jobs.models import Job
 from mem_ai.modules.jobs.schemas import (

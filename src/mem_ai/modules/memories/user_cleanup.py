@@ -55,12 +55,14 @@ class UserMemoryCleanupPlan:
 
 @dataclass(frozen=True, slots=True)
 class UserMemoryCleanupProgress:
-    """Report local invalidation separately from retained remote verification state."""
+    """Report remote verification state, retry requirements, and settlement readiness."""
 
     phase: str
     remote_complete: bool = False
-    local_complete: bool = True
     pending_jobs: int = 0
+    retry_required: bool = False
+    error_code: str | None = None
+    error_message: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,10 +217,7 @@ async def _settle_superseded_operations(
     now: datetime,
 ) -> bool:
     """A verified full wipe confirms old delete/clear intents and invalidates old creates."""
-    if any(
-        job.status == "running" and job.lease_expires_at is not None and job.lease_expires_at > now
-        for job in jobs
-    ):
+    if any(job.has_active_lease(now) for job in jobs):
         return False
     await jobs_service.cancel_matching_jobs_in_session(
         session,
@@ -226,12 +225,7 @@ async def _settle_superseded_operations(
         job_types=_MEMORY_JOB_TYPES,
         allowed_statuses=_ACTIVE_JOB_STATUSES,
         predicate=lambda job: (
-            _job_provider(job) in provider_operations
-            and not (
-                job.status == "running"
-                and job.lease_expires_at is not None
-                and job.lease_expires_at > now
-            )
+            _job_provider(job) in provider_operations and not job.has_active_lease(now)
         ),
         error_code="memory_scope_cleared",
         error_summary="memory operation superseded by verified user cleanup",
@@ -294,6 +288,89 @@ async def _settle_superseded_operations(
     return True
 
 
+async def peek_user_memory_cleanup_in_session(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    provider_operations: dict[str, str],
+) -> UserMemoryCleanupProgress | None:
+    """Inspect child clear operations read-only; return None once every provider succeeded."""
+    pending_count = 0
+    retry_error: tuple[str, str] | None = None
+    unavailable_error: tuple[str, str] | None = None
+    pending_error: tuple[str | None, str | None] = (None, None)
+    for provider, raw_operation_id in provider_operations.items():
+        try:
+            operation_id = UUID(raw_operation_id)
+        except ValueError:
+            return UserMemoryCleanupProgress(
+                phase="memory_clear_mapping_invalid",
+                pending_jobs=1,
+                error_code="memory_clear_mapping_invalid",
+                error_message="memory clear operation mapping is invalid",
+            )
+        operation = await operations_service.get_operation_in_session(
+            session,
+            operation_id=operation_id,
+        )
+        if (
+            operation is None
+            or operation.owner_id != user_id
+            or operation.operation_type != "memory_clear"
+            or operation.target_id != f"{user_id}:{provider}"
+        ):
+            pending_count += 1
+            continue
+        if operation.status == "succeeded":
+            continue
+        pending_count += 1
+        child_phase = operation.progress.get("phase")
+        if (
+            operation.status == "failed"
+            or operation.progress.get("retry_required") is True
+            or child_phase == "awaiting_retry"
+        ):
+            if retry_error is None:
+                retry_error = (
+                    operation.error_code or "memory_clear_retry_required",
+                    operation.error_message or "remote memory cleanup requires controlled retry",
+                )
+        elif (
+            operation.error_code == "memory_provider_mismatch"
+            or child_phase == "provider_unavailable"
+        ):
+            if unavailable_error is None:
+                unavailable_error = (
+                    "memory_provider_mismatch",
+                    operation.error_message or "historical memory provider is unavailable",
+                )
+        elif pending_error == (None, None) and operation.error_code is not None:
+            pending_error = (operation.error_code, operation.error_message)
+    if pending_count == 0:
+        return None
+    if retry_error is not None:
+        return UserMemoryCleanupProgress(
+            phase="awaiting_retry",
+            pending_jobs=pending_count,
+            retry_required=True,
+            error_code=retry_error[0],
+            error_message=retry_error[1],
+        )
+    if unavailable_error is not None:
+        return UserMemoryCleanupProgress(
+            phase="provider_unavailable",
+            pending_jobs=pending_count,
+            error_code=unavailable_error[0],
+            error_message=unavailable_error[1],
+        )
+    return UserMemoryCleanupProgress(
+        phase="remote_memories_pending",
+        pending_jobs=pending_count,
+        error_code=pending_error[0],
+        error_message=pending_error[1],
+    )
+
+
 async def inspect_user_memory_cleanup_in_session(
     session: AsyncSession,
     *,
@@ -320,23 +397,11 @@ async def inspect_user_memory_cleanup_in_session(
         active_lease_at=current_time,
     ):
         return UserMemoryCleanupProgress(phase="await_memory_leases", pending_jobs=1)
-    for provider, raw_operation_id in provider_operations.items():
-        try:
-            operation_id = UUID(raw_operation_id)
-        except ValueError:
-            return UserMemoryCleanupProgress(phase="memory_clear_mapping_invalid")
-        operation = await operations_service.get_operation_in_session(
-            session,
-            operation_id=operation_id,
-        )
-        if (
-            operation is None
-            or operation.owner_id != user_id
-            or operation.operation_type != "memory_clear"
-            or operation.target_id != f"{user_id}:{provider}"
-            or operation.status != "succeeded"
-        ):
-            return UserMemoryCleanupProgress(phase="remote_memories_pending", pending_jobs=1)
+    pending_remote = await peek_user_memory_cleanup_in_session(
+        session, user_id=user_id, provider_operations=provider_operations
+    )
+    if pending_remote is not None:
+        return pending_remote
     marker = {"settled_by_user_cleanup": True}
     jobs = await jobs_service.list_user_jobs_in_session(
         session,
@@ -379,6 +444,18 @@ async def inspect_user_memory_cleanup_in_session(
     ):
         return UserMemoryCleanupProgress(phase="settling_memory_operations", pending_jobs=1)
     return UserMemoryCleanupProgress(phase="remote_memories_verified", remote_complete=True)
+
+
+async def cleanup_user_memory_snapshots_in_session(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    batch_size: int = 50,
+) -> bool:
+    """Remove local cached pagination snapshots after provider barriers are persisted."""
+    return await repository.delete_user_list_snapshots(
+        session, user_id=user_id, batch_size=batch_size
+    )
 
 
 async def finalize_user_memory_cleanup_in_session(

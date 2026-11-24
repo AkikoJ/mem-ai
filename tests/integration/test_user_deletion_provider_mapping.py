@@ -44,13 +44,26 @@ async def test_missing_historical_provider_retains_identity_scope_and_operation_
         await harness.run(harness.worker(), now=now + timedelta(minutes=step + 1))
         operation = await harness.operation(accepted)
         assert operation["status"] != "succeeded"
+        assert operation["progress"]["local_complete"] is True
         assert operation["progress"]["remote_complete"] is False
-        mappings = operation["progress"]["provider_operations"]
+        assert "provider_operations" not in operation["progress"]
+        async with harness.sessions() as session:
+            parent_meta = await session.scalar(
+                text(
+                    "SELECT metadata_json FROM jobs "
+                    "WHERE id = (SELECT job_id FROM operations WHERE id = :op)"
+                ),
+                {"op": UUID(accepted["operationId"])},
+            )
+        assert isinstance(parent_meta, dict)
+        mappings = parent_meta["provider_operations"]
         assert set(mappings) == {historical.provider_id, harness.memory.provider_id}
         if historical_operation is None:
             historical_operation = mappings[historical.provider_id]
         assert mappings[historical.provider_id] == historical_operation
     assert operation["status"] == "reconciling"
+    assert operation["progress"]["phase"] == "provider_unavailable"
+    assert operation["error"]["code"] == "memory_provider_mismatch"
     assert (await harness.client.get("/v1/users/me", headers=ALICE)).status_code == 403
     assert created.record.memory_id in historical.records
     assert historical.clear_calls == []
@@ -94,4 +107,4 @@ async def test_missing_historical_provider_retains_identity_scope_and_operation_
         assert child.status == "reconciling"
         assert child.last_error_code == "memory_provider_mismatch"
         assert child.metadata_json["provider_id"] == historical.provider_id
-        assert child.operation_status != "succeeded"
+        assert child.operation_status == "reconciling"

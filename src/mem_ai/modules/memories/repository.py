@@ -399,12 +399,16 @@ async def load_tombstoned_conversation_ids(
     )
 
 
-async def delete_user_memory_state(
-    session: AsyncSession, *, user_id: UUID, batch_size: int = 50
+async def _delete_user_models_in_batch(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    models: tuple[type[MemoryListSnapshot] | type[MemoryTombstone] | type[MemoryScopeState], ...],
+    batch_size: int = 50,
 ) -> bool:
-    """Remove a finite batch after remote confirmation; remaining rows defer completion."""
+    """Delete one bounded batch across `models`; return False while matching rows remain."""
     remaining = max(1, min(100, batch_size))
-    for model in (MemoryListSnapshot, MemoryTombstone, MemoryScopeState):
+    for model in models:
         selected = list(
             await session.scalars(
                 select(model.id)
@@ -422,3 +426,27 @@ async def delete_user_memory_state(
         if remaining == 0:
             return False
     return True
+
+
+async def delete_user_list_snapshots(
+    session: AsyncSession, *, user_id: UUID, batch_size: int = 50
+) -> bool:
+    """Remove cached pagination snapshots in bounded batches during local user cleanup."""
+    return await _delete_user_models_in_batch(
+        session,
+        user_id=user_id,
+        models=(MemoryListSnapshot,),
+        batch_size=batch_size,
+    )
+
+
+async def delete_user_memory_state(
+    session: AsyncSession, *, user_id: UUID, batch_size: int = 50
+) -> bool:
+    """Remove a finite batch after remote confirmation; remaining rows defer completion."""
+    return await _delete_user_models_in_batch(
+        session,
+        user_id=user_id,
+        models=(MemoryListSnapshot, MemoryTombstone, MemoryScopeState),
+        batch_size=batch_size,
+    )

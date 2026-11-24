@@ -38,10 +38,9 @@ from mem_ai.modules.memories.barrier import (
     map_memory_provider_error,
 )
 from mem_ai.modules.memories.clear_state import (
-    ClearExecutionPlan as _ClearExecutionPlan,
-)
-from mem_ai.modules.memories.clear_state import (
+    ClearExecutionPlan,
     MemoryClearJobMetadata,
+    log_clear_alert,
     make_hold_barrier_hook,
 )
 from mem_ai.modules.memories.user_cleanup import prepare_user_memory_clear_batch_in_session
@@ -50,12 +49,6 @@ from mem_ai.modules.operations.audit import (
     DeletionAuditArchiver,
     export_deletion_audit_events_safely,
 )
-
-logger = logging.getLogger("mem_ai.memories.clear_jobs")
-
-
-def _log_alert(alert: str, message: str, *, level: int = logging.WARNING, **fields: Any) -> None:
-    logger.log(level, message, extra={"extra_fields": {"alert": alert, **fields}})
 
 
 class MemoryClearJobHandler:
@@ -107,7 +100,7 @@ class MemoryClearJobHandler:
                     error_summary="owning user no longer exists",
                 )
             if meta.provider_id != self._memory_provider.provider_id:
-                _log_alert(
+                log_clear_alert(
                     "memory_clear_provider_unavailable",
                     "Retaining clear until its provider is available",
                     operation_id=str(meta.operation_id),
@@ -117,6 +110,15 @@ class MemoryClearJobHandler:
                     outcome="reconciling",
                     error_code="memory_provider_mismatch",
                     error_summary="memory_clear is waiting for its configured provider",
+                    before_commit=make_hold_barrier_hook(
+                        user_id=ctx.job.user_id,
+                        meta=meta,
+                        op_status="reconciling",
+                        phase="provider_unavailable",
+                        current_time=self._now(),
+                        error_code="memory_provider_mismatch",
+                        error_message="memory_clear is waiting for its configured provider",
+                    ),
                 )
 
             user_id = ctx.job.user_id
@@ -128,7 +130,7 @@ class MemoryClearJobHandler:
                 )
             if meta.clear_phase in ("compensation_clear", "execute_final_clear"):
                 is_comp = meta.clear_phase == "compensation_clear"
-                plan = _ClearExecutionPlan(
+                plan = ClearExecutionPlan(
                     is_compensation=is_comp,
                     settle_timeout_exceeded=True if is_comp else meta.settle_timeout_exceeded,
                     unsettled_audit_job_ids=tuple(meta.unsettled_audit_job_ids),
@@ -159,7 +161,6 @@ class MemoryClearJobHandler:
                 max_epoch=meta.previous_epoch,
                 cancel_summary="queued memory write cancelled during clear barrier convergence",
                 now=current_time,
-                include_live_leases=meta.user_cleanup_operation_id is not None,
             )
             return unsettled
 
@@ -214,11 +215,7 @@ class MemoryClearJobHandler:
                 target_job_id = write_job.id
 
                 def _matches_target(candidate: JobRecord, target: UUID = target_job_id) -> bool:
-                    return candidate.id == target and not (
-                        candidate.status == "running"
-                        and candidate.lease_expires_at is not None
-                        and candidate.lease_expires_at > current_time
-                    )
+                    return candidate.id == target and not candidate.has_active_lease(current_time)
 
                 async with self._session_factory.begin() as session:
                     cancelled = await jobs_service.cancel_matching_jobs_in_session(
@@ -265,7 +262,7 @@ class MemoryClearJobHandler:
         )
         if not unsettled:
             return await self._execute_clear(
-                ctx=ctx, user_id=user_id, meta=meta, plan=_ClearExecutionPlan()
+                ctx=ctx, user_id=user_id, meta=meta, plan=ClearExecutionPlan()
             )
 
         if provider_supports_write_status_verification(self._memory_provider):
@@ -274,10 +271,10 @@ class MemoryClearJobHandler:
             )
             if not still_unsettled:
                 return await self._execute_clear(
-                    ctx=ctx, user_id=user_id, meta=meta, plan=_ClearExecutionPlan()
+                    ctx=ctx, user_id=user_id, meta=meta, plan=ClearExecutionPlan()
                 )
 
-            _log_alert(
+            log_clear_alert(
                 "memory_clear_waiting_inflight",
                 "Memory clear waiting for in-flight old-epoch writes to stabilize",
                 operation_id=str(meta.operation_id),
@@ -324,7 +321,7 @@ class MemoryClearJobHandler:
             )
 
         audit_ids = tuple(str(job.id) for job in unsettled)
-        _log_alert(
+        log_clear_alert(
             "memory_clear_settle_timeout_exceeded",
             "In-flight write settle timeout reached; proceeding to clear + delayed compensation",
             operation_id=str(meta.operation_id),
@@ -336,7 +333,7 @@ class MemoryClearJobHandler:
             ctx=ctx,
             user_id=user_id,
             meta=meta,
-            plan=_ClearExecutionPlan(
+            plan=ClearExecutionPlan(
                 is_compensation=False,
                 settle_timeout_exceeded=True,
                 unsettled_audit_job_ids=audit_ids,
@@ -367,7 +364,10 @@ class MemoryClearJobHandler:
                 ctx=ctx,
                 user_id=user_id,
                 meta=meta,
-                plan=_ClearExecutionPlan(settle_timeout_exceeded=meta.settle_timeout_exceeded),
+                plan=ClearExecutionPlan(
+                    settle_timeout_exceeded=meta.settle_timeout_exceeded,
+                    unsettled_audit_job_ids=tuple(meta.unsettled_audit_job_ids),
+                ),
             )
         unsettled = [
             job
@@ -375,12 +375,7 @@ class MemoryClearJobHandler:
             if not is_write_job_settled_for_clear(job)
             and not is_write_job_already_audited_for_clear(job)
         ]
-        live_writes = any(
-            job.status == "running"
-            and job.lease_expires_at is not None
-            and job.lease_expires_at > current_time
-            for job in batch.writes
-        )
+        live_writes = any(job.has_active_lease(current_time) for job in batch.writes)
         verifiable = provider_supports_write_status_verification(self._memory_provider)
         if unsettled and verifiable and not live_writes:
             unsettled = await self._reconcile_verifiable_writes(
@@ -394,9 +389,11 @@ class MemoryClearJobHandler:
         )
         can_advance = bool(batch.writes) and not live_writes and (not unsettled or timed_out)
         metadata_patch: dict[str, Any] = {"clear_phase": "await_inflight"}
+        timed_out_ids: list[str] = []
         if can_advance and timed_out:
             # Keep unknown writes fenced and retained for the parent's bounded
             # settlement after final clear and delayed compensation succeed.
+            timed_out_ids = [str(job.id) for job in unsettled]
             async with self._session_factory.begin() as session:
                 for job in unsettled:
                     updated = await jobs_service.update_reconciling_job_in_session(
@@ -410,10 +407,21 @@ class MemoryClearJobHandler:
                     )
                     if updated is None:
                         can_advance = False
+            if can_advance:
+                log_clear_alert(
+                    "memory_clear_settle_timeout_exceeded",
+                    "In-flight write settle timeout reached; proceeding to clear + compensation",
+                    operation_id=str(meta.operation_id),
+                    provider=meta.provider_id,
+                    unsettled_write_job_ids=timed_out_ids,
+                    settle_timeout_seconds=self._inflight_settle_timeout_seconds,
+                )
         if can_advance:
+            merged_audit_ids = list(dict.fromkeys([*meta.unsettled_audit_job_ids, *timed_out_ids]))
             metadata_patch.update(
                 inflight_scan_after_id=str(batch.writes[-1].id),
                 settle_timeout_exceeded=meta.settle_timeout_exceeded or timed_out,
+                unsettled_audit_job_ids=merged_audit_ids,
             )
         return JobHandlerOutcome(
             outcome="reconciling",
@@ -436,7 +444,7 @@ class MemoryClearJobHandler:
         ctx: JobExecutionContext,
         user_id: UUID,
         meta: MemoryClearJobMetadata,
-        plan: _ClearExecutionPlan,
+        plan: ClearExecutionPlan,
     ) -> JobHandlerOutcome:
         default_ref = build_clear_memories_external_ref(user_id)
         async with self._session_factory.begin() as session:
@@ -451,6 +459,7 @@ class MemoryClearJobHandler:
                     "settle_timeout_exceeded": plan.settle_timeout_exceeded,
                     "unsettled_audit_job_ids": list(plan.unsettled_audit_job_ids),
                 },
+                now=self._now(),
             )
 
         result = await invoke_provider_delete_call(
@@ -482,7 +491,7 @@ class MemoryClearJobHandler:
                 user_id=user_id, external_ref=external_ref
             )
         except Exception:
-            _log_alert(
+            log_clear_alert(
                 "memory_clear_barrier_reconciling",
                 "Remote clear verification raised an error; holding barrier reconciling",
                 operation_id=str(meta.operation_id),
@@ -503,7 +512,7 @@ class MemoryClearJobHandler:
                 user_id=user_id,
                 meta=meta,
                 ext_ref=resolved_ref,
-                plan=_ClearExecutionPlan(
+                plan=ClearExecutionPlan(
                     is_compensation=meta.verifying_compensation,
                     settle_timeout_exceeded=meta.settle_timeout_exceeded,
                     unsettled_audit_job_ids=tuple(meta.unsettled_audit_job_ids),
@@ -535,7 +544,7 @@ class MemoryClearJobHandler:
                 ),
             )
 
-        _log_alert(
+        log_clear_alert(
             "memory_clear_barrier_reconciling",
             "Remote clear still pending verification; keeping barrier reconciling",
             operation_id=str(meta.operation_id),
@@ -556,7 +565,7 @@ class MemoryClearJobHandler:
         user_id: UUID,
         meta: MemoryClearJobMetadata,
         ext_ref: str,
-        plan: _ClearExecutionPlan,
+        plan: ClearExecutionPlan,
     ) -> JobHandlerOutcome:
         current_time = self._now()
         if plan.settle_timeout_exceeded and not plan.is_compensation:
@@ -658,7 +667,7 @@ class MemoryClearJobHandler:
         meta: MemoryClearJobMetadata,
         result: MemoryDeleteResult,
         default_ref: str,
-        plan: _ClearExecutionPlan,
+        plan: ClearExecutionPlan,
     ) -> JobHandlerOutcome:
         ext_ref = result.external_ref or default_ref
         if result.status == "succeeded":
@@ -668,7 +677,7 @@ class MemoryClearJobHandler:
 
         current_time = self._now()
         if result.status in ("accepted", "reconciling"):
-            _log_alert(
+            log_clear_alert(
                 "memory_clear_barrier_reconciling",
                 "Final remote clear outcome unknown; holding barrier reconciling",
                 operation_id=str(meta.operation_id),
@@ -708,7 +717,7 @@ class MemoryClearJobHandler:
             err_code == "memory_provider_auth_error"
             or ctx.job.attempt_count >= ctx.job.max_attempts
         )
-        _log_alert(
+        log_clear_alert(
             "memory_clear_barrier_reconciling",
             "Remote clear failed; holding barrier reconciling",
             level=logging.ERROR,

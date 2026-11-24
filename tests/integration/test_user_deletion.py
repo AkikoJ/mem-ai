@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -31,6 +31,7 @@ from mem_ai.modules.jobs import service as jobs_service
 from mem_ai.modules.memories.snapshots import MemoryListScopeKey, MemorySnapshotStore
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
+from mem_ai.modules.operations.audit import DeletionAuditEvent
 from mem_ai.modules.personas.provider import LocalPersonaProvider
 from mem_ai.modules.users.cleanup import JOB_TYPE_USER_DELETE, UserCleanupJobHandler
 from mem_ai.workers.main import build_worker_registry
@@ -99,6 +100,14 @@ class DeletionMemoryProvider(GatedMemoryProvider):
         return await super().verify_operation(user_id=user_id, external_ref=external_ref)
 
 
+class _RecordingAuditArchiver:
+    def __init__(self) -> None:
+        self.events: list[DeletionAuditEvent] = []
+
+    async def export_event(self, event: DeletionAuditEvent) -> None:
+        self.events.append(event)
+
+
 @dataclass
 class UserDeletionHarness:
     client: httpx.AsyncClient
@@ -106,6 +115,7 @@ class UserDeletionHarness:
     memory: DeletionMemoryProvider
     model: _ControllableModelProvider
     settings: Settings
+    audit_archiver: _RecordingAuditArchiver = field(default_factory=_RecordingAuditArchiver)
     clock_time: datetime | None = None
 
     def worker(
@@ -118,6 +128,7 @@ class UserDeletionHarness:
         assembled = build_worker_registry(
             self.sessions,
             memory_provider=self.memory,
+            audit_archiver=self.audit_archiver,
             clock=lambda: self.clock_time or datetime.now(UTC),
         )
         registry = JobHandlerRegistry()
@@ -128,7 +139,11 @@ class UserDeletionHarness:
             assert handler is not None
             registry.register(
                 job_type,
-                UserCleanupJobHandler(session_factory=self.sessions, batch_size=batch_size)
+                UserCleanupJobHandler(
+                    session_factory=self.sessions,
+                    batch_size=batch_size,
+                    audit_archiver=self.audit_archiver,
+                )
                 if job_type == JOB_TYPE_USER_DELETE
                 else handler,
             )
@@ -180,12 +195,14 @@ async def deletion_harness(
 ) -> AsyncIterator[UserDeletionHarness]:
     memory = DeletionMemoryProvider()
     model = _ControllableModelProvider()
+    audit_archiver = _RecordingAuditArchiver()
     app = create_app(
         migrated_pg_settings,
         providers=ProviderRegistry(model_provider=model, memory_provider=memory),
         credential_verifier=test_auth_adapter,
     )
     async with app.router.lifespan_context(app):
+        app.state.deletion_audit_archiver = audit_archiver
         await models_service.sync_model_configs(
             app.state.session_factory,
             seeds=[
@@ -202,7 +219,12 @@ async def deletion_harness(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         ) as client:
             yield UserDeletionHarness(
-                client, app.state.session_factory, memory, model, migrated_pg_settings
+                client,
+                app.state.session_factory,
+                memory,
+                model,
+                migrated_pg_settings,
+                audit_archiver,
             )
 
 
@@ -382,6 +404,20 @@ async def test_deletes_complete_resource_graph_retains_receipt_and_recreates_ide
     assert recreated.status_code == 200
     assert UUID(recreated.json()["data"]["userId"]) != alice_id
     assert (await harness.operation(accepted))["status"] == "succeeded"
+    user_delete_events = [
+        event
+        for event in harness.audit_archiver.events
+        if event.operation_id == UUID(accepted["operationId"])
+        and event.operation_type == JOB_TYPE_USER_DELETE
+    ]
+    assert {event.event_type for event in user_delete_events} >= {
+        "operation_accepted",
+        "operation_transitioned",
+    }
+    assert any(
+        event.event_type == "operation_transitioned" and event.status == "succeeded"
+        for event in user_delete_events
+    )
 
 
 @pytest.mark.integration
@@ -484,7 +520,15 @@ async def test_remote_failure_retains_identity_and_resumes_after_controlled_retr
     user_id = UUID(
         (await harness.client.get("/v1/users/me", headers=ALICE)).json()["data"]["userId"]
     )
+    agent_id = await create_agent(harness)
+    await chat(harness, agent_id, "Local data cleared even when remote fails")
     memory_id = await create_memory(harness, "Remote deletion must be confirmed")
+    snapshots = MemorySnapshotStore(session_factory=harness.sessions)
+    await snapshots.create_first_page(
+        scope_key=MemoryListScopeKey(user_id=user_id, provider_id=harness.memory.provider_id),
+        records=[record for record in harness.memory.records.values() if record.user_id == user_id],
+        limit=1,
+    )
     harness.memory.clear_error_code = error_code
     accepted = await accept_deletion(harness)
     worker = harness.worker()
@@ -521,12 +565,34 @@ async def test_remote_failure_retains_identity_and_resumes_after_controlled_retr
         assert child.status == "reconciling"
         assert child.progress["phase"] == "awaiting_retry"
     restarted = harness.worker()
-    await harness.run(restarted, now=now + timedelta(hours=1))
+    stalled_check_at = now + timedelta(hours=1)
+    await harness.run(restarted, now=stalled_check_at)
+    await harness.run(restarted, now=stalled_check_at + timedelta(seconds=2))
     assert len(harness.memory.clear_calls) == stopped_calls
     assert memory_id in harness.memory.records
     retained = await resource_counts(harness, user_id)
     assert retained["users"] == retained["identities"] == 1
-    assert (await harness.operation(accepted))["progress"]["remote_complete"] is False
+    assert retained["conversations"] == 0 and retained["agents"] == 0
+    assert retained["snapshots"] == 0
+    assert retained["scopes"] >= 1 and retained["operations"] >= 2
+    stalled_op = await harness.operation(accepted)
+    assert stalled_op["status"] == "reconciling"
+    assert stalled_op["progress"]["local_complete"] is True
+    assert stalled_op["progress"]["remote_complete"] is False
+    assert stalled_op["progress"]["phase"] == "awaiting_retry"
+    assert stalled_op["progress"]["retry_required"] is True
+    assert stalled_op["error"] is not None
+    assert "provider_operations" not in stalled_op["progress"]
+    async with harness.sessions() as session:
+        parent_next_run = await session.scalar(
+            text(
+                "SELECT next_run_at FROM jobs "
+                "WHERE id = (SELECT job_id FROM operations WHERE id = :op)"
+            ),
+            {"op": UUID(accepted["operationId"])},
+        )
+    assert parent_next_run is not None
+    assert (parent_next_run - stalled_check_at).total_seconds() >= 59.0
     assert (await harness.client.get("/v1/users/me", headers=ALICE)).status_code == 403
 
     harness.memory.clear_error_code = None
@@ -627,9 +693,17 @@ async def test_completed_ordinary_clear_is_not_reused_for_user_deletion(
     accepted = await accept_deletion(harness)
     await harness.run(harness.worker(), now=datetime.now(UTC) + timedelta(minutes=1))
     initial = await harness.operation(accepted)
-    assert initial["progress"]["provider_operations"][harness.memory.provider_id] != str(
-        previous_clear
-    )
+    assert "provider_operations" not in initial["progress"]
+    async with harness.sessions() as session:
+        parent_meta = await session.scalar(
+            text(
+                "SELECT metadata_json FROM jobs "
+                "WHERE id = (SELECT job_id FROM operations WHERE id = :op)"
+            ),
+            {"op": UUID(accepted["operationId"])},
+        )
+    assert isinstance(parent_meta, dict)
+    assert parent_meta["provider_operations"][harness.memory.provider_id] != str(previous_clear)
     assert (await harness.finish(accepted))["status"] == "succeeded"
     assert harness.memory.clear_calls == [user_id, user_id]
     assert fresh_memory not in harness.memory.records
@@ -695,11 +769,13 @@ async def test_unknown_write_pages_retain_timeout_and_require_delayed_compensati
     last_page = await clear_metadata()
     assert last_page["inflight_scan_after_id"] == str(old_writes[-1])
     assert last_page["settle_timeout_exceeded"] is True
+    assert set(last_page["unsettled_audit_job_ids"]) == {str(job_id) for job_id in old_writes}
     assert harness.memory.clear_calls == []
     await harness.run(harness.worker(job_types=selected), now=now + timedelta(seconds=122))
     after_clear = await clear_metadata()
     assert after_clear["clear_phase"] == "compensation_clear"
     assert after_clear["settle_timeout_exceeded"] is True
+    assert set(after_clear["unsettled_audit_job_ids"]) == {str(job_id) for job_id in old_writes}
     assert harness.memory.clear_calls == [user_id]
     assert any(record.user_id == user_id for record in harness.memory.records.values())
     assert (await harness.operation(accepted))["progress"]["remote_complete"] is False
@@ -764,3 +840,143 @@ async def test_expired_generation_is_recovered_before_user_cleanup_finishes(
         )
     assert (await harness.finish(accepted))["status"] == "succeeded"
     assert all(count == 0 for count in (await resource_counts(harness, user_id)).values())
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
+async def test_explicit_write_confirmed_mid_deletion_does_not_trigger_false_timeout(
+    deletion_harness: UserDeletionHarness,
+) -> None:
+    harness = deletion_harness
+    harness.memory.supports_write_status_verification = False
+    user_id = UUID(
+        (await harness.client.get("/v1/users/me", headers=ALICE)).json()["data"]["userId"]
+    )
+    pending_write = asyncio.create_task(
+        harness.client.post(
+            "/v1/memories",
+            headers=ALICE,
+            json={"content": "gated", "scope": "user"},
+        )
+    )
+    await asyncio.wait_for(harness.memory.started.wait(), timeout=5)
+    try:
+        accepted = await accept_deletion(harness)
+    finally:
+        harness.memory.release.set()
+    write_response = await asyncio.wait_for(pending_write, timeout=5)
+    assert write_response.status_code == 403, write_response.text
+    assert write_response.json()["code"] == "user_deleting"
+
+    async with harness.sessions() as session:
+        write_meta = await session.scalar(
+            text(
+                "SELECT metadata_json FROM jobs "
+                "WHERE user_id = :owner AND job_type = 'memory_explicit_create'"
+            ),
+            {"owner": user_id},
+        )
+    assert isinstance(write_meta, dict)
+    assert write_meta["dispatch_state"] == "confirmed_during_clear"
+
+    now = datetime.now(UTC)
+    selected = (JOB_TYPE_USER_DELETE, "memory_clear")
+    for step in range(8):
+        await harness.run(harness.worker(job_types=selected), now=now + timedelta(seconds=step * 2))
+        if (await harness.operation(accepted))["status"] == "succeeded":
+            break
+    assert (await harness.operation(accepted))["status"] == "succeeded"
+    assert harness.memory.clear_calls == [user_id]
+    assert not any(record.user_id == user_id for record in harness.memory.records.values())
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
+async def test_superseded_conversation_delete_waits_for_remote_confirmation_and_purges_snapshots(
+    deletion_harness: UserDeletionHarness,
+) -> None:
+    harness = deletion_harness
+    user_id = UUID(
+        (await harness.client.get("/v1/users/me", headers=ALICE)).json()["data"]["userId"]
+    )
+    agent_id = await create_agent(harness)
+    turn = await chat(harness, agent_id, "Conversation joining user deletion")
+    conversation_id = turn["conversationId"]
+    conv_memory = await create_memory(
+        harness, "Conversation-scoped memory", conversation_id=conversation_id
+    )
+    snapshots = MemorySnapshotStore(session_factory=harness.sessions)
+    await snapshots.create_first_page(
+        scope_key=MemoryListScopeKey(user_id=user_id, provider_id=harness.memory.provider_id),
+        records=[record for record in harness.memory.records.values() if record.user_id == user_id],
+        limit=1,
+    )
+    conv_delete = await harness.client.delete(f"/v1/conversations/{conversation_id}", headers=ALICE)
+    assert conv_delete.status_code == 202, conv_delete.text
+    conv_op_id = UUID(conv_delete.json()["data"]["operationId"])
+
+    harness.memory.clear_error_code = "memory_provider_unavailable"
+    accepted = await accept_deletion(harness)
+    worker = harness.worker()
+    now = datetime.now(UTC)
+    failed_clear_job_id: UUID | None = None
+    for step in range(20):
+        await harness.run(worker, now=now + timedelta(minutes=step + 1))
+        async with harness.sessions() as session:
+            failed_clear_job_id = await session.scalar(
+                text(
+                    "SELECT id FROM jobs "
+                    "WHERE user_id = :owner AND job_type = 'memory_clear' AND status = 'failed'"
+                ),
+                {"owner": user_id},
+            )
+        if failed_clear_job_id is not None:
+            break
+    assert failed_clear_job_id is not None
+
+    # Local cleanup (conversations, agents, cached list snapshots) completes before remote settles.
+    await harness.run(worker, now=now + timedelta(hours=1))
+    retained = await resource_counts(harness, user_id)
+    assert retained["conversations"] == 0
+    assert retained["agents"] == 0
+    assert retained["snapshots"] == 0
+    assert retained["users"] == retained["identities"] == 1
+    assert retained["scopes"] >= 1
+    assert conv_memory in harness.memory.records
+
+    # Superseded conversation_delete must stay reconciling until remote deletion is confirmed.
+    async with harness.sessions() as session:
+        conv_op = (
+            await session.execute(
+                text("SELECT status, progress FROM operations WHERE id = :op"),
+                {"op": conv_op_id},
+            )
+        ).one()
+    assert conv_op.status == "reconciling"
+    assert conv_op.progress["local_complete"] is True
+    assert conv_op.progress["remote_complete"] is False
+
+    user_op = await harness.operation(accepted)
+    assert user_op["status"] == "reconciling"
+    assert user_op["progress"]["local_complete"] is True
+    assert user_op["progress"]["remote_complete"] is False
+
+    # Restore provider and requeue the failed clear job; both operations converge cleanly.
+    harness.memory.clear_error_code = None
+    await jobs_service.requeue_failed_job(
+        harness.sessions,
+        job_id=failed_clear_job_id,
+        reason="Provider recovered during conversation_delete + user_delete race",
+    )
+    final_op = await harness.finish(accepted, worker=harness.worker(), now=now + timedelta(hours=1))
+    assert final_op["status"] == "succeeded"
+    assert conv_memory not in harness.memory.records
+    assert all(count == 0 for count in (await resource_counts(harness, user_id)).values())
+    async with harness.sessions() as session:
+        assert (
+            await session.scalar(
+                text("SELECT count(*) FROM operations WHERE id = :op"),
+                {"op": conv_op_id},
+            )
+            == 0
+        )

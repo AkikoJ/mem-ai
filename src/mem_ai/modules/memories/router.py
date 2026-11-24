@@ -14,9 +14,6 @@ from mem_ai.api.dependencies import (
     SessionFactoryDep,
     SettingsDep,
 )
-from mem_ai.api.dependencies import (
-    get_deletion_audit_archiver as get_deletion_audit_archiver,
-)
 from mem_ai.api.pagination import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, PaginatedResponse
 from mem_ai.api.responses import ApiResponse, ok_response
 from mem_ai.contracts.memory_provider import MemoryScope
