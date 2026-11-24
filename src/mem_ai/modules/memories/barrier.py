@@ -199,6 +199,42 @@ def make_delete_audit_event(
     )
 
 
+def make_delete_accepted_audit_events(
+    *,
+    user_id: UUID,
+    operation_id: UUID,
+    provider_id: str,
+    memory_id: str,
+    memory_epoch: int,
+    operation_status: str,
+    tombstone_status: str,
+    occurred_at: datetime,
+) -> tuple[DeletionAuditEvent, DeletionAuditEvent]:
+    """Build the paired acceptance + tombstone creation audit events for single-memory delete."""
+    return (
+        make_delete_audit_event(
+            "operation_accepted",
+            user_id=user_id,
+            operation_id=operation_id,
+            provider_id=provider_id,
+            memory_id=memory_id,
+            memory_epoch=memory_epoch,
+            status=operation_status,
+            occurred_at=occurred_at,
+        ),
+        make_delete_audit_event(
+            "memory_tombstone_created",
+            user_id=user_id,
+            operation_id=operation_id,
+            provider_id=provider_id,
+            memory_id=memory_id,
+            memory_epoch=memory_epoch,
+            status=tombstone_status,
+            occurred_at=occurred_at,
+        ),
+    )
+
+
 def make_clear_audit_event(
     event_type: DeletionAuditEventType,
     *,

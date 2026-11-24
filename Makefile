@@ -1,7 +1,10 @@
-.PHONY: help sync db-up db-down db-ps migrate migrate-check sync-models api api-prod worker test check
+.PHONY: help sync db-up db-down db-ps migrate migrate-check sync-models api api-prod worker ops-health ops-budget test check
 
 APP_HOST ?= 127.0.0.1
 APP_PORT ?= 8000
+API_REPLICAS ?= 2
+WORKER_REPLICAS ?= 1
+POSTGRES_MAX_CONNECTIONS ?= 100
 
 help:
 	@echo "Available targets:"
@@ -15,6 +18,8 @@ help:
 	@echo "  make api           Start FastAPI dev server with --reload"
 	@echo "  make api-prod      Start FastAPI server without --reload"
 	@echo "  make worker        Start standalone background Worker process"
+	@echo "  make ops-health    Inspect DB readiness, job queue, leases, and memory barriers"
+	@echo "  make ops-budget    Validate PostgreSQL connection budget across API & Worker replicas"
 	@echo "  make test          Run pytest suite"
 	@echo "  make check         Run Ruff lint/format, mypy, and architecture checks"
 
@@ -47,6 +52,12 @@ api-prod:
 
 worker:
 	uv run python -m mem_ai.workers.main
+
+ops-health:
+	uv run python -m mem_ai.ops inspect-health
+
+ops-budget:
+	uv run python -m mem_ai.ops check-budget --api-replicas $(API_REPLICAS) --worker-replicas $(WORKER_REPLICAS) --postgres-max-connections $(POSTGRES_MAX_CONNECTIONS)
 
 test:
 	uv run pytest

@@ -46,6 +46,22 @@ async def ensure_user_active_in_session(
     return assert_user_active(UserRecord.model_validate(user))
 
 
+async def ensure_user_not_deleting_in_session(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    for_share: bool = False,
+) -> UserRecord:
+    """Verify a user exists and is not already deleting (permits disabled during DR replay)."""
+    user = await repository.get_user_by_id(session, user_id=user_id, for_share=for_share)
+    if user is None:
+        raise ForbiddenError(code="user_not_active", message="user is not active")
+    record = UserRecord.model_validate(user)
+    if record.status == "deleting":
+        raise ForbiddenError(code="user_deleting", message="user is being deleted")
+    return record
+
+
 async def resolve_or_create_user(
     session_factory: async_sessionmaker[AsyncSession],
     *,

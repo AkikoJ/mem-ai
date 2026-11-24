@@ -33,6 +33,7 @@ from mem_ai.modules.operations import service as operations_service
 from mem_ai.modules.operations.audit import (
     DeletionAuditArchiver,
     DeletionAuditEvent,
+    RecoveryReplayStatus,
     export_deletion_audit_events_safely,
 )
 from mem_ai.modules.operations.schemas import DeletionReceiptResponse, OperationRecord
@@ -57,6 +58,49 @@ class UserCleanupMetadata(BaseModel):
     finalizing_identity: bool = False
 
 
+async def _accept_user_deletion_in_session(
+    session: AsyncSession,
+    *,
+    owner_id: UUID,
+    settings: Settings,
+    provider_id: str | None,
+    recovery_replay: bool = False,
+) -> tuple[OperationRecord, DeletionReceiptResponse, datetime] | RecoveryReplayStatus:
+    user = await repository.get_user_by_id(session, user_id=owner_id, for_update=True)
+    if user is None:
+        if recovery_replay:
+            return "skipped_missing"
+        raise ForbiddenError(code="user_not_active", message="user is not active")
+    if recovery_replay:
+        if user.status == "deleting":
+            return "already_applied"
+    else:
+        service.assert_user_active(UserRecord.model_validate(user))
+    now = await get_database_now(session)
+    user.status = "deleting"
+    user.deleted_at = now
+    user.updated_at = now
+    operation, receipt = await operations_service.create_user_deletion_operation_in_session(
+        session, owner_id=owner_id, settings=settings, now=now
+    )
+    job, _ = await jobs_service.enqueue_job_in_session(
+        session,
+        job_type=JOB_TYPE_USER_DELETE,
+        business_id=str(operation.id),
+        user_id=owner_id,
+        dedupe_key=f"{JOB_TYPE_USER_DELETE}:{operation.id}",
+        metadata_json={
+            "operation_id": str(operation.id),
+            "provider_id": provider_id,
+        },
+        now=now,
+    )
+    await operations_service.attach_job_in_session(
+        session, operation_id=operation.id, job_id=job.id, now=now
+    )
+    return operation, receipt, now
+
+
 async def delete_user_for_owner(
     session_factory: async_sessionmaker[AsyncSession],
     *,
@@ -66,33 +110,17 @@ async def delete_user_for_owner(
     audit_archiver: DeletionAuditArchiver | None = None,
 ) -> DeletionReceiptResponse:
     """Fence all future writes and atomically retain identity, operation, receipt and task."""
+    provider_id = memory_provider.provider_id if memory_provider is not None else None
     async with session_factory.begin() as session:
-        user = await repository.get_user_by_id(session, user_id=owner_id, for_update=True)
-        if user is None:
-            raise ForbiddenError(code="user_not_active", message="user is not active")
-        service.assert_user_active(UserRecord.model_validate(user))
-        now = await get_database_now(session)
-        user.status = "deleting"
-        user.deleted_at = now
-        user.updated_at = now
-        operation, receipt = await operations_service.create_user_deletion_operation_in_session(
-            session, owner_id=owner_id, settings=settings, now=now
-        )
-        job, _ = await jobs_service.enqueue_job_in_session(
+        accepted = await _accept_user_deletion_in_session(
             session,
-            job_type=JOB_TYPE_USER_DELETE,
-            business_id=str(operation.id),
-            user_id=owner_id,
-            dedupe_key=f"{JOB_TYPE_USER_DELETE}:{operation.id}",
-            metadata_json={
-                "operation_id": str(operation.id),
-                "provider_id": memory_provider.provider_id if memory_provider is not None else None,
-            },
-            now=now,
+            owner_id=owner_id,
+            settings=settings,
+            provider_id=provider_id,
+            recovery_replay=False,
         )
-        await operations_service.attach_job_in_session(
-            session, operation_id=operation.id, job_id=job.id, now=now
-        )
+        assert isinstance(accepted, tuple)
+        operation, receipt, now = accepted
     await export_deletion_audit_events_safely(
         audit_archiver,
         [
@@ -108,6 +136,29 @@ async def delete_user_for_owner(
         ],
     )
     return receipt
+
+
+async def replay_user_deletion_for_recovery(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    owner_id: UUID,
+    settings: Settings,
+    memory_provider: MemoryProvider | None = None,
+    provider_id: str | None = None,
+) -> RecoveryReplayStatus:
+    """Idempotently replay a post-backup user deletion without re-emitting audit events."""
+    resolved_provider_id = (
+        memory_provider.provider_id if memory_provider is not None else provider_id
+    )
+    async with session_factory.begin() as session:
+        outcome = await _accept_user_deletion_in_session(
+            session,
+            owner_id=owner_id,
+            settings=settings,
+            provider_id=resolved_provider_id,
+            recovery_replay=True,
+        )
+        return "enqueued" if isinstance(outcome, tuple) else outcome
 
 
 async def _load_deleting_context_in_session(

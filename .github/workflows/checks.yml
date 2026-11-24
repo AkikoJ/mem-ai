@@ -40,8 +40,10 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Sync locked dependencies
-        run: uv sync --locked --dev
+      - name: Verify uv.lock consistency and sync locked dependencies
+        run: |
+          uv lock --check
+          uv sync --locked --dev
 
       - name: Run Ruff lint and format check
         run: |
@@ -51,12 +53,15 @@ jobs:
       - name: Run mypy type check
         run: uv run mypy src
 
-      - name: Verify Alembic upgrade and drift check
+      - name: Verify empty database upgrade, downgrade, and Alembic drift check
         run: |
           uv run alembic upgrade head
           uv run alembic check
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+          uv run alembic check
 
-      - name: Run test suite
+      - name: Run unit, API, historical-upgrade, and recovery integration test suite
         run: uv run pytest
 
       - name: Run architecture and documentation checks

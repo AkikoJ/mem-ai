@@ -16,7 +16,12 @@ from mem_ai.modules.jobs import service as jobs_service
 from mem_ai.modules.jobs.schemas import JobExecutionContext, JobHandlerOutcome, JobRecord
 from mem_ai.modules.memories import service as memories_service
 from mem_ai.modules.operations import service as operations_service
-from mem_ai.modules.operations.audit import DeletionAuditArchiver
+from mem_ai.modules.operations.audit import (
+    DeletionAuditArchiver,
+    DeletionAuditEvent,
+    RecoveryReplayStatus,
+    export_deletion_audit_events_safely,
+)
 from mem_ai.modules.operations.schemas import OperationRecord
 from mem_ai.modules.users import service as users_service
 
@@ -34,73 +39,148 @@ class ConversationCleanupMetadata(BaseModel):
     pending_memory_ids: tuple[str, ...] = ()
 
 
+async def _accept_conversation_deletion_in_session(
+    session: AsyncSession,
+    *,
+    owner_id: UUID,
+    conversation_id: UUID,
+    provider_id: str | None,
+    allow_disabled_user: bool = False,
+) -> tuple[OperationRecord, bool, datetime | None]:
+    if allow_disabled_user:
+        await users_service.ensure_user_not_deleting_in_session(
+            session, user_id=owner_id, for_share=True
+        )
+    else:
+        await users_service.ensure_user_active_in_session(session, user_id=owner_id, for_share=True)
+    conversation = await repository.get_conversation_for_update(
+        session,
+        owner_id=owner_id,
+        conversation_id=conversation_id,
+    )
+    existing = await operations_service.find_operation_for_target_in_session(
+        session,
+        owner_id=owner_id,
+        operation_type=JOB_TYPE_CONVERSATION_DELETE,
+        target_id=str(conversation_id),
+    )
+    if existing is not None and (not allow_disabled_user or existing.status != "failed"):
+        return existing, False, None
+    if conversation is None:
+        if existing is not None:
+            return existing, False, None
+        raise NotFoundError(code="conversation_not_found", message="conversation not found")
+    now = await get_database_now(session)
+    conversation.status = "deleting"
+    conversation.deleted_at = now
+    conversation.updated_at = now
+    operation = await operations_service.create_operation_in_session(
+        session,
+        owner_id=owner_id,
+        operation_type=JOB_TYPE_CONVERSATION_DELETE,
+        status="running",
+        target_type="conversation",
+        target_id=str(conversation_id),
+        progress={"phase": "settling_generation"},
+    )
+    providers = await memories_service.begin_conversation_cleanup_in_session(
+        session,
+        user_id=owner_id,
+        conversation_id=conversation_id,
+        operation_id=operation.id,
+        provider_id=provider_id,
+    )
+    dedupe_key = (
+        f"{JOB_TYPE_CONVERSATION_DELETE}:{conversation_id}:{operation.id}"
+        if existing is not None
+        else f"{JOB_TYPE_CONVERSATION_DELETE}:{conversation_id}"
+    )
+    job, _ = await jobs_service.enqueue_job_in_session(
+        session,
+        job_type=JOB_TYPE_CONVERSATION_DELETE,
+        business_id=str(conversation_id),
+        user_id=owner_id,
+        dedupe_key=dedupe_key,
+        metadata_json={
+            "conversation_id": str(conversation_id),
+            "operation_id": str(operation.id),
+            "provider_ids": providers,
+        },
+        now=now,
+    )
+    result = (
+        await operations_service.attach_job_in_session(
+            session,
+            operation_id=operation.id,
+            job_id=job.id,
+            now=now,
+        )
+        or operation
+    )
+    return result, True, now
+
+
 async def delete_conversation_for_owner(
     session_factory: async_sessionmaker[AsyncSession],
     *,
     owner_id: UUID,
     conversation_id: UUID,
     memory_provider: MemoryProvider | None,
+    audit_archiver: DeletionAuditArchiver | None = None,
 ) -> OperationRecord:
     """Atomically hide an owned conversation and enqueue exactly one effective operation."""
+    provider_id = memory_provider.provider_id if memory_provider is not None else None
     async with session_factory.begin() as session:
-        await users_service.ensure_user_active_in_session(session, user_id=owner_id, for_share=True)
-        conversation = await repository.get_conversation_for_update(
+        result, created_new, accepted_at = await _accept_conversation_deletion_in_session(
             session,
             owner_id=owner_id,
             conversation_id=conversation_id,
+            provider_id=provider_id,
+            allow_disabled_user=False,
         )
-        existing = await operations_service.find_operation_for_target_in_session(
-            session,
-            owner_id=owner_id,
-            operation_type=JOB_TYPE_CONVERSATION_DELETE,
-            target_id=str(conversation_id),
+    if created_new and accepted_at is not None:
+        await export_deletion_audit_events_safely(
+            audit_archiver,
+            [
+                DeletionAuditEvent(
+                    event_type="operation_accepted",
+                    occurred_at=accepted_at,
+                    user_id=owner_id,
+                    operation_id=result.id,
+                    operation_type=JOB_TYPE_CONVERSATION_DELETE,
+                    target_type="conversation",
+                    target_id=str(conversation_id),
+                    status=result.status,
+                )
+            ],
         )
-        if existing is not None:
-            return existing
-        if conversation is None:
-            raise NotFoundError(code="conversation_not_found", message="conversation not found")
-        now = await get_database_now(session)
-        conversation.status = "deleting"
-        conversation.deleted_at = now
-        conversation.updated_at = now
-        operation = await operations_service.create_operation_in_session(
-            session,
-            owner_id=owner_id,
-            operation_type=JOB_TYPE_CONVERSATION_DELETE,
-            status="running",
-            target_type="conversation",
-            target_id=str(conversation_id),
-            progress={"phase": "settling_generation"},
-        )
-        providers = await memories_service.begin_conversation_cleanup_in_session(
-            session,
-            user_id=owner_id,
-            conversation_id=conversation_id,
-            operation_id=operation.id,
-            provider_id=memory_provider.provider_id if memory_provider is not None else None,
-        )
-        job, _ = await jobs_service.enqueue_job_in_session(
-            session,
-            job_type=JOB_TYPE_CONVERSATION_DELETE,
-            business_id=str(conversation_id),
-            user_id=owner_id,
-            dedupe_key=f"{JOB_TYPE_CONVERSATION_DELETE}:{conversation_id}",
-            metadata_json={
-                "conversation_id": str(conversation_id),
-                "operation_id": str(operation.id),
-                "provider_ids": providers,
-            },
-            now=now,
-        )
-        return (
-            await operations_service.attach_job_in_session(
+    return result
+
+
+async def replay_conversation_deletion_for_recovery(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    owner_id: UUID,
+    conversation_id: UUID,
+    memory_provider: MemoryProvider | None = None,
+    provider_id: str | None = None,
+) -> RecoveryReplayStatus:
+    """Idempotently replay a post-backup conversation deletion without re-emitting audit events."""
+    resolved_provider_id = (
+        memory_provider.provider_id if memory_provider is not None else provider_id
+    )
+    try:
+        async with session_factory.begin() as session:
+            _, created_new, _ = await _accept_conversation_deletion_in_session(
                 session,
-                operation_id=operation.id,
-                job_id=job.id,
-                now=now,
+                owner_id=owner_id,
+                conversation_id=conversation_id,
+                provider_id=resolved_provider_id,
+                allow_disabled_user=True,
             )
-            or operation
-        )
+    except (NotFoundError, ForbiddenError):
+        return "skipped_missing"
+    return "enqueued" if created_new else "already_applied"
 
 
 class ConversationCleanupJobHandler:
@@ -265,12 +345,32 @@ class ConversationCleanupJobHandler:
                 result_summary={"conversation_id": str(meta.conversation_id)} if completed else {},
             )
 
+        async def after_commit(_job: JobRecord) -> None:
+            if not completed:
+                return
+            await export_deletion_audit_events_safely(
+                self._audit_archiver,
+                [
+                    DeletionAuditEvent(
+                        event_type="operation_transitioned",
+                        occurred_at=datetime.now(UTC),
+                        user_id=owner,
+                        operation_id=meta.operation_id,
+                        operation_type=JOB_TYPE_CONVERSATION_DELETE,
+                        target_type="conversation",
+                        target_id=str(meta.conversation_id),
+                        status="succeeded",
+                    )
+                ],
+            )
+
         return JobHandlerOutcome(
             outcome="succeeded" if completed else "reconciling",
             metadata_patch=patch,
             result_summary={"phase": phase},
             retry_after_seconds=1,
             before_commit=commit_cleanup,
+            after_commit=after_commit,
         )
 
 

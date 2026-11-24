@@ -37,6 +37,7 @@ from mem_ai.modules.memories.barrier import (
     NoopRecalledMemoryReferenceMarker,
     RecalledMemoryReferenceMarker,
     invoke_provider_delete_call,
+    make_delete_accepted_audit_events,
     make_delete_audit_event,
     map_memory_provider_error,
     resolve_current_time,
@@ -61,13 +62,7 @@ from mem_ai.modules.users import service as users_service
 logger = logging.getLogger("mem_ai.memories.deletions")
 
 MemoryDeleteState = Literal[
-    "pending",
-    "in_flight",
-    "accepted",
-    "reconciling",
-    "retry_delete",
-    "verified",
-    "failed",
+    "pending", "in_flight", "accepted", "reconciling", "retry_delete", "verified", "failed"
 ]
 
 
@@ -94,7 +89,7 @@ class _PreparedSingleDelete:
     audit_events: tuple[DeletionAuditEvent, ...] = ()
 
 
-async def _prepare_single_delete_tx1(
+async def prepare_single_delete_tx1(
     session_factory: async_sessionmaker[AsyncSession],
     *,
     user_id: UUID,
@@ -104,19 +99,23 @@ async def _prepare_single_delete_tx1(
     max_attempts: int,
     attempt_retention_days: int,
     now: datetime | None,
+    force_async: bool = False,
+    allow_disabled_user: bool = False,
 ) -> _PreparedSingleDelete:
+    user_check = (
+        users_service.ensure_user_not_deleting_in_session
+        if allow_disabled_user
+        else users_service.ensure_user_active_in_session
+    )
     for _ in range(2):
         try:
             async with session_factory.begin() as session:
                 current_time = await resolve_current_time(session, now)
-                await users_service.ensure_user_active_in_session(
-                    session, user_id=user_id, for_share=True
-                )
+                await user_check(session, user_id=user_id, for_share=True)
                 scope_row = await repository.get_scope(
                     session, user_id=user_id, provider_id=provider_id, for_share=True
                 )
                 current_epoch = scope_row.epoch if scope_row is not None else 0
-
                 existing = await repository.get_memory_tombstone(
                     session,
                     user_id=user_id,
@@ -149,11 +148,11 @@ async def _prepare_single_delete_tx1(
                     session,
                     owner_id=user_id,
                     operation_type=OPERATION_TYPE_MEMORY_DELETE,
-                    status="running",
+                    status="pending" if force_async else "running",
                     target_type="memory",
                     target_id=memory_id,
                     progress={
-                        "phase": "deleting",
+                        "phase": "recovery_replay_pending" if force_async else "deleting",
                         "provider_id": provider_id,
                         "memory_id": memory_id,
                         "memory_epoch": current_epoch,
@@ -181,28 +180,44 @@ async def _prepare_single_delete_tx1(
                     )
                     tombstone_row = rebound if rebound is not None else existing
 
-                job = await jobs_service.register_and_claim_sync_job_in_session(
-                    session,
-                    job_type=JOB_TYPE_MEMORY_DELETE,
-                    business_id=str(operation.id),
-                    user_id=user_id,
-                    dedupe_key=f"{JOB_TYPE_MEMORY_DELETE}:{operation.id}",
-                    max_attempts=max_attempts,
-                    attempt_retention_days=attempt_retention_days,
-                    now=current_time,
-                    metadata_json={
-                        "operation_id": str(operation.id),
-                        "tombstone_id": str(tombstone_row.id),
-                        "provider_id": provider_id,
-                        "memory_id": memory_id,
-                        "memory_epoch": current_epoch,
-                        "delete_state": "in_flight",
-                    },
+                delete_meta = {
+                    "operation_id": str(operation.id),
+                    "tombstone_id": str(tombstone_row.id),
+                    "provider_id": provider_id,
+                    "memory_id": memory_id,
+                    "memory_epoch": current_epoch,
+                    "delete_state": "pending" if force_async else "in_flight",
+                }
+                dedupe_key = f"{JOB_TYPE_MEMORY_DELETE}:{operation.id}"
+                if force_async:
+                    job, _ = await jobs_service.enqueue_job_in_session(
+                        session,
+                        job_type=JOB_TYPE_MEMORY_DELETE,
+                        business_id=str(operation.id),
+                        user_id=user_id,
+                        dedupe_key=dedupe_key,
+                        max_attempts=max_attempts,
+                        now=current_time,
+                        metadata_json=delete_meta,
+                    )
+                else:
+                    job = await jobs_service.register_and_claim_sync_job_in_session(
+                        session,
+                        job_type=JOB_TYPE_MEMORY_DELETE,
+                        business_id=str(operation.id),
+                        user_id=user_id,
+                        dedupe_key=dedupe_key,
+                        max_attempts=max_attempts,
+                        attempt_retention_days=attempt_retention_days,
+                        now=current_time,
+                        metadata_json=delete_meta,
+                    )
+                final_op = (
+                    await operations_service.attach_job_in_session(
+                        session, operation_id=operation.id, job_id=job.id, now=current_time
+                    )
+                    or operation
                 )
-                attached = await operations_service.attach_job_in_session(
-                    session, operation_id=operation.id, job_id=job.id, now=current_time
-                )
-                final_op = attached or operation
                 await marker.mark_memory_deleted_in_session(
                     session,
                     owner_id=user_id,
@@ -214,27 +229,15 @@ async def _prepare_single_delete_tx1(
                     session, user_id=user_id, provider_id=provider_id
                 )
                 tombstone_dto = MemoryTombstoneRecord.model_validate(tombstone_row)
-                events = (
-                    make_delete_audit_event(
-                        "operation_accepted",
-                        user_id=user_id,
-                        operation_id=final_op.id,
-                        provider_id=provider_id,
-                        memory_id=memory_id,
-                        memory_epoch=current_epoch,
-                        status=final_op.status,
-                        occurred_at=current_time,
-                    ),
-                    make_delete_audit_event(
-                        "memory_tombstone_created",
-                        user_id=user_id,
-                        operation_id=final_op.id,
-                        provider_id=provider_id,
-                        memory_id=memory_id,
-                        memory_epoch=current_epoch,
-                        status=tombstone_dto.status,
-                        occurred_at=current_time,
-                    ),
+                events = make_delete_accepted_audit_events(
+                    user_id=user_id,
+                    operation_id=final_op.id,
+                    provider_id=provider_id,
+                    memory_id=memory_id,
+                    memory_epoch=current_epoch,
+                    operation_status=final_op.status,
+                    tombstone_status=tombstone_dto.status,
+                    occurred_at=current_time,
                 )
                 return _PreparedSingleDelete(
                     shortcut=None,
@@ -250,8 +253,7 @@ async def _prepare_single_delete_tx1(
             raise
 
     raise ServiceUnavailableError(
-        code="memory_delete_conflict",
-        message="concurrent deletion state could not be resolved",
+        code="memory_delete_conflict", message="concurrent deletion state could not be resolved"
     )
 
 
@@ -278,7 +280,7 @@ async def delete_single_memory(
 
     provider_id = memory_provider.provider_id
     marker = recalled_memory_marker or NoopRecalledMemoryReferenceMarker()
-    prepared = await _prepare_single_delete_tx1(
+    prepared = await prepare_single_delete_tx1(
         session_factory,
         user_id=user_id,
         provider_id=provider_id,

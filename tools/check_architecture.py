@@ -20,6 +20,7 @@ LOCAL_DOCS = (
     ROOT / "DESIGN.md",
     ROOT / "GLOSSARY.md",
     ROOT / "docs/backend-scaffold-design.md",
+    ROOT / "docs/operations/deployment-and-recovery.md",
     ROOT / "docs/agents/issue-tracker.md",
     ROOT / ".scratch/ai-chat-memory/spec.md",
 )
@@ -33,6 +34,7 @@ ASSEMBLY_EXCEPTIONS = frozenset(
     {
         "src/mem_ai/application.py",
         "src/mem_ai/main.py",
+        "src/mem_ai/ops.py",
         "src/mem_ai/db/model_registry.py",
         "src/mem_ai/api/router.py",
         "src/mem_ai/workers/main.py",

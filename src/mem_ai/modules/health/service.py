@@ -53,19 +53,19 @@ class ReadinessStatus(BaseModel):
 
 @lru_cache(maxsize=1)
 def _discover_alembic_head() -> str | None:
-    repo_root = Path(__file__).resolve().parents[4]
-    alembic_ini = repo_root / "alembic.ini"
-    migrations_dir = repo_root / "migrations"
-    if alembic_ini.exists():
-        cfg = Config(str(alembic_ini))
-        cfg.set_main_option("script_location", str(migrations_dir))
-    elif migrations_dir.exists():
-        cfg = Config()
-        cfg.set_main_option("script_location", str(migrations_dir))
-    else:
-        return None
-    script = ScriptDirectory.from_config(cfg)
-    return script.get_current_head()
+    candidates = (Path(__file__).resolve().parents[4], Path.cwd())
+    for root in candidates:
+        alembic_ini = root / "alembic.ini"
+        migrations_dir = root / "migrations"
+        if alembic_ini.exists() and migrations_dir.exists():
+            cfg = Config(str(alembic_ini))
+            cfg.set_main_option("script_location", str(migrations_dir))
+            return ScriptDirectory.from_config(cfg).get_current_head()
+        if migrations_dir.exists():
+            cfg = Config()
+            cfg.set_main_option("script_location", str(migrations_dir))
+            return ScriptDirectory.from_config(cfg).get_current_head()
+    return None
 
 
 def resolve_expected_migration_revision(settings: Settings) -> str | None:

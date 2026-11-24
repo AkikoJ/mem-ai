@@ -126,6 +126,12 @@ from mem_ai.modules.memories.recall import (
 from mem_ai.modules.memories.recall import (
     select_memories_for_prompt as select_memories_for_prompt,
 )
+from mem_ai.modules.memories.recovery import (
+    replay_clear_scope_for_recovery as replay_clear_scope_for_recovery,
+)
+from mem_ai.modules.memories.recovery import (
+    replay_single_memory_delete_for_recovery as replay_single_memory_delete_for_recovery,
+)
 from mem_ai.modules.memories.schemas import (
     AcceptedMemoryOutcome,
     CreatedMemoryOutcome,

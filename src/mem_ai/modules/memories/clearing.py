@@ -79,6 +79,7 @@ async def prepare_clear_scope_in_session(
     force_async: bool = False,
     user_cleanup_operation_id: UUID | None = None,
     attempt_retention_days: int = jobs_service.DEFAULT_JOB_ATTEMPT_RETENTION_DAYS,
+    min_new_epoch: int | None = None,
 ) -> _PreparedClearScope:
     """Prepare a clear under the caller's resource-status policy.
 
@@ -112,16 +113,45 @@ async def prepare_clear_scope_in_session(
                         limit=1,
                     )
                 )
-            if existing_is_cleanup:
+            if existing_is_cleanup and (min_new_epoch is None or scope_row.epoch >= min_new_epoch):
                 return _PreparedClearScope(
                     shortcut=AcceptedMemoryDeletionOutcome(operation=existing_op)
                 )
 
     if scope_row.barrier_state == "idle":
-        previous_epoch, new_epoch = scope_row.epoch, scope_row.epoch + 1
+        target_epoch = scope_row.epoch + 1
+        if min_new_epoch is not None:
+            target_epoch = max(target_epoch, min_new_epoch)
+        previous_epoch, new_epoch = target_epoch - 1, target_epoch
         next_barrier: MemoryBarrierState = "clearing"
     else:
-        new_epoch, previous_epoch = scope_row.epoch, max(0, scope_row.epoch - 1)
+        target_epoch = scope_row.epoch
+        if min_new_epoch is not None and min_new_epoch > scope_row.epoch:
+            target_epoch = min_new_epoch
+            # Supersede any prior lower-epoch barrier operation/job before advancing.
+            prior_op_id = scope_row.barrier_operation_id
+            if prior_op_id is not None:
+                await jobs_service.cancel_matching_jobs_in_session(
+                    session,
+                    user_id=user_id,
+                    job_types=(JOB_TYPE_MEMORY_CLEAR,),
+                    allowed_statuses=("pending", "retry_wait", "reconciling", "running"),
+                    predicate=lambda job: not job.has_active_lease(current_time),
+                    error_code="superseded_by_higher_epoch_clear",
+                    error_summary="superseded by higher-epoch recovery clear barrier",
+                    metadata_match={"operation_id": str(prior_op_id)},
+                    now=current_time,
+                )
+                await operations_service.transition_operation_in_session(
+                    session,
+                    operation_id=prior_op_id,
+                    status="failed",
+                    progress={"phase": "superseded", "provider_id": provider_id},
+                    error_code="superseded_by_higher_epoch_clear",
+                    error_message="superseded by higher-epoch recovery clear barrier",
+                    now=current_time,
+                )
+        new_epoch, previous_epoch = target_epoch, max(0, target_epoch - 1)
         next_barrier = cast(MemoryBarrierState, scope_row.barrier_state)
 
     cancelled_queued: list[JobRecord] = []

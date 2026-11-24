@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, Path, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 
 from mem_ai.api.dependencies import (
+    DeletionAuditArchiverDep,
     GenerationLimiterDep,
     ModelProviderDep,
     OptionalMemoryProviderDep,
@@ -57,6 +58,7 @@ async def delete_conversation(
     auth: AuthContextDep,
     session_factory: SessionFactoryDep,
     memory_provider: OptionalMemoryProviderDep,
+    audit_archiver: DeletionAuditArchiverDep,
     response: Response,
 ) -> ApiResponse[OperationAcceptedResponse]:
     """Hide an owned conversation immediately and return its durable cleanup operation."""
@@ -65,6 +67,7 @@ async def delete_conversation(
         owner_id=auth.user_id,
         conversation_id=conversation_id,
         memory_provider=memory_provider,
+        audit_archiver=audit_archiver,
     )
     response.headers["Location"] = operation.status_url
     return ok_response(OperationAcceptedResponse.from_record(operation))
