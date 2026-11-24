@@ -50,10 +50,16 @@ from mem_ai.modules.memories.barrier import (
     OPERATION_TYPE_MEMORY_DELETE as OPERATION_TYPE_MEMORY_DELETE,
 )
 from mem_ai.modules.memories.barrier import (
+    MemoryBarrierObservabilitySnapshot as MemoryBarrierObservabilitySnapshot,
+)
+from mem_ai.modules.memories.barrier import (
     NoopRecalledMemoryReferenceMarker as NoopRecalledMemoryReferenceMarker,
 )
 from mem_ai.modules.memories.barrier import (
     RecalledMemoryReferenceMarker as RecalledMemoryReferenceMarker,
+)
+from mem_ai.modules.memories.barrier import (
+    get_memory_barrier_observability as get_memory_barrier_observability,
 )
 from mem_ai.modules.memories.barrier import (
     is_valid_barrier_transition as is_valid_barrier_transition,

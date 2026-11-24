@@ -7,7 +7,13 @@ import logging
 
 import pytest
 
-from mem_ai.core.exceptions import AppError, ConflictError, NotFoundError
+from mem_ai.core.exceptions import (
+    AppError,
+    ConflictError,
+    NotFoundError,
+    PayloadTooLargeError,
+    RateLimitError,
+)
 from mem_ai.core.logging import (
     JsonLogFormatter,
     bind_log_context,
@@ -83,3 +89,56 @@ def test_json_formatter_includes_correlation_fields_and_redacts_secrets() -> Non
         assert payload["nested"] == {"password": "[REDACTED]", "safe": "ok"}
     finally:
         reset_log_context(tokens)
+
+
+def test_json_formatter_redacts_inline_bearer_receipts_and_preserves_token_counts() -> None:
+    clear_log_context()
+    formatter = JsonLogFormatter()
+    record = logging.LogRecord(
+        name="mem_ai.test",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="auth failed for Bearer tok_secret_123 and DeletionReceipt rcpt_secret_456",
+        args=(),
+        exc_info=None,
+    )
+    record.extra_fields = {
+        "user_message": "my secret diary entry",
+        "assistant_message": "assistant reply text",
+        "user_message_id": "msg_1",
+        "input_tokens": 12,
+        "output_tokens": 25,
+        "total_tokens": 37,
+        "lease_token": "genlease_secret",
+        "header_sample": "Authorization: Bearer another_secret_token",
+    }
+
+    payload = json.loads(formatter.format(record))
+    assert "tok_secret_123" not in payload["message"]
+    assert "rcpt_secret_456" not in payload["message"]
+    assert payload["user_message"] == "[REDACTED]"
+    assert payload["assistant_message"] == "[REDACTED]"
+    assert payload["user_message_id"] == "msg_1"
+    assert payload["input_tokens"] == 12
+    assert payload["output_tokens"] == 25
+    assert payload["total_tokens"] == 37
+    assert payload["lease_token"] == "[REDACTED]"
+    assert "another_secret_token" not in payload["header_sample"]
+
+
+def test_rate_limit_and_payload_too_large_errors_expose_stable_headers_and_details() -> None:
+    rate_err = RateLimitError(
+        code="request_concurrency_limit_exceeded",
+        message="too many concurrent requests",
+        retry_after_seconds=4.2,
+    )
+    assert rate_err.status_code == 429
+    assert rate_err.code == "request_concurrency_limit_exceeded"
+    assert rate_err.headers["Retry-After"] == "5"
+    assert rate_err.details["retry_after_seconds"] == 5
+
+    large_err = PayloadTooLargeError(max_bytes=1024)
+    assert large_err.status_code == 413
+    assert large_err.code == "payload_too_large"
+    assert large_err.details["max_request_body_bytes"] == 1024

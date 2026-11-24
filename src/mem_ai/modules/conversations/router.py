@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, Path, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 
 from mem_ai.api.dependencies import (
+    GenerationLimiterDep,
     ModelProviderDep,
     OptionalMemoryProviderDep,
     PersonaProviderDep,
@@ -18,6 +19,8 @@ from mem_ai.api.dependencies import (
 from mem_ai.api.pagination import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, PaginatedResponse
 from mem_ai.api.responses import ApiResponse, ok_response
 from mem_ai.core.exceptions import UnprocessableEntityError
+from mem_ai.core.limits import ConcurrencyPermit
+from mem_ai.core.logging import bind_log_context
 from mem_ai.modules.auth.dependencies import AuthContextDep
 from mem_ai.modules.conversations import cleanup as conversation_cleanup
 from mem_ai.modules.conversations import queries as conversation_queries
@@ -183,6 +186,7 @@ async def post_chat(
     model_provider: ModelProviderDep,
     memory_provider: OptionalMemoryProviderDep,
     task_registry: SyncTaskRegistryDep,
+    generation_limiter: GenerationLimiterDep,
 ) -> ApiResponse[ChatResponse] | Response:
     """Start, continue, stream, or idempotently replay a conversation turn."""
     idempotency_key = request.headers.get("Idempotency-Key")
@@ -196,7 +200,9 @@ async def post_chat(
         user_permissions=auth.permissions,
         require_streaming=payload.stream,
         task_registry=task_registry,
+        generation_limiter=generation_limiter,
     )
+    acquired_permit: list[ConcurrencyPermit] = []
     prepared_or_replay = await conversations_service.prepare_chat_turn(
         session_factory,
         persona_provider=persona_provider,
@@ -210,8 +216,17 @@ async def post_chat(
         stream=payload.stream,
         allow_streaming=True,
         options=options,
+        on_generation_permit=acquired_permit.append,
     )
+    permit = acquired_permit[0] if acquired_permit else None
+
     if isinstance(prepared_or_replay, ChatAcceptedResult):
+        bind_log_context(
+            conversation_id=str(prepared_or_replay.conversation_id),
+            generation_id=str(prepared_or_replay.generation_id),
+        )
+        if permit is not None:
+            permit.release()
         accepted = ok_response(ChatAcceptedResponse.from_result(prepared_or_replay))
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
@@ -219,7 +234,18 @@ async def post_chat(
             headers={"Location": prepared_or_replay.status_url},
         )
     if not isinstance(prepared_or_replay, PreparedGeneration):
+        bind_log_context(
+            conversation_id=str(prepared_or_replay.conversation_id),
+            generation_id=str(prepared_or_replay.generation_id),
+        )
+        if permit is not None:
+            permit.release()
         return ok_response(ChatResponse.from_result(prepared_or_replay))
+
+    bind_log_context(
+        conversation_id=str(prepared_or_replay.conversation_id),
+        generation_id=str(prepared_or_replay.generation_id),
+    )
 
     if payload.stream:
         return conversations_stream.build_chat_sse_response(
@@ -228,6 +254,7 @@ async def post_chat(
             prepared=prepared_or_replay,
             memory_provider=memory_provider,
             options=options,
+            on_finished=permit.release if permit is not None else None,
         )
 
     outcome = await conversations_service.execute_prepared_sync_chat(
@@ -236,6 +263,7 @@ async def post_chat(
         memory_provider=memory_provider,
         prepared=prepared_or_replay,
         options=options,
+        on_finished=permit.release if permit is not None else None,
     )
     return ok_response(ChatResponse.from_result(outcome))
 
@@ -252,6 +280,7 @@ async def get_generation(
     session_factory: SessionFactoryDep,
 ) -> ApiResponse[GenerationResponse]:
     """Query status, committed result, or terminal error for an owned generation."""
+    bind_log_context(conversation_id=str(conversation_id), generation_id=str(generation_id))
     detail = await conversation_queries.get_generation_detail_for_owner(
         session_factory,
         owner_id=auth.user_id,

@@ -7,6 +7,7 @@ background turn-memory loading.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, cast
 from uuid import UUID
@@ -540,4 +541,28 @@ class DatabaseRecalledMemoryReferenceMarker:
             provider_id=provider_id,
             max_memory_epoch=max_memory_epoch,
             deleted_at=deleted_at,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationObservabilitySnapshot:
+    """Point-in-time aggregate counts of active and lease-expired generations."""
+
+    running_count: int
+    expired_lease_count: int
+
+
+async def get_generation_observability(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> GenerationObservabilitySnapshot:
+    """Read aggregate running and lease-expired generation counts in a short read session."""
+    async with session_factory() as session:
+        current_time = await repository.get_database_now(session)
+        running_count, expired_count = await repository.get_generation_status_aggregates(
+            session,
+            current_time=current_time,
+        )
+        return GenerationObservabilitySnapshot(
+            running_count=running_count,
+            expired_lease_count=expired_count,
         )

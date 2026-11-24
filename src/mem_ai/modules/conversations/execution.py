@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any, TypeVar
 
@@ -34,6 +35,13 @@ from mem_ai.core.exceptions import (
     ServiceUnavailableError,
 )
 from mem_ai.core.logging import bind_log_context, reset_log_context
+from mem_ai.core.telemetry import (
+    GenerationMode,
+    GenerationOutcome,
+    ModelOutcome,
+    current_telemetry,
+    current_tracer,
+)
 from mem_ai.modules.conversations import generation as generation_store
 from mem_ai.modules.conversations.generation import (
     BeforeCommitHook,
@@ -127,6 +135,76 @@ def build_turn_memory_enqueue_hook(
     return _before_commit
 
 
+def _model_provider_name(model_provider: ModelProvider) -> str:
+    raw = getattr(model_provider, "provider_id", None)
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return type(model_provider).__name__
+
+
+async def _run_observed_model_call(
+    *,
+    model_provider: ModelProvider,
+    model_id: str,
+    mode: GenerationMode,
+    span_name: str,
+    timeout_seconds: float | None,
+    invoke: Callable[[float], Awaitable[ModelResponse]],
+) -> ModelResponse:
+    """Shared span, provider log binding, deadline timeout, and latency metrics wrapper."""
+    telemetry = current_telemetry()
+    tracer = current_tracer()
+    provider_name = _model_provider_name(model_provider)
+    started = time.perf_counter()
+    outcome: ModelOutcome = "error"
+    log_tokens = bind_log_context(provider=provider_name)
+    try:
+        with tracer.start_span(
+            span_name,
+            attributes={"model_id": model_id, "mode": mode, "provider": provider_name},
+        ) as span:
+            try:
+                timeout_ctx = (
+                    asyncio.timeout(timeout_seconds)
+                    if timeout_seconds is not None
+                    else contextlib.nullcontext()
+                )
+                async with timeout_ctx:
+                    response = await invoke(started)
+                outcome = "succeeded"
+                span.set_status("ok")
+                return response
+            except TimeoutError:
+                outcome = "timeout"
+                span.set_status("error", "generation_timeout")
+                raise GatewayTimeoutError(
+                    code="generation_timeout",
+                    message="model generation timed out",
+                ) from None
+            except asyncio.CancelledError:
+                elapsed = max(0.0, time.perf_counter() - started)
+                if timeout_seconds is not None and elapsed >= max(0.0, timeout_seconds - 0.05):
+                    outcome = "timeout"
+                    span.set_status("error", "generation_timeout")
+                else:
+                    outcome = "cancelled"
+                    span.set_status("error", "cancelled")
+                raise
+            except BaseException as exc:
+                span.record_exception(exc)
+                span.set_status("error", getattr(exc, "code", type(exc).__name__))
+                raise
+            finally:
+                telemetry.record_model_request(
+                    model_id=model_id,
+                    mode=mode,
+                    outcome=outcome,
+                    duration_seconds=max(0.0, time.perf_counter() - started),
+                )
+    finally:
+        reset_log_context(log_tokens)
+
+
 async def execute_model_completion(
     *,
     model_provider: ModelProvider,
@@ -141,15 +219,18 @@ async def execute_model_completion(
         max_output_tokens=context.prepared.max_output_tokens,
         timeout_seconds=timeout_seconds,
     )
-    if timeout_seconds is None:
+
+    async def _invoke(_started: float) -> ModelResponse:
         return await model_provider.generate(request)
-    try:
-        return await asyncio.wait_for(model_provider.generate(request), timeout=timeout_seconds)
-    except TimeoutError:
-        raise GatewayTimeoutError(
-            code="generation_timeout",
-            message="model generation timed out",
-        ) from None
+
+    return await _run_observed_model_call(
+        model_provider=model_provider,
+        model_id=request.model_id,
+        mode="sync",
+        span_name="model.generate",
+        timeout_seconds=timeout_seconds,
+        invoke=_invoke,
+    )
 
 
 async def _close_stream_iterator(iterator: object) -> None:
@@ -174,26 +255,45 @@ async def execute_model_stream(
         max_output_tokens=context.prepared.max_output_tokens,
         timeout_seconds=timeout_seconds,
     )
-    collected: list[str] = []
-    final_usage = ModelUsage()
-    final_finish_reason: str | None = None
-    stream_iter = model_provider.stream_generate(request)
-    try:
-        async for chunk in stream_iter:
-            if chunk.usage is not None:
-                final_usage = chunk.usage
-            if chunk.finish_reason is not None:
-                final_finish_reason = chunk.finish_reason
-            if chunk.text:
-                collected.append(chunk.text)
-                on_delta(chunk.text)
-    finally:
-        await _close_stream_iterator(stream_iter)
-    return ModelResponse(
-        model_id=context.prepared.model_id,
-        content="".join(collected),
-        usage=final_usage,
-        finish_reason=final_finish_reason,
+    telemetry = current_telemetry()
+
+    async def _invoke(started: float) -> ModelResponse:
+        first_token_recorded = False
+        collected: list[str] = []
+        final_usage = ModelUsage()
+        final_finish_reason: str | None = None
+        stream_iter = model_provider.stream_generate(request)
+        try:
+            async for chunk in stream_iter:
+                if chunk.usage is not None:
+                    final_usage = chunk.usage
+                if chunk.finish_reason is not None:
+                    final_finish_reason = chunk.finish_reason
+                if chunk.text:
+                    if not first_token_recorded:
+                        first_token_recorded = True
+                        telemetry.record_model_first_token(
+                            model_id=request.model_id,
+                            duration_seconds=max(0.0, time.perf_counter() - started),
+                        )
+                    collected.append(chunk.text)
+                    on_delta(chunk.text)
+        finally:
+            await _close_stream_iterator(stream_iter)
+        return ModelResponse(
+            model_id=context.prepared.model_id,
+            content="".join(collected),
+            usage=final_usage,
+            finish_reason=final_finish_reason,
+        )
+
+    return await _run_observed_model_call(
+        model_provider=model_provider,
+        model_id=request.model_id,
+        mode="stream",
+        span_name="model.stream_generate",
+        timeout_seconds=timeout_seconds,
+        invoke=_invoke,
     )
 
 
@@ -210,11 +310,19 @@ async def run_prepared_generation_lifecycle(
     prepare_context_fn: ContextPreparer,
     run_model: ModelRunner,
     overall_deadline_seconds: float | None = None,
+    mode: GenerationMode = "sync",
 ) -> tuple[CommittedChatResult | None, StreamGenerationFailure | None, AppError | None]:
     """Single shared generation execution & convergence pipeline for sync and streaming flows."""
+    telemetry = current_telemetry()
+    tracer = current_tracer()
+    started = time.perf_counter()
     log_tokens = bind_log_context(
         conversation_id=str(prepared.conversation_id),
         generation_id=str(prepared.generation_id),
+    )
+    telemetry.inc_gauge(
+        "mem_ai_generations_active",
+        help_text="Current number of in-process active generations.",
     )
     execution_task: asyncio.Task[ModelResponse] | None = None
 
@@ -231,6 +339,21 @@ async def run_prepared_generation_lifecycle(
             error_message=exc.message,
             error_status_code=exc.status_code,
             idempotency_retention_seconds=idempotency_retention_seconds,
+        )
+        outcome_label: GenerationOutcome = (
+            "timeout" if exc.code == "generation_timeout" else "failed"
+        )
+        telemetry.record_generation_outcome(mode=mode, outcome=outcome_label, error_code=exc.code)
+        logger.warning(
+            "Generation converged to failure",
+            extra={
+                "extra_fields": {
+                    "mode": mode,
+                    "model_id": prepared.model_id,
+                    "error_code": exc.code,
+                    "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                }
+            },
         )
         return (
             None,
@@ -274,76 +397,109 @@ async def run_prepared_generation_lifecycle(
             ) from None
 
     try:
-        try:
-            async with GenerationLeaseHeartbeat(
-                session_factory=session_factory,
-                prepared=prepared,
-                lease_ttl_seconds=lease_ttl_seconds,
-                renew_interval_seconds=lease_renew_interval_seconds,
-                on_lease_lost=_abort_on_lease_lost,
-            ) as heartbeat:
-                execution_task = asyncio.create_task(_prepare_and_invoke(heartbeat))
-                try:
-                    model_response = await execution_task
-                except asyncio.CancelledError:
+        with tracer.start_span(
+            "chat.generation",
+            attributes={
+                "mode": mode,
+                "model_id": prepared.model_id,
+                "conversation_id": str(prepared.conversation_id),
+                "generation_id": str(prepared.generation_id),
+            },
+        ) as span:
+            try:
+                async with GenerationLeaseHeartbeat(
+                    session_factory=session_factory,
+                    prepared=prepared,
+                    lease_ttl_seconds=lease_ttl_seconds,
+                    renew_interval_seconds=lease_renew_interval_seconds,
+                    on_lease_lost=_abort_on_lease_lost,
+                ) as heartbeat:
+                    execution_task = asyncio.create_task(_prepare_and_invoke(heartbeat))
+                    try:
+                        model_response = await execution_task
+                    except asyncio.CancelledError:
+                        if heartbeat.loss_error is not None:
+                            raise heartbeat.loss_error from None
+                        raise
+                    finally:
+                        if not execution_task.done():
+                            execution_task.cancel()
+                            with (
+                                anyio.CancelScope(shield=True),
+                                contextlib.suppress(asyncio.CancelledError, Exception),
+                            ):
+                                await execution_task
+
                     if heartbeat.loss_error is not None:
-                        raise heartbeat.loss_error from None
-                    raise
-                finally:
-                    if not execution_task.done():
-                        execution_task.cancel()
-                        with (
-                            anyio.CancelScope(shield=True),
-                            contextlib.suppress(asyncio.CancelledError, Exception),
-                        ):
-                            await execution_task
-
-                if heartbeat.loss_error is not None:
-                    raise heartbeat.loss_error
-        except asyncio.CancelledError:
-            raise
-        except AppError as exc:
-            return await _fail(exc)
-        except Exception:
-            logger.exception(
-                "Unexpected exception during model execution",
-                extra={"extra_fields": {"model_id": prepared.model_id}},
-            )
-            return await _fail(
-                BadGatewayError(code="model_upstream_error", message="model generation failed")
-            )
-
-        tx2_hook = build_turn_memory_enqueue_hook(
-            prepared=prepared,
-            memory_provider=memory_provider,
-            max_attempts=memory_write_max_attempts,
-            extra_hook=before_commit_hook,
-        )
-        try:
-            committed = await generation_store.commit_generation_success_phase(
-                session_factory,
-                prepared=prepared,
-                assistant_content=model_response.content,
-                usage=model_response.usage,
-                finish_reason=model_response.finish_reason,
-                before_commit_hook=tx2_hook,
-                idempotency_retention_seconds=idempotency_retention_seconds,
-            )
-            return committed, None, None
-        except asyncio.CancelledError:
-            raise
-        except AppError as exc:
-            return await _fail(exc)
-        except Exception:
-            logger.exception(
-                "Failed to commit completed generation atomically",
-                extra={"extra_fields": {"model_id": prepared.model_id}},
-            )
-            return await _fail(
-                ServiceUnavailableError(
-                    code="generation_commit_failed",
-                    message="failed to commit generation result",
+                        raise heartbeat.loss_error
+            except asyncio.CancelledError:
+                span.set_status("error", "cancelled")
+                raise
+            except AppError as exc:
+                span.set_status("error", exc.code)
+                return await _fail(exc)
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_status("error", "model_upstream_error")
+                logger.exception(
+                    "Unexpected exception during model execution",
+                    extra={"extra_fields": {"model_id": prepared.model_id}},
                 )
+                return await _fail(
+                    BadGatewayError(code="model_upstream_error", message="model generation failed")
+                )
+
+            tx2_hook = build_turn_memory_enqueue_hook(
+                prepared=prepared,
+                memory_provider=memory_provider,
+                max_attempts=memory_write_max_attempts,
+                extra_hook=before_commit_hook,
             )
+            try:
+                committed = await generation_store.commit_generation_success_phase(
+                    session_factory,
+                    prepared=prepared,
+                    assistant_content=model_response.content,
+                    usage=model_response.usage,
+                    finish_reason=model_response.finish_reason,
+                    before_commit_hook=tx2_hook,
+                    idempotency_retention_seconds=idempotency_retention_seconds,
+                )
+                telemetry.record_generation_outcome(mode=mode, outcome="succeeded")
+                span.set_status("ok")
+                logger.info(
+                    "Generation completed",
+                    extra={
+                        "extra_fields": {
+                            "mode": mode,
+                            "model_id": prepared.model_id,
+                            "input_tokens": committed.usage.input_tokens,
+                            "output_tokens": committed.usage.output_tokens,
+                            "total_tokens": committed.usage.total_tokens,
+                            "duration_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                        }
+                    },
+                )
+                return committed, None, None
+            except asyncio.CancelledError:
+                span.set_status("error", "cancelled")
+                raise
+            except AppError as exc:
+                span.set_status("error", exc.code)
+                return await _fail(exc)
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_status("error", "generation_commit_failed")
+                logger.exception(
+                    "Failed to commit completed generation atomically",
+                    extra={"extra_fields": {"model_id": prepared.model_id}},
+                )
+                return await _fail(
+                    ServiceUnavailableError(
+                        code="generation_commit_failed",
+                        message="failed to commit generation result",
+                    )
+                )
     finally:
+        telemetry.dec_gauge("mem_ai_generations_active")
         reset_log_context(log_tokens)

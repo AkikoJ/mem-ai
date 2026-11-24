@@ -693,21 +693,28 @@ async def get_job_status_aggregates(
     session: AsyncSession,
     *,
     job_type: str | None = None,
-) -> tuple[dict[str, int], datetime | None]:
-    """Return status counts and oldest `next_run_at` among waiting/reconciling jobs."""
+) -> tuple[dict[str, int], datetime | None, datetime | None]:
+    """Return status counts, oldest due timestamp, and latest succeeded timestamp."""
     count_stmt = select(Job.status, func.count(Job.id)).group_by(Job.status)
     due_stmt = select(func.min(Job.next_run_at)).where(
         Job.status.in_(("pending", "retry_wait", "reconciling"))
     )
+    last_success_stmt = select(func.max(Job.finished_at)).where(Job.status == "succeeded")
     if job_type is not None:
         count_stmt = count_stmt.where(Job.job_type == job_type)
         due_stmt = due_stmt.where(Job.job_type == job_type)
+        last_success_stmt = last_success_stmt.where(Job.job_type == job_type)
 
     counts: dict[str, int] = {
         str(status): int(total) for status, total in (await session.execute(count_stmt)).all()
     }
     oldest_due = (await session.execute(due_stmt)).scalar_one_or_none()
-    return counts, normalize_utc(oldest_due) if oldest_due is not None else None
+    last_success = (await session.execute(last_success_stmt)).scalar_one_or_none()
+    return (
+        counts,
+        normalize_utc(oldest_due) if oldest_due is not None else None,
+        normalize_utc(last_success) if last_success is not None else None,
+    )
 
 
 async def delete_terminal_user_job_batch(

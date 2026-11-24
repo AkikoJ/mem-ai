@@ -24,6 +24,8 @@ from mem_ai.contracts.memory_provider import (
     MemoryScope,
 )
 from mem_ai.core.exceptions import AppError
+from mem_ai.core.logging import bind_log_context, reset_log_context
+from mem_ai.core.telemetry import current_telemetry, current_tracer
 from mem_ai.modules.memories import repository
 from mem_ai.modules.users import service as users_service
 
@@ -425,81 +427,110 @@ async def recall_relevant_memories(
         )
 
     provider_id = memory_provider.provider_id
-    async with session_factory() as session:
-        await users_service.ensure_user_active_in_session(session, user_id=user_id)
-        guard = await load_recall_guard_in_session(
-            session,
-            user_id=user_id,
-            provider_id=provider_id,
-            conversation_id=conversation_id,
-            tombstone_lookup=tombstone_lookup,
-        )
+    telemetry = current_telemetry()
+    tracer = current_tracer()
+    log_tokens = bind_log_context(provider=provider_id)
+    try:
+        with tracer.start_span(
+            "memory.recall",
+            attributes={"provider": provider_id, "conversation_id": str(conversation_id)},
+        ) as span:
+            async with session_factory() as session:
+                await users_service.ensure_user_active_in_session(session, user_id=user_id)
+                guard = await load_recall_guard_in_session(
+                    session,
+                    user_id=user_id,
+                    provider_id=provider_id,
+                    conversation_id=conversation_id,
+                    tombstone_lookup=tombstone_lookup,
+                )
 
-    if guard.is_blocked:
-        return MemoryRecallOutcome(
-            items=(),
-            provider_id=provider_id,
-            captured_epoch=guard.current_epoch,
-            degraded=True,
-            degradation_reason="memory_scope_clearing",
-        )
+            if guard.is_blocked:
+                telemetry.record_memory_recall(
+                    provider=provider_id,
+                    outcome="degraded",
+                    reason="memory_scope_clearing",
+                )
+                span.set_attribute("memory.degraded", True)
+                span.set_attribute("memory.degradation_reason", "memory_scope_clearing")
+                return MemoryRecallOutcome(
+                    items=(),
+                    provider_id=provider_id,
+                    captured_epoch=guard.current_epoch,
+                    degraded=True,
+                    degradation_reason="memory_scope_clearing",
+                )
 
-    normalized_query = _normalize_text(query)
-    if not normalized_query:
-        return MemoryRecallOutcome(
-            items=(),
-            provider_id=provider_id,
-            captured_epoch=guard.current_epoch,
-            degraded=False,
-        )
+            normalized_query = _normalize_text(query)
+            if not normalized_query:
+                return MemoryRecallOutcome(
+                    items=(),
+                    provider_id=provider_id,
+                    captured_epoch=guard.current_epoch,
+                    degraded=False,
+                )
 
-    scopes_to_query: list[tuple[MemoryScope, UUID | None]] = [("user", None)]
-    if not guard.conversation_tombstoned:
-        scopes_to_query.append(("conversation", conversation_id))
+            scopes_to_query: list[tuple[MemoryScope, UUID | None]] = [("user", None)]
+            if not guard.conversation_tombstoned:
+                scopes_to_query.append(("conversation", conversation_id))
 
-    recall_queries = [
-        MemoryRecallQuery(
-            user_id=user_id,
-            query=normalized_query,
-            scope=scope,
-            conversation_id=conv_id,
-            limit=resolved_policy.recall_limit,
-            min_relevance=resolved_policy.min_relevance,
-        )
-        for scope, conv_id in scopes_to_query
-    ]
+            recall_queries = [
+                MemoryRecallQuery(
+                    user_id=user_id,
+                    query=normalized_query,
+                    scope=scope,
+                    conversation_id=conv_id,
+                    limit=resolved_policy.recall_limit,
+                    min_relevance=resolved_policy.min_relevance,
+                )
+                for scope, conv_id in scopes_to_query
+            ]
 
-    results = await asyncio.gather(
-        *(
-            _invoke_scope_recall(
-                memory_provider=memory_provider,
-                query=recall_query,
-                timeout_seconds=resolved_policy.timeout_seconds,
+            results = await asyncio.gather(
+                *(
+                    _invoke_scope_recall(
+                        memory_provider=memory_provider,
+                        query=recall_query,
+                        timeout_seconds=resolved_policy.timeout_seconds,
+                    )
+                    for recall_query in recall_queries
+                )
             )
-            for recall_query in recall_queries
-        )
-    )
 
-    candidates: list[MemoryRecallItem] = []
-    degradation_reason: str | None = None
-    for scope_items, err_code in results:
-        if err_code is not None and degradation_reason is None:
-            degradation_reason = err_code
-        candidates.extend(scope_items)
+            candidates: list[MemoryRecallItem] = []
+            degradation_reason: str | None = None
+            for scope_items, err_code in results:
+                if err_code is not None and degradation_reason is None:
+                    degradation_reason = err_code
+                candidates.extend(scope_items)
 
-    selected = select_memories_for_prompt(
-        conversation_id=conversation_id,
-        current_input=normalized_query,
-        candidates=candidates,
-        limit=resolved_policy.recall_limit,
-        min_relevance=resolved_policy.min_relevance,
-        max_memory_chars=resolved_policy.max_memory_chars,
-        guard=guard,
-    )
-    return MemoryRecallOutcome(
-        items=selected,
-        provider_id=provider_id,
-        captured_epoch=guard.current_epoch,
-        degraded=degradation_reason is not None,
-        degradation_reason=degradation_reason,
-    )
+            selected = select_memories_for_prompt(
+                conversation_id=conversation_id,
+                current_input=normalized_query,
+                candidates=candidates,
+                limit=resolved_policy.recall_limit,
+                min_relevance=resolved_policy.min_relevance,
+                max_memory_chars=resolved_policy.max_memory_chars,
+                guard=guard,
+            )
+            if degradation_reason is not None:
+                telemetry.record_memory_recall(
+                    provider=provider_id,
+                    outcome="degraded",
+                    reason=degradation_reason,
+                )
+                span.set_attribute("memory.degraded", True)
+                span.set_attribute("memory.degradation_reason", degradation_reason)
+            else:
+                telemetry.record_memory_recall(provider=provider_id, outcome="ok")
+                span.set_attribute("memory.degraded", False)
+                span.set_status("ok")
+            return MemoryRecallOutcome(
+                items=selected,
+                provider_id=provider_id,
+                captured_epoch=guard.current_epoch,
+                degraded=degradation_reason is not None,
+                degradation_reason=degradation_reason,
+            )
+    finally:
+        reset_log_context(log_tokens)

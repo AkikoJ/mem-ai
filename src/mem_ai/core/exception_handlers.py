@@ -22,6 +22,7 @@ _HTTP_STATUS_CODES: dict[int, str] = {
     404: "not_found",
     405: "method_not_allowed",
     409: "conflict",
+    413: "payload_too_large",
     422: "validation_error",
     429: "rate_limit_exceeded",
     500: "internal_server_error",
@@ -71,6 +72,7 @@ def register_exception_handlers(app: FastAPI) -> None:
                 request_id=request_id,
                 details=exc.details,
             ),
+            headers=exc.headers or None,
         )
 
     @app.exception_handler(RequestValidationError)

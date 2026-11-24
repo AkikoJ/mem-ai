@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 from contextvars import ContextVar, Token
 from datetime import UTC, datetime
@@ -40,9 +41,39 @@ _SENSITIVE_KEY_MARKERS = (
     "memory_value",
     "memory_content",
     "user_content",
+    "assistant_content",
     "recall_query",
+    "private_key",
+    "signing_key",
+    "gateway_auth",
 )
-_SENSITIVE_EXACT_KEYS = frozenset({"content"})
+_SENSITIVE_EXACT_KEYS = frozenset(
+    {
+        "content",
+        "user_message",
+        "assistant_message",
+        "reply",
+        "delta",
+        "text",
+        "body",
+        "raw_body",
+    }
+)
+_SAFE_EXACT_KEYS = frozenset(
+    {
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "max_output_tokens",
+        "max_context_tokens",
+        "user_message_id",
+        "assistant_message_id",
+    }
+)
+_INLINE_SECRET_PATTERN = re.compile(
+    r"\b(Bearer|DeletionReceipt)\s+([A-Za-z0-9._~+/=-]{4,})\b",
+    re.IGNORECASE,
+)
 
 REDACTED_VALUE = "[REDACTED]"
 
@@ -78,15 +109,24 @@ def clear_log_context() -> None:
 
 def _is_sensitive_key(key: str) -> bool:
     lowered = key.lower()
+    if lowered in _SAFE_EXACT_KEYS:
+        return False
     if lowered in _SENSITIVE_EXACT_KEYS:
         return True
     return any(marker in lowered for marker in _SENSITIVE_KEY_MARKERS)
 
 
+def redact_inline_secrets(text: str) -> str:
+    """Redact inline `Bearer <token>` and `DeletionReceipt <receipt>` values from strings."""
+    return _INLINE_SECRET_PATTERN.sub(lambda m: f"{m.group(1)} {REDACTED_VALUE}", text)
+
+
 def sanitize_log_value(key: str | None, value: Any) -> Any:
-    """Recursively redact sensitive keys in structured log payloads."""
+    """Recursively redact sensitive keys and inline credentials in structured log payloads."""
     if key is not None and _is_sensitive_key(key):
         return REDACTED_VALUE
+    if isinstance(value, str):
+        return redact_inline_secrets(value)
     if isinstance(value, dict):
         return {str(k): sanitize_log_value(str(k), v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -102,7 +142,7 @@ class JsonLogFormatter(logging.Formatter):
             "timestamp": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": redact_inline_secrets(record.getMessage()),
         }
 
         for field_name, var in _CONTEXT_VARS.items():

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
@@ -18,6 +19,7 @@ class AppError(Exception):
         code: str,
         message: str,
         details: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         if not _ERROR_CODE_PATTERN.fullmatch(code):
             raise ValueError(f"Error code must be lowercase snake_case, got: {code!r}")
@@ -26,6 +28,7 @@ class AppError(Exception):
         self.code = code
         self.message = message
         self.details: dict[str, Any] = dict(details) if details is not None else {}
+        self.headers: dict[str, str] = dict(headers) if headers is not None else {}
 
 
 class UnauthorizedError(AppError):
@@ -93,6 +96,23 @@ class UnprocessableEntityError(AppError):
         super().__init__(status_code=422, code=code, message=message, details=details)
 
 
+class PayloadTooLargeError(AppError):
+    """413 HTTP request payload exceeds configured byte budget."""
+
+    def __init__(
+        self,
+        *,
+        code: str = "payload_too_large",
+        message: str = "request body exceeds maximum allowed size",
+        max_bytes: int | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        merged_details = dict(details) if details is not None else {}
+        if max_bytes is not None:
+            merged_details.setdefault("max_request_body_bytes", max_bytes)
+        super().__init__(status_code=413, code=code, message=message, details=merged_details)
+
+
 class RateLimitError(AppError):
     """429 rate or resource budget exceeded."""
 
@@ -101,9 +121,23 @@ class RateLimitError(AppError):
         *,
         code: str = "rate_limit_exceeded",
         message: str = "rate limit exceeded",
+        retry_after_seconds: int | float | None = None,
         details: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
-        super().__init__(status_code=429, code=code, message=message, details=details)
+        merged_details = dict(details) if details is not None else {}
+        merged_headers = dict(headers) if headers is not None else {}
+        if retry_after_seconds is not None:
+            retry_after_int = max(1, math.ceil(float(retry_after_seconds)))
+            merged_details.setdefault("retry_after_seconds", retry_after_int)
+            merged_headers.setdefault("Retry-After", str(retry_after_int))
+        super().__init__(
+            status_code=429,
+            code=code,
+            message=message,
+            details=merged_details,
+            headers=merged_headers,
+        )
 
 
 class BadGatewayError(AppError):

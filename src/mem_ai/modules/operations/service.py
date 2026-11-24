@@ -431,3 +431,12 @@ async def purge_expired_operation_summaries_batch_in_session(
         next_cursor=next_cursor,
         has_more=has_more,
     )
+
+
+async def get_oldest_operation_created_at_in_session(
+    session: AsyncSession,
+    *,
+    operation_ids: Sequence[UUID],
+) -> datetime | None:
+    """Return earliest `operations.created_at` for active barrier/operation age metrics."""
+    return await repository.get_oldest_operation_created_at(session, operation_ids=operation_ids)

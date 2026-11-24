@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 from uuid import UUID
@@ -21,7 +21,7 @@ from uuid import UUID
 import anyio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.responses import StreamingResponse
-from starlette.types import Send
+from starlette.types import Receive, Scope, Send
 
 from mem_ai.contracts.memory_provider import MemoryProvider
 from mem_ai.contracts.model_provider import ModelProvider, ModelUsage
@@ -171,7 +171,31 @@ def format_sse_heartbeat() -> str:
 
 
 class SseStreamingResponse(StreamingResponse):
-    """StreamingResponse ensuring shielded async-generator closure on client disconnect."""
+    """StreamingResponse ensuring shielded generator closure and guaranteed permit release."""
+
+    def __init__(
+        self,
+        content: AsyncIterator[str],
+        *,
+        on_finished: Callable[[], None] | None = None,
+        status_code: int = 200,
+        headers: Mapping[str, str] | None = None,
+        media_type: str | None = None,
+    ) -> None:
+        super().__init__(
+            content,
+            status_code=status_code,
+            headers=headers,
+            media_type=media_type,
+        )
+        self._on_finished = on_finished
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            if self._on_finished is not None:
+                self._on_finished()
 
     async def stream_response(self, send: Send) -> None:
         try:
@@ -181,6 +205,8 @@ class SseStreamingResponse(StreamingResponse):
             if callable(aclose):
                 with anyio.CancelScope(shield=True):
                     await aclose()
+            if self._on_finished is not None:
+                self._on_finished()
 
 
 async def stream_prepared_generation(
@@ -190,6 +216,7 @@ async def stream_prepared_generation(
     prepared: PreparedGeneration,
     memory_provider: MemoryProvider | None = None,
     options: ChatOptions | None = None,
+    on_finished: Callable[[], None] | None = None,
 ) -> AsyncIterator[str]:
     """Stream SSE frames for an already-prepared generation via `conversations.service`."""
     resolved_options = options if options is not None else ChatOptions()
@@ -279,21 +306,25 @@ async def stream_prepared_generation(
                 )
                 break
     finally:
-        with anyio.CancelScope(shield=True):
-            if producer_task is not None and not producer_task.done():
-                producer_task.cancel()
-                with contextlib.suppress(TimeoutError, asyncio.CancelledError, Exception):
-                    async with asyncio.timeout(_PRODUCER_CANCEL_GRACE_SECONDS):
-                        await producer_task
-            if terminal_state == "running":
-                terminal_state = "cancelled"
-                with contextlib.suppress(TimeoutError):
-                    async with asyncio.timeout(_CANCEL_CONVERGENCE_TIMEOUT_SECONDS):
-                        await conversations_service.cancel_stream_generation(
-                            session_factory,
-                            prepared=prepared,
-                            options=resolved_options,
-                        )
+        try:
+            with anyio.CancelScope(shield=True):
+                if producer_task is not None and not producer_task.done():
+                    producer_task.cancel()
+                    with contextlib.suppress(TimeoutError, asyncio.CancelledError, Exception):
+                        async with asyncio.timeout(_PRODUCER_CANCEL_GRACE_SECONDS):
+                            await producer_task
+                if terminal_state == "running":
+                    terminal_state = "cancelled"
+                    with contextlib.suppress(TimeoutError):
+                        async with asyncio.timeout(_CANCEL_CONVERGENCE_TIMEOUT_SECONDS):
+                            await conversations_service.cancel_stream_generation(
+                                session_factory,
+                                prepared=prepared,
+                                options=resolved_options,
+                            )
+        finally:
+            if on_finished is not None:
+                on_finished()
 
 
 def build_chat_sse_response(
@@ -303,6 +334,7 @@ def build_chat_sse_response(
     prepared: PreparedGeneration,
     memory_provider: MemoryProvider | None = None,
     options: ChatOptions | None = None,
+    on_finished: Callable[[], None] | None = None,
 ) -> SseStreamingResponse:
     """Create the `text/event-stream` response wired with proxy headers and shielded cleanup."""
     return SseStreamingResponse(
@@ -312,7 +344,9 @@ def build_chat_sse_response(
             prepared=prepared,
             memory_provider=memory_provider,
             options=options,
+            on_finished=on_finished,
         ),
+        on_finished=on_finished,
         status_code=200,
         media_type=SSE_MEDIA_TYPE,
         headers=SSE_RESPONSE_HEADERS,

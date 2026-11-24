@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 from uuid import UUID
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mem_ai.contracts.memory_provider import MemoryDeleteResult
 from mem_ai.core.exceptions import (
@@ -18,6 +19,7 @@ from mem_ai.core.exceptions import (
     NotFoundError,
     ServiceUnavailableError,
 )
+from mem_ai.core.telemetry import current_telemetry
 from mem_ai.modules.jobs import service as jobs_service
 from mem_ai.modules.jobs.schemas import JobRecord
 from mem_ai.modules.memories import repository
@@ -585,7 +587,7 @@ async def finalize_clear_barrier_in_session(
     if unsettled_audit_job_ids:
         result_summary["unsettled_write_job_ids"] = [str(jid) for jid in unsettled_audit_job_ids]
 
-    return await operations_service.transition_operation_in_session(
+    completed_op = await operations_service.transition_operation_in_session(
         session,
         operation_id=operation_id,
         status="succeeded",
@@ -601,6 +603,43 @@ async def finalize_clear_barrier_in_session(
         result_summary=result_summary,
         now=current_time,
     )
+    if completed_op is not None:
+        duration_seconds = max(0.0, (current_time - completed_op.created_at).total_seconds())
+        current_telemetry().record_memory_barrier_duration(
+            provider=provider_id,
+            outcome="succeeded",
+            duration_seconds=duration_seconds,
+        )
+    return completed_op
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryBarrierObservabilitySnapshot:
+    """Point-in-time aggregate counts and oldest start time for active memory barriers."""
+
+    clearing_count: int
+    reconciling_count: int
+    oldest_active_since: datetime | None
+
+
+async def get_memory_barrier_observability(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> MemoryBarrierObservabilitySnapshot:
+    """Read active barrier counts and oldest barrier start time in a short read session."""
+    async with session_factory() as session:
+        counts, oldest_updated, op_ids = await repository.get_active_barrier_aggregates(session)
+        oldest_created = (
+            await operations_service.get_oldest_operation_created_at_in_session(
+                session, operation_ids=op_ids
+            )
+            if op_ids
+            else None
+        )
+        return MemoryBarrierObservabilitySnapshot(
+            clearing_count=counts.get("clearing", 0),
+            reconciling_count=counts.get("reconciling", 0),
+            oldest_active_since=oldest_created if oldest_created is not None else oldest_updated,
+        )
 
 
 async def find_protected_operation_ids_in_session(

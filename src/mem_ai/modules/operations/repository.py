@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, delete, exists, or_, select, tuple_, update
+from sqlalchemy import and_, delete, exists, func, or_, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from mem_ai.db.base import normalize_utc
@@ -439,3 +439,20 @@ async def delete_operations_by_ids(session: AsyncSession, *, operation_ids: Sequ
         delete(Operation).where(Operation.id.in_(unique_ids)).returning(Operation.id)
     )
     return len(result.all())
+
+
+async def get_oldest_operation_created_at(
+    session: AsyncSession,
+    *,
+    operation_ids: Sequence[UUID],
+) -> datetime | None:
+    """Return the earliest `created_at` among `operation_ids` for accurate barrier age."""
+    unique_ids = tuple(set(operation_ids))
+    if not unique_ids:
+        return None
+    oldest = (
+        await session.execute(
+            select(func.min(Operation.created_at)).where(Operation.id.in_(unique_ids))
+        )
+    ).scalar_one_or_none()
+    return normalize_utc(oldest) if oldest is not None else None

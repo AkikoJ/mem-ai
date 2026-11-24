@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import delete, exists, select, tuple_, union, update
+from sqlalchemy import delete, exists, func, select, tuple_, union, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -529,3 +529,27 @@ async def find_protected_operation_ids(
         if op_id is not None:
             protected.add(op_id)
     return frozenset(protected)
+
+
+async def get_active_barrier_aggregates(
+    session: AsyncSession,
+) -> tuple[dict[str, int], datetime | None, tuple[UUID, ...]]:
+    """Return active barrier counts, oldest updated timestamp, and active barrier operation IDs."""
+    count_stmt = (
+        select(MemoryScopeState.barrier_state, func.count(MemoryScopeState.id))
+        .where(MemoryScopeState.barrier_state != "idle")
+        .group_by(MemoryScopeState.barrier_state)
+    )
+    oldest_stmt = select(func.min(MemoryScopeState.updated_at)).where(
+        MemoryScopeState.barrier_state != "idle"
+    )
+    op_ids_stmt = select(MemoryScopeState.barrier_operation_id).where(
+        MemoryScopeState.barrier_state != "idle",
+        MemoryScopeState.barrier_operation_id.is_not(None),
+    )
+    counts = {str(state): int(total) for state, total in (await session.execute(count_stmt)).all()}
+    oldest = (await session.execute(oldest_stmt)).scalar_one_or_none()
+    op_ids = tuple(
+        op_id for op_id in (await session.scalars(op_ids_stmt)).all() if op_id is not None
+    )
+    return counts, normalize_utc(oldest) if oldest is not None else None, op_ids

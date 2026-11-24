@@ -58,6 +58,7 @@ def test_production_accepts_hardened_configuration() -> None:
         app_env="production",
         postgres_host="postgres",
         postgres_password="strong-prod-password-123",
+        allowed_hosts=["api.example.com"],
         cors_allowed_origins=["https://app.example.com"],
         auth_mode="jwt_hs256",
         auth_jwt_hs256_secret="super-secret-jwt-signing-key-at-least-32-chars",
@@ -113,6 +114,7 @@ def test_jwt_hs256_mode_requires_secret_issuer_and_audience() -> None:
             _env_file=None,
             app_env="production",
             postgres_password="strong-prod-password-123",
+            allowed_hosts=["api.example.com"],
             auth_mode="jwt_hs256",
             auth_jwt_hs256_secret="too-short",
             auth_trusted_issuers=["https://idp.example.com"],
@@ -165,6 +167,7 @@ def test_trusted_gateway_mode_requires_explicit_proxies_issuers_and_secret() -> 
         _env_file=None,
         app_env="production",
         postgres_password="strong-prod-password-123",
+        allowed_hosts=["api.example.com"],
         auth_mode="trusted_gateway",
         auth_trusted_proxies=["10.0.0.0/8", "127.0.0.1"],
         auth_trusted_issuers=["https://gateway.example.com"],
@@ -503,3 +506,87 @@ def test_data_retention_policy_settings_defaults_and_bounds() -> None:
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None, app_env="test", retention_max_batches_per_run=0)
+
+
+def test_resource_limits_observability_and_proxy_heartbeat_coordination_settings() -> None:
+    defaults = Settings(_env_file=None, app_env="test")
+    assert defaults.allowed_hosts == []
+    assert defaults.max_request_body_bytes == 1_048_576
+    assert defaults.max_concurrent_requests == 100
+    assert defaults.max_concurrent_generations == 20
+    assert defaults.rate_limit_retry_after_seconds == 5
+    assert defaults.chat_message_max_chars == 32000
+    assert defaults.proxy_read_timeout_seconds == 60.0
+    assert defaults.metrics_enabled is True
+    assert defaults.metrics_allowed_networks == ["127.0.0.1/32", "::1/128"]
+    assert defaults.metrics_bearer_token is None
+    assert defaults.worker_heartbeat_interval_seconds == 30.0
+    assert defaults.worker_heartbeat_file is None
+    assert defaults.effective_trust_request_id_from_proxies_only() is False
+
+    # Heartbeat must be strictly shorter than proxy idle read timeout.
+    with pytest.raises(ValidationError, match="proxy_read_timeout_seconds"):
+        Settings(
+            _env_file=None,
+            app_env="test",
+            chat_stream_heartbeat_interval_seconds=30.0,
+            proxy_read_timeout_seconds=30.0,
+        )
+
+    # Invalid CIDR in metrics_allowed_networks rejected.
+    with pytest.raises(ValidationError, match="metrics_allowed_networks"):
+        Settings(
+            _env_file=None,
+            app_env="test",
+            metrics_allowed_networks=["not-a-cidr"],
+        )
+
+    # Production requires explicit non-wildcard allowed_hosts and non-wildcard metrics networks.
+    with pytest.raises(ValidationError, match="allowed_hosts"):
+        Settings(
+            _env_file=None,
+            app_env="production",
+            postgres_password="strong-prod-password-123",
+            auth_mode="jwt_hs256",
+            auth_jwt_hs256_secret="super-secret-jwt-signing-key-at-least-32-chars",
+            auth_trusted_issuers=["https://idp.example.com"],
+            auth_trusted_audience="mem-ai-api",
+        )
+
+    with pytest.raises(ValidationError, match="allowed_hosts"):
+        Settings(
+            _env_file=None,
+            app_env="production",
+            postgres_password="strong-prod-password-123",
+            allowed_hosts=["*"],
+            auth_mode="jwt_hs256",
+            auth_jwt_hs256_secret="super-secret-jwt-signing-key-at-least-32-chars",
+            auth_trusted_issuers=["https://idp.example.com"],
+            auth_trusted_audience="mem-ai-api",
+        )
+
+    with pytest.raises(ValidationError, match="metrics_allowed_networks"):
+        Settings(
+            _env_file=None,
+            app_env="production",
+            postgres_password="strong-prod-password-123",
+            allowed_hosts=["api.example.com"],
+            metrics_allowed_networks=["0.0.0.0/0"],
+            auth_mode="jwt_hs256",
+            auth_jwt_hs256_secret="super-secret-jwt-signing-key-at-least-32-chars",
+            auth_trusted_issuers=["https://idp.example.com"],
+            auth_trusted_audience="mem-ai-api",
+        )
+
+    prod = Settings(
+        _env_file=None,
+        app_env="production",
+        postgres_password="strong-prod-password-123",
+        allowed_hosts=["api.example.com", "*.internal.example.com"],
+        cors_allowed_origins=["https://app.example.com"],
+        auth_mode="jwt_hs256",
+        auth_jwt_hs256_secret="super-secret-jwt-signing-key-at-least-32-chars",
+        auth_trusted_issuers=["https://idp.example.com"],
+        auth_trusted_audience="mem-ai-api",
+    )
+    assert prod.effective_trust_request_id_from_proxies_only() is True

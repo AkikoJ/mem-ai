@@ -3,16 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import signal
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
 from datetime import datetime
 
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from mem_ai.api.middleware import RequestContextMiddleware
+from mem_ai.api.responses import ApiResponse, ok_response
 from mem_ai.contracts.memory_provider import MemoryProvider
 from mem_ai.core.config import Settings
+from mem_ai.core.exception_handlers import register_exception_handlers
 from mem_ai.core.logging import configure_logging
+from mem_ai.core.telemetry import TelemetryRegistry, Tracer
 from mem_ai.db.engine import create_async_engine_from_settings, create_session_factory
 from mem_ai.integrations.http import create_http_client
 from mem_ai.modules.conversations import generation as conversations_generation
@@ -25,6 +33,11 @@ from mem_ai.modules.conversations.queries import (
     DatabaseTurnContentLoader,
 )
 from mem_ai.modules.conversations.schemas import DEFAULT_IDEMPOTENCY_RETENTION_SECONDS
+from mem_ai.modules.health.service import (
+    ReadinessStatus,
+    build_metrics_response,
+    check_readiness,
+)
 from mem_ai.modules.jobs.schemas import JobExecutionContext, JobHandlerOutcome
 from mem_ai.modules.memories.adapters.memos import MemOSMemoryProvider
 from mem_ai.modules.memories.jobs import (
@@ -51,6 +64,7 @@ from mem_ai.workers.runner import (
     JobHandlerRegistry,
     PeriodicJobSpec,
     WorkerConfig,
+    WorkerHealthSnapshot,
     WorkerRunner,
     worker_config_from_settings,
 )
@@ -195,6 +209,71 @@ def default_periodic_jobs(settings: Settings) -> tuple[PeriodicJobSpec, ...]:
     )
 
 
+class _WorkerProbeServer(uvicorn.Server):
+    """Uvicorn server whose shutdown is coordinated by `run_worker` rather than OS signals."""
+
+    @contextlib.contextmanager
+    def capture_signals(self) -> Generator[None]:
+        yield
+
+
+def build_worker_probe_app(
+    *,
+    runner: WorkerRunner,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+) -> FastAPI:
+    """Build standalone operational probe & controlled `/metrics` ASGI app for the Worker."""
+    probe_app = FastAPI(
+        title=f"{settings.app_name}-worker",
+        version=settings.app_version,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    probe_app.state.settings = settings
+    probe_app.state.telemetry = runner.telemetry
+    probe_app.add_middleware(
+        RequestContextMiddleware,
+        request_id_header=settings.trusted_request_id_header,
+        trust_from_proxies_only=settings.effective_trust_request_id_from_proxies_only(),
+        trusted_proxies=settings.trusted_proxy_networks(),
+    )
+    register_exception_handlers(probe_app)
+
+    async def worker_live() -> ApiResponse[WorkerHealthSnapshot]:
+        return ok_response(runner.health_snapshot())
+
+    async def worker_ready() -> ApiResponse[ReadinessStatus]:
+        snap = runner.health_snapshot()
+        return ok_response(
+            await check_readiness(session_factory, settings, app_ready=not snap.shutting_down)
+        )
+
+    async def worker_metrics(request: Request) -> PlainTextResponse:
+        return await build_metrics_response(
+            request,
+            session_factory=session_factory,
+            settings=settings,
+            telemetry=runner.telemetry,
+        )
+
+    probe_app.add_api_route(
+        "/health/live",
+        worker_live,
+        methods=["GET"],
+        response_model=ApiResponse[WorkerHealthSnapshot],
+    )
+    probe_app.add_api_route(
+        "/health/ready",
+        worker_ready,
+        methods=["GET"],
+        response_model=ApiResponse[ReadinessStatus],
+    )
+    probe_app.add_api_route("/metrics", worker_metrics, methods=["GET"])
+    return probe_app
+
+
 async def run_worker(
     settings: Settings | None = None,
     *,
@@ -202,6 +281,8 @@ async def run_worker(
     stop_event: asyncio.Event | None = None,
     config_override: WorkerConfig | None = None,
     periodic_jobs: Sequence[PeriodicJobSpec] | None = None,
+    telemetry: TelemetryRegistry | None = None,
+    tracer: Tracer | None = None,
 ) -> None:
     """Initialize standalone Worker resources, run until shutdown signal, and clean up."""
     resolved_settings = settings if settings is not None else Settings()
@@ -255,7 +336,27 @@ async def run_worker(
         registry=registry,
         config=worker_config,
         periodic_jobs=resolved_periodic,
+        telemetry=telemetry,
+        tracer=tracer,
     )
+
+    probe_server: uvicorn.Server | None = None
+    probe_task: asyncio.Task[None] | None = None
+    if resolved_settings.worker_metrics_port is not None:
+        probe_app = build_worker_probe_app(
+            runner=runner,
+            session_factory=session_factory,
+            settings=resolved_settings,
+        )
+        uv_config = uvicorn.Config(
+            probe_app,
+            host=resolved_settings.worker_metrics_host,
+            port=resolved_settings.worker_metrics_port,
+            log_config=None,
+            access_log=False,
+        )
+        probe_server = _WorkerProbeServer(uv_config)
+        probe_task = asyncio.create_task(probe_server.serve())
 
     effective_stop = stop_event if stop_event is not None else asyncio.Event()
     installed_signals: list[signal.Signals] = []
@@ -271,6 +372,11 @@ async def run_worker(
     try:
         await runner.run_forever(stop_event=effective_stop)
     finally:
+        if probe_server is not None:
+            probe_server.should_exit = True
+        if probe_task is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(probe_task, timeout=5.0)
         if installed_signals:
             loop = asyncio.get_running_loop()
             for sig in installed_signals:

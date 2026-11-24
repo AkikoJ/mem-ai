@@ -376,6 +376,7 @@ async def test_credential_verifier_dependency_override_and_production_guard(
         _env_file=None,
         app_env="production",
         postgres_password="strong-prod-password-123",
+        allowed_hosts=["api.example.com"],
         auth_mode="jwt_hs256",
         auth_jwt_hs256_secret="super-secret-jwt-signing-key-at-least-32-chars",
         auth_trusted_issuers=["https://idp.example.com"],

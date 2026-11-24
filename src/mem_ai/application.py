@@ -17,7 +17,15 @@ from mem_ai.api.middleware import register_middleware
 from mem_ai.api.router import build_api_router
 from mem_ai.core.config import Settings
 from mem_ai.core.exception_handlers import register_exception_handlers
+from mem_ai.core.limits import ConcurrencyLimiter, NoopRateLimiter, RateLimiter
 from mem_ai.core.logging import configure_logging
+from mem_ai.core.telemetry import (
+    NoopTracer,
+    TelemetryRegistry,
+    Tracer,
+    bind_telemetry,
+    reset_telemetry,
+)
 from mem_ai.db.engine import create_async_engine_from_settings, create_session_factory
 from mem_ai.integrations.http import create_http_client
 from mem_ai.modules.auth.adapters import (
@@ -80,6 +88,9 @@ def create_app(
     *,
     providers: ProviderRegistry | None = None,
     credential_verifier: CredentialVerifier | None = None,
+    rate_limiter: RateLimiter | None = None,
+    telemetry: TelemetryRegistry | None = None,
+    tracer: Tracer | None = None,
 ) -> FastAPI:
     """Construct and configure the Mem-AI FastAPI application."""
     resolved_settings = settings if settings is not None else Settings()
@@ -93,10 +104,18 @@ def create_app(
     ):
         raise ValueError("development or test authentication adapter is forbidden in production")
 
+    resolved_telemetry = telemetry if telemetry is not None else TelemetryRegistry()
+    resolved_tracer: Tracer = tracer if tracer is not None else NoopTracer()
+    resolved_rate_limiter: RateLimiter = (
+        rate_limiter if rate_limiter is not None else NoopRateLimiter()
+    )
+
     configure_logging(resolved_settings.app_log_level)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        tel_tokens = bind_telemetry(telemetry=resolved_telemetry, tracer=resolved_tracer)
+        app.state.ready = False
         db_engine = create_async_engine_from_settings(resolved_settings)
         session_factory = create_session_factory(db_engine)
         http_client = create_http_client(resolved_settings)
@@ -166,15 +185,18 @@ def create_app(
             memory_provider=resolved_memory_provider,
             persona_provider=resolved_persona_provider,
         )
+        app.state.ready = True
 
         try:
             yield
         finally:
+            app.state.ready = False
             await sync_task_registry.drain(
                 timeout_seconds=min(resolved_settings.chat_generation_timeout_seconds, 10.0)
             )
             await http_client.aclose()
             await db_engine.dispose()
+            reset_telemetry(tel_tokens)
 
     docs_enabled = resolved_settings.app_env != "production"
     app = FastAPI(
@@ -188,6 +210,18 @@ def create_app(
     app.state.settings = resolved_settings
     app.state.providers = providers if providers is not None else ProviderRegistry()
     app.state.credential_verifier = resolved_verifier
+    app.state.telemetry = resolved_telemetry
+    app.state.tracer = resolved_tracer
+    app.state.rate_limiter = resolved_rate_limiter
+    app.state.request_concurrency_limiter = ConcurrencyLimiter(
+        max_in_flight=resolved_settings.max_concurrent_requests,
+        name="http_requests",
+    )
+    app.state.generation_concurrency_limiter = ConcurrencyLimiter(
+        max_in_flight=resolved_settings.max_concurrent_generations,
+        name="generations",
+    )
+    app.state.ready = False
 
     register_middleware(app, resolved_settings)
     register_exception_handlers(app)

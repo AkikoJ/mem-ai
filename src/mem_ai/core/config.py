@@ -181,6 +181,7 @@ class Settings(BaseSettings):
     db_statement_timeout_ms: int = Field(default=10000, ge=100)
     db_health_check_timeout_seconds: float = Field(default=2.0, gt=0.0)
     expected_alembic_revision: str | None = None
+    compatible_alembic_revisions: list[str] = Field(default_factory=list)
 
     # Outbound HTTP client
     http_connect_timeout_seconds: float = Field(default=5.0, gt=0.0)
@@ -190,9 +191,21 @@ class Settings(BaseSettings):
     http_max_connections: int = Field(default=100, ge=1)
     http_max_keepalive_connections: int = Field(default=20, ge=0)
 
-    # Security / HTTP middleware
+    # Security / HTTP middleware & process resource budgets
     cors_allowed_origins: list[str] = Field(default_factory=list)
+    allowed_hosts: list[str] = Field(default_factory=list)
     trusted_request_id_header: str = Field(default="X-Request-Id", min_length=1)
+    trust_request_id_from_proxies_only: bool | None = None
+    max_request_body_bytes: int = Field(default=1_048_576, ge=1024, le=100_000_000)
+    max_concurrent_requests: int = Field(default=100, ge=1, le=10000)
+    max_concurrent_generations: int = Field(default=20, ge=1, le=1000)
+    rate_limit_retry_after_seconds: int = Field(default=5, ge=1, le=3600)
+    proxy_read_timeout_seconds: float = Field(default=60.0, gt=0.0, le=3600.0)
+
+    # Observability & controlled metrics endpoint
+    metrics_enabled: bool = True
+    metrics_allowed_networks: list[str] = Field(default_factory=lambda: ["127.0.0.1/32", "::1/128"])
+    metrics_bearer_token: SecretStr | None = None
 
     # Authentication
     auth_mode: AuthMode = "development"
@@ -254,6 +267,7 @@ class Settings(BaseSettings):
     chat_memory_max_items: int = Field(default=10, ge=0, le=50)
     chat_memory_context_max_chars: int = Field(default=2000, ge=0, le=32000)
     chat_prompt_max_chars: int = Field(default=24000, ge=256, le=200000)
+    chat_message_max_chars: int = Field(default=32000, ge=1, le=200000)
 
     # Background worker and durable job budgets
     worker_concurrency: int = Field(default=4, ge=1, le=100)
@@ -267,6 +281,10 @@ class Settings(BaseSettings):
     worker_backoff_jitter_ratio: float = Field(default=0.2, ge=0.0, le=1.0)
     worker_reconcile_delay_seconds: float = Field(default=10.0, gt=0.0, le=3600.0)
     worker_shutdown_grace_seconds: float = Field(default=15.0, gt=0.0, le=300.0)
+    worker_heartbeat_interval_seconds: float = Field(default=30.0, gt=0.0, le=300.0)
+    worker_heartbeat_file: str | None = None
+    worker_metrics_host: str = Field(default="127.0.0.1", min_length=1)
+    worker_metrics_port: int | None = Field(default=None, ge=1, le=65535)
     conversation_retention_policy: Literal["indefinite"] = "indefinite"
     job_attempt_retention_days: int = Field(default=30, ge=1, le=365)
     idempotency_retention_hours: int = Field(default=24, ge=1, le=720)
@@ -308,6 +326,37 @@ class Settings(BaseSettings):
                 )
             parsed_proxies.append(network)
 
+        # Validate CIDR / IP syntax for any configured metrics network allowlist entries.
+        parsed_metrics_nets: list[ProxyNetwork] = []
+        for raw_net in self.metrics_allowed_networks:
+            try:
+                net = ipaddress.ip_network(raw_net.strip(), strict=False)
+            except ValueError as exc:
+                raise ValueError(
+                    f"metrics_allowed_networks contains invalid IP/CIDR entry: {raw_net!r}"
+                ) from exc
+            if is_production and net.prefixlen == 0:
+                raise ValueError(
+                    f"metrics_allowed_networks must not contain wildcard CIDR {raw_net!r} "
+                    "in production"
+                )
+            parsed_metrics_nets.append(net)
+
+        if self.metrics_bearer_token is not None:
+            metrics_token = self.metrics_bearer_token.get_secret_value().strip()
+            if not metrics_token:
+                raise ValueError("metrics_bearer_token must not be blank when set")
+            if is_production and len(metrics_token) < _MIN_PRODUCTION_SECRET_LENGTH:
+                raise ValueError(
+                    f"metrics_bearer_token must be at least "
+                    f"{_MIN_PRODUCTION_SECRET_LENGTH} characters in production"
+                )
+
+        normalized_hosts = [host.strip().lower() for host in self.allowed_hosts]
+        for host in normalized_hosts:
+            if not host or any(ch.isspace() for ch in host) or "/" in host:
+                raise ValueError(f"allowed_hosts contains invalid host entry: {host!r}")
+
         trusted_issuers = [issuer.strip() for issuer in self.auth_trusted_issuers if issuer.strip()]
 
         if is_production:
@@ -319,6 +368,19 @@ class Settings(BaseSettings):
                 raise ValueError("cors_allowed_origins must not contain '*' in production")
             if self.auth_mode == "development":
                 raise ValueError("auth_mode='development' is forbidden in production")
+            if not normalized_hosts:
+                raise ValueError("allowed_hosts must not be empty in production")
+            if any(host == "*" for host in normalized_hosts):
+                raise ValueError("allowed_hosts must not contain '*' in production")
+            if (
+                self.metrics_enabled
+                and not parsed_metrics_nets
+                and self.metrics_bearer_token is None
+            ):
+                raise ValueError(
+                    "metrics_allowed_networks or metrics_bearer_token must be configured "
+                    "when metrics_enabled=True in production"
+                )
 
         if self.auth_mode == "jwt_hs256":
             _validate_required_secret(
@@ -379,6 +441,8 @@ class Settings(BaseSettings):
             and not self.deletion_audit_archive_path.strip()
         ):
             raise ValueError("deletion_audit_archive_path must not be blank when set")
+        if self.worker_heartbeat_file is not None and not self.worker_heartbeat_file.strip():
+            raise ValueError("worker_heartbeat_file must not be blank when set")
 
         if self.chat_lease_renew_interval_seconds >= self.chat_lease_ttl_seconds:
             raise ValueError(
@@ -390,6 +454,12 @@ class Settings(BaseSettings):
             raise ValueError(
                 "chat_stream_heartbeat_interval_seconds must be strictly less than "
                 "chat_stream_timeout_seconds"
+            )
+
+        if self.chat_stream_heartbeat_interval_seconds >= self.proxy_read_timeout_seconds:
+            raise ValueError(
+                "chat_stream_heartbeat_interval_seconds must be strictly less than "
+                "proxy_read_timeout_seconds"
             )
 
         if self.worker_lease_renew_interval_seconds >= self.worker_lease_ttl_seconds:
@@ -413,6 +483,19 @@ class Settings(BaseSettings):
         return tuple(
             ipaddress.ip_network(entry.strip(), strict=False) for entry in self.auth_trusted_proxies
         )
+
+    def metrics_allowed_proxy_networks(self) -> tuple[ProxyNetwork, ...]:
+        """Parse configured IP/CIDR allowlist guarding `/metrics` scraping."""
+        return tuple(
+            ipaddress.ip_network(entry.strip(), strict=False)
+            for entry in self.metrics_allowed_networks
+        )
+
+    def effective_trust_request_id_from_proxies_only(self) -> bool:
+        """Trust inbound `X-Request-Id` only from configured proxies in production by default."""
+        if self.trust_request_id_from_proxies_only is not None:
+            return self.trust_request_id_from_proxies_only
+        return self.app_env == "production"
 
     def deletion_receipt_signing_key(self) -> bytes:
         """Use an independent key when configured, otherwise the active stable server secret."""

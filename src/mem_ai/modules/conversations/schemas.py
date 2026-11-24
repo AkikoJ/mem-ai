@@ -28,8 +28,8 @@ def _strip_required_message(value: str) -> str:
     stripped = value.strip()
     if not stripped:
         raise ValueError("message must not be empty")
-    if len(stripped) > 32000:
-        raise ValueError("message exceeds maximum length of 32000")
+    if len(stripped) > 200000:
+        raise ValueError("message exceeds maximum length of 200000")
     return stripped
 
 

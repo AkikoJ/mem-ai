@@ -338,6 +338,7 @@ async def test_api_docs_are_disabled_in_production() -> None:
         _env_file=None,
         app_env="production",
         postgres_password="strong-prod-password-123",
+        allowed_hosts=["test"],
         auth_mode="jwt_hs256",
         auth_jwt_hs256_secret="super-secret-jwt-signing-key-at-least-32-chars",
         auth_trusted_issuers=["https://idp.example.com"],

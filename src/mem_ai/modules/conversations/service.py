@@ -15,7 +15,7 @@ Implements the public orchestration boundary of Engineering Design §5.4:
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, overload
@@ -29,9 +29,12 @@ from mem_ai.contracts.persona_provider import PersonaProvider
 from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import (
     NotFoundError,
+    RateLimitError,
     ServiceUnavailableError,
     UnprocessableEntityError,
 )
+from mem_ai.core.limits import ConcurrencyLimiter, ConcurrencyPermit
+from mem_ai.core.telemetry import current_telemetry
 from mem_ai.modules.conversations import execution as generation_execution
 from mem_ai.modules.conversations import generation as generation_store
 from mem_ai.modules.conversations import idempotency as idempotency_store
@@ -88,11 +91,14 @@ class ChatOptions:
     memory_max_items: int = 10
     memory_context_max_chars: int = 2000
     prompt_max_chars: int | None = 24000
+    max_message_chars: int = 32000
     memory_write_max_attempts: int = 5
     idempotency_retention_seconds: float = idempotency_store.DEFAULT_IDEMPOTENCY_RETENTION_SECONDS
     tombstone_lookup: TombstoneLookup | None = None
     task_registry: SyncGenerationTaskRegistry | None = None
     before_commit_hook: BeforeCommitHook | None = None
+    generation_limiter: ConcurrencyLimiter | None = None
+    rate_limit_retry_after_seconds: int = 5
 
 
 def chat_options_from_settings(
@@ -101,6 +107,7 @@ def chat_options_from_settings(
     user_permissions: frozenset[str] = frozenset(),
     require_streaming: bool = False,
     task_registry: SyncGenerationTaskRegistry | None = None,
+    generation_limiter: ConcurrencyLimiter | None = None,
 ) -> ChatOptions:
     """Construct `ChatOptions` with the shared server `ModelRoutingPolicy` and budgets."""
     return ChatOptions(
@@ -118,10 +125,43 @@ def chat_options_from_settings(
         memory_max_items=settings.chat_memory_max_items,
         memory_context_max_chars=settings.chat_memory_context_max_chars,
         prompt_max_chars=settings.chat_prompt_max_chars,
+        max_message_chars=settings.chat_message_max_chars,
         memory_write_max_attempts=settings.worker_max_attempts,
         idempotency_retention_seconds=float(settings.idempotency_retention_hours * 3600),
         task_registry=task_registry,
+        generation_limiter=generation_limiter,
+        rate_limit_retry_after_seconds=settings.rate_limit_retry_after_seconds,
     )
+
+
+def _validate_message_length(user_message: str, max_chars: int) -> None:
+    if len(user_message) > max_chars:
+        raise UnprocessableEntityError(
+            code="validation_error",
+            message=f"message exceeds maximum length of {max_chars}",
+            details={"max_message_chars": max_chars},
+        )
+
+
+def _acquire_generation_permit(resolved: ChatOptions) -> ConcurrencyPermit | None:
+    if resolved.generation_limiter is None:
+        return None
+    permit = resolved.generation_limiter.try_acquire()
+    if permit is None:
+        current_telemetry().record_rate_limit_rejection(
+            scope="generations",
+            reason="generation_concurrency_limit_exceeded",
+        )
+        raise RateLimitError(
+            code="generation_concurrency_limit_exceeded",
+            message="server generation concurrency budget exceeded",
+            retry_after_seconds=resolved.rate_limit_retry_after_seconds,
+            details={
+                "limit_scope": "generations",
+                "max_in_flight": resolved.generation_limiter.max_in_flight,
+            },
+        )
+    return permit
 
 
 async def prepare_generation(
@@ -140,6 +180,7 @@ async def prepare_generation(
 ) -> PreparedGeneration:
     """Resolve persona outside DB write tx, validate model, and commit Tx 1 preparation."""
     resolved = options if options is not None else ChatOptions()
+    _validate_message_length(user_message, resolved.max_message_chars)
     await users_service.get_active_user(session_factory, user_id=owner_id)
 
     if conversation_id is None:
@@ -346,6 +387,8 @@ async def complete_prepared_sync_generation(
         before_commit_hook=effective.before_commit_hook,
         prepare_context_fn=_prepare,
         run_model=_run_sync,
+        overall_deadline_seconds=effective.timeout_seconds,
+        mode="sync",
     )
     if error is not None:
         raise error
@@ -402,6 +445,7 @@ async def complete_prepared_stream_generation(
         prepare_context_fn=_prepare,
         run_model=_run_stream,
         overall_deadline_seconds=effective_timeout,
+        mode="stream",
     )
     if committed is not None:
         return committed
@@ -417,7 +461,7 @@ async def cancel_stream_generation(
 ) -> GenerationRecord | None:
     """Converge a disconnected streaming generation to `cancelled` unless already terminal."""
     resolved = options if options is not None else ChatOptions()
-    return await generation_store.converge_generation_failure_safely(
+    converged = await generation_store.converge_generation_failure_safely(
         session_factory,
         prepared=prepared,
         target_status="cancelled",
@@ -426,6 +470,13 @@ async def cancel_stream_generation(
         error_status_code=409,
         idempotency_retention_seconds=resolved.idempotency_retention_seconds,
     )
+    if converged is not None and converged.status == "cancelled":
+        current_telemetry().record_generation_outcome(
+            mode="stream",
+            outcome="cancelled",
+            error_code="generation_cancelled",
+        )
+    return converged
 
 
 async def execute_prepared_sync_chat(
@@ -435,16 +486,25 @@ async def execute_prepared_sync_chat(
     prepared: PreparedGeneration,
     memory_provider: MemoryProvider | None = None,
     options: ChatOptions | None = None,
+    on_finished: Callable[[], None] | None = None,
 ) -> CommittedChatResult:
     """Execute an already-prepared sync generation shielded from client HTTP disconnects."""
     resolved = options if options is not None else ChatOptions()
-    coro = complete_prepared_sync_generation(
-        session_factory,
-        model_provider=model_provider,
-        memory_provider=memory_provider,
-        prepared=prepared,
-        options=resolved,
-    )
+
+    async def _run() -> CommittedChatResult:
+        try:
+            return await complete_prepared_sync_generation(
+                session_factory,
+                model_provider=model_provider,
+                memory_provider=memory_provider,
+                prepared=prepared,
+                options=resolved,
+            )
+        finally:
+            if on_finished is not None:
+                on_finished()
+
+    coro = _run()
     if resolved.task_registry is not None:
         task = resolved.task_registry.spawn(coro)
     else:
@@ -468,9 +528,11 @@ async def prepare_chat_turn(
     memory_provider: MemoryProvider | None = None,
     options: ChatOptions | None = None,
     now: datetime | None = None,
+    on_generation_permit: Callable[[ConcurrencyPermit], None] | None = None,
 ) -> PreparedGeneration | ChatTurnOutcome:
     """Shared idempotent chat preparation entry point for both sync and SSE execution."""
     resolved = options if options is not None else ChatOptions()
+    _validate_message_length(user_message, resolved.max_message_chars)
     spec = idempotency_store.build_chat_idempotency_spec(
         raw_key=idempotency_key,
         agent_id=agent_id,
@@ -497,35 +559,47 @@ async def prepare_chat_turn(
             code="streaming_not_enabled",
             message="streaming responses are not enabled on this endpoint yet",
         )
+
+    permit = _acquire_generation_permit(resolved)
+
     effective = (
         replace(resolved, require_streaming=True)
         if stream and not resolved.require_streaming
         else resolved
     )
-    for _ in range(2):
-        try:
-            return await prepare_generation(
-                session_factory,
-                persona_provider=persona_provider,
-                memory_provider=memory_provider,
-                owner_id=owner_id,
-                agent_id=agent_id,
-                conversation_id=conversation_id,
-                user_message=user_message,
-                requested_model_id=requested_model_id,
-                options=effective,
-                idempotency_spec=spec,
-                now=now,
-            )
-        except (IdempotencyRecordHitError, IdempotencyScopeRaceError):
-            replay_after_race = await _resolve_replay()
-            if replay_after_race is not None:
-                return replay_after_race
+    permit_transferred = False
+    try:
+        for _ in range(2):
+            try:
+                prepared = await prepare_generation(
+                    session_factory,
+                    persona_provider=persona_provider,
+                    memory_provider=memory_provider,
+                    owner_id=owner_id,
+                    agent_id=agent_id,
+                    conversation_id=conversation_id,
+                    user_message=user_message,
+                    requested_model_id=requested_model_id,
+                    options=effective,
+                    idempotency_spec=spec,
+                    now=now,
+                )
+                if permit is not None and on_generation_permit is not None:
+                    on_generation_permit(permit)
+                    permit_transferred = True
+                return prepared
+            except (IdempotencyRecordHitError, IdempotencyScopeRaceError):
+                replay_after_race = await _resolve_replay()
+                if replay_after_race is not None:
+                    return replay_after_race
 
-    raise ServiceUnavailableError(
-        code="idempotency_resolution_failed",
-        message="failed to resolve concurrent idempotent chat request",
-    )
+        raise ServiceUnavailableError(
+            code="idempotency_resolution_failed",
+            message="failed to resolve concurrent idempotent chat request",
+        )
+    finally:
+        if permit is not None and not permit_transferred:
+            permit.release()
 
 
 @overload
@@ -584,6 +658,7 @@ async def run_sync_chat(
 ) -> ChatTurnOutcome:
     """Execute or idempotently replay a synchronous chat turn shielded from HTTP disconnects."""
     resolved = options if options is not None else ChatOptions()
+    acquired_permit: list[ConcurrencyPermit] = []
     if idempotency_key is not None:
         prepared_or_replay = await prepare_chat_turn(
             session_factory,
@@ -599,28 +674,41 @@ async def run_sync_chat(
             allow_streaming=False,
             options=resolved,
             now=now,
+            on_generation_permit=acquired_permit.append,
         )
         if not isinstance(prepared_or_replay, PreparedGeneration):
+            if acquired_permit:
+                acquired_permit[0].release()
             return prepared_or_replay
         prepared = prepared_or_replay
     else:
-        prepared = await prepare_generation(
-            session_factory,
-            persona_provider=persona_provider,
-            memory_provider=memory_provider,
-            owner_id=owner_id,
-            agent_id=agent_id,
-            conversation_id=conversation_id,
-            user_message=user_message,
-            requested_model_id=requested_model_id,
-            options=resolved,
-            now=now,
-        )
+        permit_no_idem = _acquire_generation_permit(resolved)
+        try:
+            prepared = await prepare_generation(
+                session_factory,
+                persona_provider=persona_provider,
+                memory_provider=memory_provider,
+                owner_id=owner_id,
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+                user_message=user_message,
+                requested_model_id=requested_model_id,
+                options=resolved,
+                now=now,
+            )
+        except BaseException:
+            if permit_no_idem is not None:
+                permit_no_idem.release()
+            raise
+        if permit_no_idem is not None:
+            acquired_permit.append(permit_no_idem)
 
+    permit = acquired_permit[0] if acquired_permit else None
     return await execute_prepared_sync_chat(
         session_factory,
         model_provider=model_provider,
         memory_provider=memory_provider,
         prepared=prepared,
         options=resolved,
+        on_finished=permit.release if permit is not None else None,
     )

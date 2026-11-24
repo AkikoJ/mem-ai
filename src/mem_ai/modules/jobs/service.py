@@ -781,9 +781,11 @@ async def get_job_observability(
     *,
     job_type: str | None = None,
 ) -> JobObservabilitySnapshot:
-    """Return backlog counts and oldest due timestamp across durable jobs."""
+    """Return backlog counts, oldest due timestamp, and latest success across durable jobs."""
     async with session_factory() as session:
-        counts, oldest_due = await repository.get_job_status_aggregates(session, job_type=job_type)
+        counts, oldest_due, last_success = await repository.get_job_status_aggregates(
+            session, job_type=job_type
+        )
         return JobObservabilitySnapshot(
             status_counts=counts,
             pending_count=counts.get("pending", 0),
@@ -792,4 +794,5 @@ async def get_job_observability(
             reconciling_count=counts.get("reconciling", 0),
             failed_count=counts.get("failed", 0),
             oldest_due_at=oldest_due,
+            last_success_at=last_success,
         )

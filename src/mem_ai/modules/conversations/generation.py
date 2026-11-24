@@ -30,6 +30,7 @@ from mem_ai.contracts.memory_provider import MemoryRecallItem
 from mem_ai.contracts.model_provider import ModelUsage
 from mem_ai.contracts.persona_provider import PersonaSnapshot
 from mem_ai.core.exceptions import AppError, ConflictError, ForbiddenError, NotFoundError
+from mem_ai.core.telemetry import current_telemetry
 from mem_ai.db.base import is_unique_violation
 from mem_ai.modules.conversations import idempotency, queries, repository
 from mem_ai.modules.conversations.models import (
@@ -132,12 +133,14 @@ class GenerationLeaseHeartbeat:
                 )
             except AppError as exc:
                 self.loss_error = exc
+                current_telemetry().record_generation_lease_event("lease_lost")
                 if self._on_lease_lost is not None:
                     self._on_lease_lost(exc)
                 return
             except asyncio.CancelledError:
                 raise
             except Exception:
+                current_telemetry().record_generation_lease_event("renew_failed")
                 logger.warning(
                     "Transient error renewing generation lease; retrying before expiry",
                     exc_info=True,
@@ -392,6 +395,7 @@ async def prepare_generation_phase(
                             conversation_id=conversation.id,
                             active_generation_id=active_generation.id,
                         )
+                    current_telemetry().record_generation_lease_event("inline_takeover")
 
                 history_rows = await repository.list_succeeded_history_messages(
                     session, conversation_id=conversation.id, limit=history_limit
@@ -712,6 +716,8 @@ async def recover_expired_generations_phase(
             )
             if converged is not None:
                 recovered.append(converged)
+    for _ in recovered:
+        current_telemetry().record_generation_lease_event("worker_recovery")
     return recovered
 
 

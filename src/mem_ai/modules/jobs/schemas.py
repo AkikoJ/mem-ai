@@ -201,6 +201,7 @@ class JobObservabilitySnapshot(BaseModel):
     reconciling_count: int
     failed_count: int
     oldest_due_at: datetime | None
+    last_success_at: datetime | None = None
 
 
 @runtime_checkable

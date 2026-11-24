@@ -589,3 +589,20 @@ async def mark_recalled_memories_deleted_for_user_epoch(
         deleted_at=deleted_at,
         extra_criterion=MessageRecalledMemory.memory_epoch <= max_memory_epoch,
     )
+
+
+async def get_generation_status_aggregates(
+    session: AsyncSession,
+    *,
+    current_time: datetime,
+) -> tuple[int, int]:
+    """Return `(running_count, expired_lease_count)` across all persisted generations."""
+    running_stmt = select(func.count(Generation.id)).where(Generation.status == "running")
+    expired_stmt = select(func.count(Generation.id)).where(
+        Generation.status == "running",
+        Generation.lease_expires_at.is_not(None),
+        Generation.lease_expires_at <= normalize_utc(current_time),
+    )
+    running_count = int((await session.execute(running_stmt)).scalar_one() or 0)
+    expired_count = int((await session.execute(expired_stmt)).scalar_one() or 0)
+    return running_count, expired_count

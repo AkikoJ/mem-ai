@@ -14,6 +14,8 @@ from mem_ai.contracts.model_provider import ModelProvider
 from mem_ai.contracts.persona_provider import PersonaProvider
 from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import ServiceUnavailableError
+from mem_ai.core.limits import ConcurrencyLimiter
+from mem_ai.core.telemetry import TelemetryRegistry
 from mem_ai.modules.operations.audit import DeletionAuditArchiver, NoopDeletionAuditArchiver
 
 _ProviderT = TypeVar("_ProviderT")
@@ -85,11 +87,50 @@ def get_persona_provider(request: Request) -> PersonaProvider:
     return _require_provider(registry.persona_provider, name="persona")
 
 
+def get_telemetry(request: Request) -> TelemetryRegistry:
+    """Return the application's low-cardinality `TelemetryRegistry`."""
+    configured = getattr(request.app.state, "telemetry", None)
+    if isinstance(configured, TelemetryRegistry):
+        return configured
+    created = TelemetryRegistry()
+    request.app.state.telemetry = created
+    return created
+
+
+def get_optional_session_factory(request: Request) -> async_sessionmaker[AsyncSession] | None:
+    """Return the runtime async session factory if initialized, else None."""
+    return cast(
+        async_sessionmaker[AsyncSession] | None,
+        getattr(request.app.state, "session_factory", None),
+    )
+
+
+def get_app_ready(request: Request) -> bool:
+    """Return True when application startup initialization has completed and is not draining."""
+    return bool(getattr(request.app.state, "ready", True))
+
+
+def get_generation_concurrency_limiter(request: Request) -> ConcurrencyLimiter | None:
+    """Return the process-level generation concurrency budget limiter, if configured."""
+    configured = getattr(request.app.state, "generation_concurrency_limiter", None)
+    if isinstance(configured, ConcurrencyLimiter):
+        return configured
+    return None
+
+
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 SessionFactoryDep = Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)]
+OptionalSessionFactoryDep = Annotated[
+    async_sessionmaker[AsyncSession] | None, Depends(get_optional_session_factory)
+]
+AppReadyDep = Annotated[bool, Depends(get_app_ready)]
 HttpClientDep = Annotated[httpx.AsyncClient, Depends(get_http_client)]
 ModelProviderDep = Annotated[ModelProvider, Depends(get_model_provider)]
 MemoryProviderDep = Annotated[MemoryProvider, Depends(get_memory_provider)]
 OptionalMemoryProviderDep = Annotated[MemoryProvider | None, Depends(get_optional_memory_provider)]
 PersonaProviderDep = Annotated[PersonaProvider, Depends(get_persona_provider)]
 DeletionAuditArchiverDep = Annotated[DeletionAuditArchiver, Depends(get_deletion_audit_archiver)]
+TelemetryDep = Annotated[TelemetryRegistry, Depends(get_telemetry)]
+GenerationLimiterDep = Annotated[
+    ConcurrencyLimiter | None, Depends(get_generation_concurrency_limiter)
+]
