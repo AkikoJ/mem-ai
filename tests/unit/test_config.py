@@ -364,6 +364,7 @@ def test_chat_memory_recall_budget_settings_validation() -> None:
 
 def test_worker_and_job_retention_settings_validation() -> None:
     defaults = Settings(_env_file=None, app_env="test")
+    assert defaults.worker_loop_enabled is True
     assert defaults.worker_concurrency == 4
     assert defaults.worker_poll_interval_seconds == 1.0
     assert defaults.worker_claim_batch_size == 10
@@ -506,6 +507,35 @@ def test_data_retention_policy_settings_defaults_and_bounds() -> None:
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None, app_env="test", retention_max_batches_per_run=0)
+
+
+def test_worker_requires_an_online_connection_reserve_when_polling_is_enabled() -> None:
+    with pytest.raises(ValidationError, match="worker_concurrency"):
+        Settings(
+            _env_file=None,
+            db_pool_size=2,
+            db_max_overflow=1,
+            worker_concurrency=3,
+            worker_loop_enabled=True,
+        )
+
+    enabled = Settings(
+        _env_file=None,
+        db_pool_size=3,
+        db_max_overflow=1,
+        worker_concurrency=3,
+        worker_loop_enabled=True,
+    )
+    assert enabled.worker_loop_enabled is True
+
+    paused = Settings(
+        _env_file=None,
+        db_pool_size=2,
+        db_max_overflow=1,
+        worker_concurrency=3,
+        worker_loop_enabled=False,
+    )
+    assert paused.worker_loop_enabled is False
 
 
 def test_resource_limits_observability_and_proxy_heartbeat_coordination_settings() -> None:

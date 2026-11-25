@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -19,6 +21,7 @@ from mem_ai.core.config import Settings
 from mem_ai.core.exception_handlers import register_exception_handlers
 from mem_ai.core.limits import ConcurrencyLimiter, NoopRateLimiter, RateLimiter
 from mem_ai.core.logging import configure_logging
+from mem_ai.core.tasks import drain_tasks_bounded
 from mem_ai.core.telemetry import (
     NoopTracer,
     TelemetryRegistry,
@@ -44,9 +47,12 @@ from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.adapters.openai_compatible import OpenAICompatibleModelProvider
 from mem_ai.modules.models.schemas import ModelConfigSeed
 from mem_ai.modules.operations.audit import build_deletion_audit_archiver
+from mem_ai.workers.assembly import build_worker_registry_from_settings, default_periodic_jobs
+from mem_ai.workers.runner import WorkerRunner, worker_config_from_settings
 
 _OFFLINE_DOCS_STATIC_DIR = Path(fastapi_offline.__file__).resolve().parent / "static"
 _OFFLINE_DOCS_STATIC_PREFIX = "/static/docs"
+logger = logging.getLogger("mem_ai.application")
 
 
 def _register_offline_docs(app: FastAPI) -> None:
@@ -178,18 +184,80 @@ def create_app(
             model_provider=resolved_model_provider,
             memory_provider=resolved_memory_provider,
         )
+
+        worker_runner = WorkerRunner(
+            session_factory=session_factory,
+            registry=build_worker_registry_from_settings(
+                session_factory,
+                resolved_settings,
+                memory_provider=resolved_memory_provider,
+                audit_archiver=app.state.deletion_audit_archiver,
+            ),
+            config=worker_config_from_settings(resolved_settings),
+            periodic_jobs=default_periodic_jobs(resolved_settings),
+            telemetry=resolved_telemetry,
+            tracer=resolved_tracer,
+        )
+        worker_task: asyncio.Task[None] | None = None
+        if resolved_settings.worker_loop_enabled:
+            worker_task = asyncio.create_task(
+                worker_runner.run_forever(),
+                name="mem-ai-worker-runner",
+            )
+        app.state.worker_runner = worker_runner
+        app.state.worker_task = worker_task
         app.state.ready = True
 
         try:
             yield
         finally:
             app.state.ready = False
-            await sync_task_registry.drain(
-                timeout_seconds=min(resolved_settings.chat_generation_timeout_seconds, 10.0)
+            worker_runner.request_shutdown()
+
+            async def _shutdown_worker() -> None:
+                worker_error: BaseException | None = None
+                try:
+                    if worker_task is not None:
+                        if not worker_task.done():
+                            # `run_forever` drains within `worker_shutdown_grace_seconds`;
+                            # keep a slight outer slack so the runner owns its own drain window.
+                            outer_timeout = resolved_settings.worker_shutdown_grace_seconds + 0.5
+                            remaining = await drain_tasks_bounded(
+                                (worker_task,),
+                                timeout_seconds=outer_timeout,
+                            )
+                            if remaining:
+                                logger.warning(
+                                    "Embedded worker task remained active after shutdown grace",
+                                    extra={
+                                        "extra_fields": {
+                                            "worker_id": worker_runner.config.worker_id
+                                        }
+                                    },
+                                )
+                        if worker_task.done() and not worker_task.cancelled():
+                            worker_error = worker_task.exception()
+                finally:
+                    await worker_runner.drain()
+
+                if worker_error is not None:
+                    raise worker_error
+
+            shutdown_results = await asyncio.gather(
+                sync_task_registry.drain(
+                    timeout_seconds=min(resolved_settings.chat_generation_timeout_seconds, 10.0)
+                ),
+                _shutdown_worker(),
+                return_exceptions=True,
             )
-            await http_client.aclose()
-            await db_engine.dispose()
-            reset_telemetry(tel_tokens)
+            try:
+                for result in shutdown_results:
+                    if isinstance(result, BaseException):
+                        raise result
+            finally:
+                await http_client.aclose()
+                await db_engine.dispose()
+                reset_telemetry(tel_tokens)
 
     docs_enabled = resolved_settings.app_env != "production"
     app = FastAPI(

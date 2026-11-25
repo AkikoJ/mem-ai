@@ -7,22 +7,17 @@ import contextlib
 import json
 import logging
 import os
-import socket
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from types import TracebackType
 from typing import Any
-from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import AppError, ConflictError
 from mem_ai.core.logging import bind_log_context, reset_log_context
+from mem_ai.core.tasks import drain_tasks_bounded
 from mem_ai.core.telemetry import (
     NoopTracer,
     Span,
@@ -34,193 +29,30 @@ from mem_ai.core.telemetry import (
 from mem_ai.modules.jobs import service as jobs_service
 from mem_ai.modules.jobs.schemas import (
     ClaimedJob,
-    JobBackoffPolicy,
     JobExecutionContext,
-    JobHandler,
     JobHandlerOutcome,
+)
+from mem_ai.workers.lease import JobLeaseHeartbeat
+from mem_ai.workers.schemas import (
+    JobHandlerRegistry,
+    PeriodicJobSpec,
+    WorkerConfig,
+    WorkerHealthSnapshot,
+    default_worker_id,
+    worker_config_from_settings,
 )
 
 logger = logging.getLogger("mem_ai.workers.runner")
 
-
-def default_worker_id() -> str:
-    """Generate a unique identifier for a Worker runner process."""
-    host = socket.gethostname() or "localhost"
-    return f"worker-{host}-{os.getpid()}-{uuid4().hex[:8]}"
-
-
-@dataclass(frozen=True, slots=True)
-class WorkerConfig:
-    """Runtime concurrency, polling, lease, backoff, and shutdown settings for `WorkerRunner`."""
-
-    worker_id: str = field(default_factory=default_worker_id)
-    concurrency: int = 4
-    poll_interval_seconds: float = 1.0
-    claim_batch_size: int = 10
-    lease_ttl_seconds: float = 60.0
-    lease_renew_interval_seconds: float | None = 20.0
-    backoff_policy: JobBackoffPolicy = field(default_factory=JobBackoffPolicy)
-    attempt_retention_days: int = 30
-    shutdown_grace_seconds: float = 15.0
-    heartbeat_interval_seconds: float = 30.0
-    heartbeat_file: str | None = None
-
-
-def worker_config_from_settings(
-    settings: Settings,
-    *,
-    worker_id: str | None = None,
-) -> WorkerConfig:
-    """Build `WorkerConfig` from validated application `Settings`."""
-    return WorkerConfig(
-        worker_id=worker_id or default_worker_id(),
-        concurrency=settings.worker_concurrency,
-        poll_interval_seconds=settings.worker_poll_interval_seconds,
-        claim_batch_size=settings.worker_claim_batch_size,
-        lease_ttl_seconds=float(settings.worker_lease_ttl_seconds),
-        lease_renew_interval_seconds=settings.worker_lease_renew_interval_seconds,
-        backoff_policy=JobBackoffPolicy(
-            base_delay_seconds=settings.worker_backoff_base_seconds,
-            max_delay_seconds=settings.worker_backoff_max_seconds,
-            jitter_ratio=settings.worker_backoff_jitter_ratio,
-            reconcile_delay_seconds=settings.worker_reconcile_delay_seconds,
-        ),
-        attempt_retention_days=settings.job_attempt_retention_days,
-        shutdown_grace_seconds=settings.worker_shutdown_grace_seconds,
-        heartbeat_interval_seconds=settings.worker_heartbeat_interval_seconds,
-        heartbeat_file=settings.worker_heartbeat_file,
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class PeriodicJobSpec:
-    """Periodic window job specification deduplicated via PostgreSQL `dedupe_key`."""
-
-    job_type: str
-    interval_seconds: float
-    max_attempts: int = 3
-    metadata_json: dict[str, Any] = field(default_factory=dict)
-
-
-class WorkerHealthSnapshot(BaseModel):
-    """Observable runtime heartbeat and counters exported by a `WorkerRunner`."""
-
-    model_config = ConfigDict(frozen=True)
-
-    worker_id: str
-    started_at: datetime | None = None
-    last_poll_at: datetime | None = None
-    last_claim_at: datetime | None = None
-    last_success_at: datetime | None = None
-    active_tasks: int = 0
-    processed_count: int = 0
-    succeeded_count: int = 0
-    retry_wait_count: int = 0
-    reconciling_count: int = 0
-    failed_count: int = 0
-    cancelled_count: int = 0
-    lease_lost_count: int = 0
-    shutting_down: bool = False
-
-
-class JobHandlerRegistry:
-    """Type-keyed registry mapping `jobs.job_type` to concrete `JobHandler` instances."""
-
-    def __init__(self) -> None:
-        self._handlers: dict[str, JobHandler] = {}
-
-    def register(self, job_type: str, handler: JobHandler) -> None:
-        """Register a handler for `job_type`, rejecting blanks and duplicates."""
-        normalized = job_type.strip()
-        if not normalized:
-            raise ValueError("job_type must not be empty")
-        if normalized in self._handlers:
-            raise ValueError(f"job handler already registered for job_type={normalized!r}")
-        self._handlers[normalized] = handler
-
-    def get(self, job_type: str) -> JobHandler | None:
-        """Look up a registered handler by `job_type`."""
-        return self._handlers.get(job_type)
-
-    def job_types(self) -> tuple[str, ...]:
-        """Return all registered `job_type` keys in deterministic order."""
-        return tuple(sorted(self._handlers.keys()))
-
-
-class JobLeaseHeartbeat:
-    """Periodic lease renewal context manager protecting long-running job handlers."""
-
-    def __init__(
-        self,
-        *,
-        session_factory: async_sessionmaker[AsyncSession],
-        claimed: ClaimedJob,
-        lease_ttl_seconds: float,
-        renew_interval_seconds: float | None,
-        on_lease_lost: Callable[[AppError], None] | None = None,
-    ) -> None:
-        self._session_factory = session_factory
-        self._claimed = claimed
-        self._lease_ttl_seconds = lease_ttl_seconds
-        self._renew_interval_seconds = renew_interval_seconds
-        self._on_lease_lost = on_lease_lost
-        self._task: asyncio.Task[None] | None = None
-        self.loss_error: AppError | None = None
-
-    async def __aenter__(self) -> JobLeaseHeartbeat:
-        if self._renew_interval_seconds is not None and self._renew_interval_seconds > 0:
-            self._task = asyncio.create_task(self._run_loop())
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        _ = (exc_type, exc, tb)
-        await self.stop()
-
-    async def stop(self) -> None:
-        """Stop background lease renewal before conditional outcome commit."""
-        task = self._task
-        self._task = None
-        if task is None:
-            return
-        if not task.done():
-            task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-
-    async def _run_loop(self) -> None:
-        assert self._renew_interval_seconds is not None
-        while True:
-            await asyncio.sleep(self._renew_interval_seconds)
-            try:
-                await jobs_service.renew_job_lease(
-                    self._session_factory,
-                    job_id=self._claimed.job.id,
-                    lease_token=self._claimed.lease_token,
-                    lease_ttl_seconds=self._lease_ttl_seconds,
-                )
-            except ConflictError as exc:
-                self.loss_error = exc
-                if self._on_lease_lost is not None:
-                    self._on_lease_lost(exc)
-                return
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.warning(
-                    "Transient error renewing job lease; retrying before expiry",
-                    extra={
-                        "extra_fields": {
-                            "job_id": str(self._claimed.job.id),
-                            "job_type": self._claimed.job.job_type,
-                        }
-                    },
-                    exc_info=True,
-                )
+__all__ = [
+    "JobHandlerRegistry",
+    "PeriodicJobSpec",
+    "WorkerConfig",
+    "WorkerHealthSnapshot",
+    "WorkerRunner",
+    "default_worker_id",
+    "worker_config_from_settings",
+]
 
 
 class WorkerRunner:
@@ -245,6 +77,11 @@ class WorkerRunner:
         self._telemetry = telemetry if telemetry is not None else TelemetryRegistry()
         self._tracer: Tracer = tracer if tracer is not None else NoopTracer()
         self._active_tasks: set[asyncio.Task[None]] = set()
+        self._run_once_tasks: set[asyncio.Task[Any]] = set()
+        self._concurrency_semaphore = asyncio.Semaphore(self._config.concurrency)
+        self._reserved_slots = 0
+        self._poll_loop_task: asyncio.Task[None] | None = None
+        self._drain_lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
 
         self._started_at: datetime | None = None
@@ -252,6 +89,9 @@ class WorkerRunner:
         self._last_claim_at: datetime | None = None
         self._last_success_at: datetime | None = None
         self._last_heartbeat_log_monotonic: float | None = None
+        self._last_queue_observation_monotonic: float | None = None
+        self._job_backlog_count = 0
+        self._pending_reconciliation_count = 0
         self._processed_count = 0
         self._succeeded_count = 0
         self._retry_wait_count = 0
@@ -305,6 +145,8 @@ class WorkerRunner:
                         "processed_count": snap.processed_count,
                         "succeeded_count": snap.succeeded_count,
                         "reconciling_count": snap.reconciling_count,
+                        "job_backlog_count": snap.job_backlog_count,
+                        "pending_reconciliation_count": snap.pending_reconciliation_count,
                         "failed_count": snap.failed_count,
                         "shutting_down": snap.shutting_down,
                         "last_poll_at": snap.last_poll_at.isoformat()
@@ -338,6 +180,9 @@ class WorkerRunner:
     def request_shutdown(self) -> None:
         """Signal the runner to stop claiming new work and drain in-flight tasks."""
         self._stop_event.set()
+        poll_task = self._poll_loop_task
+        if poll_task is not None and not poll_task.done():
+            poll_task.cancel()
 
     def health_snapshot(self) -> WorkerHealthSnapshot:
         """Return an immutable snapshot of Worker heartbeat and execution counters."""
@@ -352,11 +197,90 @@ class WorkerRunner:
             succeeded_count=self._succeeded_count,
             retry_wait_count=self._retry_wait_count,
             reconciling_count=self._reconciling_count,
+            job_backlog_count=self._job_backlog_count,
+            pending_reconciliation_count=self._pending_reconciliation_count,
             failed_count=self._failed_count,
             cancelled_count=self._cancelled_count,
             lease_lost_count=self._lease_lost_count,
             shutting_down=self._stop_event.is_set(),
         )
+
+    async def _refresh_job_observability(self, *, force: bool = False) -> None:
+        """Refresh bounded queue counts used in Worker heartbeat logs."""
+        monotonic_now = time.perf_counter()
+        if (
+            not force
+            and self._last_queue_observation_monotonic is not None
+            and monotonic_now - self._last_queue_observation_monotonic
+            < self._config.heartbeat_interval_seconds
+        ):
+            return
+
+        self._last_queue_observation_monotonic = monotonic_now
+        try:
+            snapshot = await jobs_service.get_job_observability(self._session_factory)
+        except Exception:
+            logger.warning(
+                "Failed to collect durable job counts for Worker heartbeat",
+                extra={"extra_fields": {"worker_id": self._config.worker_id}},
+                exc_info=True,
+            )
+            return
+
+        self._job_backlog_count = snapshot.pending_count + snapshot.retry_wait_count
+        self._pending_reconciliation_count = snapshot.reconciling_count
+
+    async def _refresh_job_observability_bounded(
+        self,
+        *,
+        force: bool = False,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        """Refresh queue counts within a tight timeout so shutdown cannot block on DB."""
+        cap = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else min(0.5, max(0.02, self._config.shutdown_grace_seconds * 0.2))
+        )
+        if cap <= 0.0:
+            return
+        try:
+            async with asyncio.timeout(cap):
+                await self._refresh_job_observability(force=force)
+        except TimeoutError:
+            logger.warning(
+                "Timed out collecting durable job counts for Worker heartbeat",
+                extra={"extra_fields": {"worker_id": self._config.worker_id}},
+            )
+
+    def _available_claim_slots(self) -> int:
+        return max(0, self._config.concurrency - len(self._active_tasks) - self._reserved_slots)
+
+    async def _run_job_with_concurrency_guard(
+        self,
+        claimed: ClaimedJob,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        async with self._concurrency_semaphore:
+            await self._execute_claimed_job(claimed, now=now)
+
+    def _track_active_task(self, task: asyncio.Task[None]) -> None:
+        self._active_tasks.add(task)
+
+        def _observe_completion(done_task: asyncio.Task[None]) -> None:
+            self._active_tasks.discard(done_task)
+            if done_task.cancelled():
+                return
+            error = done_task.exception()
+            if error is not None:
+                logger.error(
+                    "Worker task exited unexpectedly",
+                    extra={"extra_fields": {"worker_id": self._config.worker_id}},
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(_observe_completion)
 
     async def schedule_periodic_jobs(self, *, now: datetime | None = None) -> int:
         """Idempotently enqueue window-deduplicated periodic jobs across multi-Worker replicas."""
@@ -388,6 +312,57 @@ class WorkerRunner:
                     created_count += 1
         return created_count
 
+    async def _claim_and_spawn_tasks(
+        self,
+        *,
+        registered_types: tuple[str, ...],
+        requested: int,
+        task_name: str,
+        now: datetime | None = None,
+        swallow_claim_errors: bool = False,
+    ) -> list[asyncio.Task[None]]:
+        if requested <= 0 or not registered_types:
+            return []
+        available_slots = self._available_claim_slots()
+        if available_slots <= 0:
+            return []
+
+        limit = min(requested, available_slots)
+        self._reserved_slots += limit
+        tasks: list[asyncio.Task[None]] = []
+        try:
+            try:
+                claimed_jobs = await jobs_service.claim_due_jobs(
+                    self._session_factory,
+                    worker_id=self._config.worker_id,
+                    job_types=registered_types,
+                    limit=limit,
+                    lease_ttl_seconds=self._config.lease_ttl_seconds,
+                    attempt_retention_days=self._config.attempt_retention_days,
+                    now=now,
+                )
+            except Exception:
+                if not swallow_claim_errors:
+                    raise
+                logger.exception(
+                    "Error claiming due jobs from PostgreSQL",
+                    extra={"extra_fields": {"worker_id": self._config.worker_id}},
+                )
+                return []
+
+            if claimed_jobs:
+                self._last_claim_at = now if now is not None else datetime.now(UTC)
+                for item in claimed_jobs:
+                    task = asyncio.create_task(
+                        self._run_job_with_concurrency_guard(item, now=now),
+                        name=task_name,
+                    )
+                    self._track_active_task(task)
+                    tasks.append(task)
+        finally:
+            self._reserved_slots -= limit
+        return tasks
+
     async def run_once(
         self,
         *,
@@ -395,44 +370,78 @@ class WorkerRunner:
         now: datetime | None = None,
     ) -> int:
         """Run one bounded claim-and-execute cycle; ideal for deterministic tests and CLI probes."""
-        registered_types = self._registry.job_types()
-        if not registered_types:
+        if self._stop_event.is_set():
             return 0
 
-        tel_tokens = bind_telemetry(telemetry=self._telemetry, tracer=self._tracer)
+        cycle_task = asyncio.current_task()
+        if cycle_task is not None:
+            self._run_once_tasks.add(cycle_task)
         try:
-            await self.schedule_periodic_jobs(now=now)
-            self._last_poll_at = now if now is not None else datetime.now(UTC)
-
-            limit = min(
-                max_jobs if max_jobs is not None else self._config.claim_batch_size,
-                self._config.concurrency,
-            )
-            claimed_jobs = await jobs_service.claim_due_jobs(
-                self._session_factory,
-                worker_id=self._config.worker_id,
-                job_types=registered_types,
-                limit=max(1, limit),
-                lease_ttl_seconds=self._config.lease_ttl_seconds,
-                attempt_retention_days=self._config.attempt_retention_days,
-                now=now,
-            )
-            if not claimed_jobs:
-                self._emit_heartbeat(now=now)
+            registered_types = self._registry.job_types()
+            if not registered_types:
                 return 0
 
-            self._last_claim_at = now if now is not None else datetime.now(UTC)
-            semaphore = asyncio.Semaphore(self._config.concurrency)
+            tel_tokens = bind_telemetry(telemetry=self._telemetry, tracer=self._tracer)
+            try:
+                await self.schedule_periodic_jobs(now=now)
+                self._last_poll_at = now if now is not None else datetime.now(UTC)
+                if self._stop_event.is_set():
+                    self._emit_heartbeat(now=now)
+                    return 0
 
-            async def _bounded_exec(item: ClaimedJob) -> None:
-                async with semaphore:
-                    await self._execute_claimed_job(item, now=now)
+                requested = max_jobs if max_jobs is not None else self._config.claim_batch_size
+                tasks = await self._claim_and_spawn_tasks(
+                    registered_types=registered_types,
+                    requested=requested,
+                    task_name="mem-ai-worker-run-once-job",
+                    now=now,
+                )
+                if not tasks:
+                    await self._refresh_job_observability(force=True)
+                    self._emit_heartbeat(now=now)
+                    return 0
 
-            await asyncio.gather(*(_bounded_exec(item) for item in claimed_jobs))
-            self._emit_heartbeat(now=now)
-            return len(claimed_jobs)
+                self._emit_heartbeat(now=now)
+                await asyncio.gather(*tasks)
+                await self._refresh_job_observability(force=True)
+                self._emit_heartbeat(now=now, force_log=True)
+                return len(tasks)
+            finally:
+                reset_telemetry(tel_tokens)
         finally:
-            reset_telemetry(tel_tokens)
+            if cycle_task is not None:
+                self._run_once_tasks.discard(cycle_task)
+
+    async def _poll_loop(
+        self,
+        effective_stop: asyncio.Event,
+        registered_types: tuple[str, ...],
+    ) -> None:
+        while not effective_stop.is_set() and not self._stop_event.is_set():
+            try:
+                await self.schedule_periodic_jobs()
+            except Exception:
+                logger.exception(
+                    "Failed to schedule periodic jobs; retrying next poll",
+                    extra={"extra_fields": {"worker_id": self._config.worker_id}},
+                )
+
+            await self._refresh_job_observability()
+            self._last_poll_at = datetime.now(UTC)
+            self._emit_heartbeat()
+            claimed_tasks: list[asyncio.Task[None]] = []
+            if not effective_stop.is_set() and not self._stop_event.is_set():
+                claimed_tasks = await self._claim_and_spawn_tasks(
+                    registered_types=registered_types,
+                    requested=self._config.claim_batch_size,
+                    task_name="mem-ai-worker-job",
+                    swallow_claim_errors=True,
+                )
+                if claimed_tasks:
+                    self._emit_heartbeat()
+
+            if not claimed_tasks or self._available_claim_slots() <= 0:
+                await self._wait_for_poll_or_stop(effective_stop)
 
     async def run_forever(self, stop_event: asyncio.Event | None = None) -> None:
         """Continuously claim and execute jobs until shutdown, then drain within grace period."""
@@ -450,56 +459,36 @@ class WorkerRunner:
                 }
             },
         )
+        if not effective_stop.is_set() and not self._stop_event.is_set():
+            await self._refresh_job_observability(force=True)
         self._emit_heartbeat(force_log=True)
 
         try:
-            while not effective_stop.is_set() and not self._stop_event.is_set():
+            if not effective_stop.is_set() and not self._stop_event.is_set():
+                poll_task = asyncio.create_task(
+                    self._poll_loop(effective_stop, registered_types),
+                    name="mem-ai-worker-poll-loop",
+                )
+                self._poll_loop_task = poll_task
                 try:
-                    await self.schedule_periodic_jobs()
-                except Exception:
-                    logger.exception(
-                        "Failed to schedule periodic jobs; retrying next poll",
-                        extra={"extra_fields": {"worker_id": self._config.worker_id}},
-                    )
-
-                self._last_poll_at = datetime.now(UTC)
-                self._emit_heartbeat()
-                available_slots = self._config.concurrency - len(self._active_tasks)
-                claimed_count = 0
-
-                if available_slots > 0 and registered_types:
-                    claim_limit = min(available_slots, self._config.claim_batch_size)
-                    try:
-                        claimed_jobs = await jobs_service.claim_due_jobs(
-                            self._session_factory,
-                            worker_id=self._config.worker_id,
-                            job_types=registered_types,
-                            limit=claim_limit,
-                            lease_ttl_seconds=self._config.lease_ttl_seconds,
-                            attempt_retention_days=self._config.attempt_retention_days,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Error claiming due jobs from PostgreSQL",
-                            extra={"extra_fields": {"worker_id": self._config.worker_id}},
-                        )
-                        claimed_jobs = []
-
-                    claimed_count = len(claimed_jobs)
-                    if claimed_jobs:
-                        self._last_claim_at = datetime.now(UTC)
-                        for claimed in claimed_jobs:
-                            task = asyncio.create_task(self._execute_claimed_job(claimed))
-                            self._active_tasks.add(task)
-                            task.add_done_callback(self._active_tasks.discard)
-                        self._emit_heartbeat()
-
-                if claimed_count == 0 or len(self._active_tasks) >= self._config.concurrency:
-                    await self._wait_for_poll_or_stop(effective_stop)
+                    await poll_task
+                except asyncio.CancelledError:
+                    if not (effective_stop.is_set() or self._stop_event.is_set()):
+                        raise
+                finally:
+                    if self._poll_loop_task is poll_task:
+                        self._poll_loop_task = None
+                    if not poll_task.done():
+                        poll_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await poll_task
         finally:
             self._stop_event.set()
+            shutdown_deadline = time.monotonic() + self._config.shutdown_grace_seconds
+            await self._refresh_job_observability_bounded(force=True)
             self._emit_heartbeat(force_log=True)
-            await self._drain_active_tasks()
+            await self.drain(timeout_seconds=max(0.0, shutdown_deadline - time.monotonic()))
+            await self._refresh_job_observability_bounded(force=True)
             self._emit_heartbeat(force_log=True)
             logger.info(
                 "Worker runner stopped",
@@ -529,19 +518,29 @@ class WorkerRunner:
                     waiter.cancel()
             await asyncio.gather(*waiters, return_exceptions=True)
 
-    async def _drain_active_tasks(self) -> None:
-        """Give in-flight jobs bounded time to converge; cancel stragglers for lease recovery."""
-        if not self._active_tasks:
-            return
-        pending = list(self._active_tasks)
-        _, still_pending = await asyncio.wait(
-            pending,
-            timeout=self._config.shutdown_grace_seconds,
+    async def drain(self, *, timeout_seconds: float | None = None) -> None:
+        """Drain in-flight work and bound cancellation cleanup for lease recovery."""
+        current_task = asyncio.current_task()
+        effective_timeout = (
+            self._config.shutdown_grace_seconds if timeout_seconds is None else timeout_seconds
         )
-        for task in still_pending:
-            task.cancel()
-        if still_pending:
-            await asyncio.gather(*still_pending, return_exceptions=True)
+        async with self._drain_lock:
+            pending = set(self._active_tasks)
+            pending.update(task for task in self._run_once_tasks if task is not current_task)
+            cancellation_pending = await drain_tasks_bounded(
+                pending,
+                timeout_seconds=effective_timeout,
+            )
+            if cancellation_pending:
+                logger.warning(
+                    "Worker tasks remained active after cancellation grace",
+                    extra={
+                        "extra_fields": {
+                            "worker_id": self._config.worker_id,
+                            "active_task_count": len(cancellation_pending),
+                        }
+                    },
+                )
 
     def _record_lease_lost(
         self,
@@ -661,6 +660,7 @@ class WorkerRunner:
                                 result_summary={"phase": "handler_exception"},
                             )
                         finally:
+                            await heartbeat.stop()
                             if handler_task is not None and not handler_task.done():
                                 handler_task.cancel()
                                 with contextlib.suppress(asyncio.CancelledError):

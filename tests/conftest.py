@@ -263,6 +263,7 @@ def empty_pg_settings() -> Iterator[Settings]:
             postgres_user=base_settings.postgres_user,
             postgres_password=base_settings.postgres_password,
             postgres_db=test_db,
+            worker_loop_enabled=False,
         )
     finally:
         with admin_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:

@@ -270,6 +270,7 @@ class Settings(BaseSettings):
     chat_message_max_chars: int = Field(default=32000, ge=1, le=200000)
 
     # Background worker and durable job budgets
+    worker_loop_enabled: bool = True
     worker_concurrency: int = Field(default=4, ge=1, le=100)
     worker_poll_interval_seconds: float = Field(default=1.0, gt=0.0, le=60.0)
     worker_claim_batch_size: int = Field(default=10, ge=1, le=200)
@@ -466,6 +467,16 @@ class Settings(BaseSettings):
             raise ValueError(
                 "worker_lease_renew_interval_seconds must be strictly less than "
                 "worker_lease_ttl_seconds"
+            )
+
+        if (
+            self.worker_loop_enabled
+            and self.db_pool_size + self.db_max_overflow < self.worker_concurrency + 1
+        ):
+            raise ValueError(
+                "db_pool_size + db_max_overflow must be at least "
+                "worker_concurrency + 1 when worker_loop_enabled is true to reserve a "
+                "database connection for online requests"
             )
 
         if self.worker_backoff_base_seconds > self.worker_backoff_max_seconds:

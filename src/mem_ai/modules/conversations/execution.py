@@ -35,6 +35,7 @@ from mem_ai.core.exceptions import (
     ServiceUnavailableError,
 )
 from mem_ai.core.logging import bind_log_context, reset_log_context
+from mem_ai.core.tasks import drain_tasks_bounded
 from mem_ai.core.telemetry import (
     GenerationMode,
     GenerationOutcome,
@@ -90,14 +91,16 @@ class SyncGenerationTaskRegistry:
         return task
 
     async def drain(self, *, timeout_seconds: float = 10.0) -> None:
-        """Wait bounded time for in-flight shielded sync tasks to finish on app shutdown."""
-        if not self._tasks:
-            return
-        _, still_pending = await asyncio.wait(list(self._tasks), timeout=timeout_seconds)
-        for task in still_pending:
-            task.cancel()
-        if still_pending:
-            await asyncio.gather(*still_pending, return_exceptions=True)
+        """Drain sync tasks, then bound cancellation cleanup within `timeout_seconds`."""
+        cancellation_pending = await drain_tasks_bounded(
+            list(self._tasks),
+            timeout_seconds=timeout_seconds,
+        )
+        if cancellation_pending:
+            logger.warning(
+                "Synchronous generation tasks remained active after cancellation grace",
+                extra={"extra_fields": {"active_task_count": len(cancellation_pending)}},
+            )
 
 
 def build_turn_memory_enqueue_hook(

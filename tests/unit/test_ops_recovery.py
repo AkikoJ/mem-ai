@@ -156,6 +156,7 @@ def test_compute_connection_budget_enforces_total_and_worker_pool_bounds() -> No
     tight_worker = Settings(
         _env_file=None,
         app_env="test",
+        worker_loop_enabled=False,
         db_pool_size=2,
         db_max_overflow=1,
         worker_concurrency=4,

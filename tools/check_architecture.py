@@ -37,6 +37,7 @@ ASSEMBLY_EXCEPTIONS = frozenset(
         "src/mem_ai/ops.py",
         "src/mem_ai/db/model_registry.py",
         "src/mem_ai/api/router.py",
+        "src/mem_ai/workers/assembly.py",
         "src/mem_ai/workers/main.py",
     }
 )
