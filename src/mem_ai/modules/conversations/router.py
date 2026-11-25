@@ -13,7 +13,6 @@ from mem_ai.api.dependencies import (
     GenerationLimiterDep,
     ModelProviderDep,
     OptionalMemoryProviderDep,
-    PersonaProviderDep,
     SessionFactoryDep,
     SettingsDep,
 )
@@ -185,7 +184,6 @@ async def post_chat(
     auth: AuthContextDep,
     settings: SettingsDep,
     session_factory: SessionFactoryDep,
-    persona_provider: PersonaProviderDep,
     model_provider: ModelProviderDep,
     memory_provider: OptionalMemoryProviderDep,
     task_registry: SyncTaskRegistryDep,
@@ -208,7 +206,6 @@ async def post_chat(
     acquired_permit: list[ConcurrencyPermit] = []
     prepared_or_replay = await conversations_service.prepare_chat_turn(
         session_factory,
-        persona_provider=persona_provider,
         memory_provider=memory_provider,
         owner_id=auth.user_id,
         agent_id=payload.agent_id,

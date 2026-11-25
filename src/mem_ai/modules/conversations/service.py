@@ -25,7 +25,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mem_ai.contracts.memory_provider import MemoryProvider, MemoryRecallItem
 from mem_ai.contracts.model_provider import ModelProvider, ModelResponse
-from mem_ai.contracts.persona_provider import PersonaProvider
 from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import (
     NotFoundError,
@@ -35,6 +34,7 @@ from mem_ai.core.exceptions import (
 )
 from mem_ai.core.limits import ConcurrencyLimiter, ConcurrencyPermit
 from mem_ai.core.telemetry import current_telemetry
+from mem_ai.modules.agents import service as agents_service
 from mem_ai.modules.conversations import execution as generation_execution
 from mem_ai.modules.conversations import generation as generation_store
 from mem_ai.modules.conversations import idempotency as idempotency_store
@@ -167,7 +167,6 @@ def _acquire_generation_permit(resolved: ChatOptions) -> ConcurrencyPermit | Non
 async def prepare_generation(
     session_factory: async_sessionmaker[AsyncSession],
     *,
-    persona_provider: PersonaProvider,
     owner_id: UUID,
     agent_id: UUID,
     conversation_id: UUID | None,
@@ -184,7 +183,9 @@ async def prepare_generation(
     await users_service.get_active_user(session_factory, user_id=owner_id)
 
     if conversation_id is None:
-        persona = await persona_provider.get_latest_published(owner_id=owner_id, agent_id=agent_id)
+        persona = await agents_service.get_latest_published_version_for_owner(
+            session_factory, owner_id=owner_id, agent_id=agent_id
+        )
         if persona is None:
             raise NotFoundError(
                 code="agent_persona_not_found",
@@ -197,7 +198,8 @@ async def prepare_generation(
             conversation_id=conversation_id,
             expected_agent_id=agent_id,
         )
-        persona = await persona_provider.get_version(
+        persona = await agents_service.get_published_persona_version_for_owner(
+            session_factory,
             owner_id=owner_id,
             agent_id=agent_id,
             version_id=existing_conv.persona_version_id,
@@ -516,7 +518,6 @@ async def execute_prepared_sync_chat(
 async def prepare_chat_turn(
     session_factory: async_sessionmaker[AsyncSession],
     *,
-    persona_provider: PersonaProvider,
     owner_id: UUID,
     agent_id: UUID,
     conversation_id: UUID | None,
@@ -573,7 +574,6 @@ async def prepare_chat_turn(
             try:
                 prepared = await prepare_generation(
                     session_factory,
-                    persona_provider=persona_provider,
                     memory_provider=memory_provider,
                     owner_id=owner_id,
                     agent_id=agent_id,
@@ -606,7 +606,6 @@ async def prepare_chat_turn(
 async def run_sync_chat(
     session_factory: async_sessionmaker[AsyncSession],
     *,
-    persona_provider: PersonaProvider,
     model_provider: ModelProvider,
     owner_id: UUID,
     agent_id: UUID,
@@ -625,7 +624,6 @@ async def run_sync_chat(
 async def run_sync_chat(
     session_factory: async_sessionmaker[AsyncSession],
     *,
-    persona_provider: PersonaProvider,
     model_provider: ModelProvider,
     owner_id: UUID,
     agent_id: UUID,
@@ -643,7 +641,6 @@ async def run_sync_chat(
 async def run_sync_chat(
     session_factory: async_sessionmaker[AsyncSession],
     *,
-    persona_provider: PersonaProvider,
     model_provider: ModelProvider,
     owner_id: UUID,
     agent_id: UUID,
@@ -662,7 +659,6 @@ async def run_sync_chat(
     if idempotency_key is not None:
         prepared_or_replay = await prepare_chat_turn(
             session_factory,
-            persona_provider=persona_provider,
             memory_provider=memory_provider,
             owner_id=owner_id,
             agent_id=agent_id,
@@ -686,7 +682,6 @@ async def run_sync_chat(
         try:
             prepared = await prepare_generation(
                 session_factory,
-                persona_provider=persona_provider,
                 memory_provider=memory_provider,
                 owner_id=owner_id,
                 agent_id=agent_id,

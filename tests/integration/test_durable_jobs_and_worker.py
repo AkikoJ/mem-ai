@@ -30,7 +30,6 @@ from mem_ai.contracts.model_provider import (
     ModelResponse,
     ModelStreamChunk,
 )
-from mem_ai.contracts.persona_provider import MemoryPolicy
 from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import (
     BadGatewayError,
@@ -40,7 +39,7 @@ from mem_ai.core.exceptions import (
 from mem_ai.core.logging import JsonLogFormatter
 from mem_ai.db.engine import create_async_engine_from_settings, create_session_factory
 from mem_ai.modules.agents import service as agents_service
-from mem_ai.modules.agents.schemas import AgentCreateRequest
+from mem_ai.modules.agents.schemas import AgentCreateRequest, MemoryPolicy
 from mem_ai.modules.conversations import generation as generation_store
 from mem_ai.modules.conversations import service as conversations_service
 from mem_ai.modules.conversations.queries import DatabaseTurnContentLoader
@@ -62,7 +61,6 @@ from mem_ai.modules.memories.schemas import AcceptedMemoryOutcome
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
 from mem_ai.modules.operations import service as operations_service
-from mem_ai.modules.personas.provider import LocalPersonaProvider
 from mem_ai.modules.users import service as users_service
 from mem_ai.workers.main import (
     JOB_TYPE_GENERATION_LEASE_RECOVERY,
@@ -223,7 +221,6 @@ async def test_atomic_tx2_commit_write_scopes_disabled_policy_and_rollback(
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
     try:
-        persona_provider = LocalPersonaProvider(session_factory=session_factory)
         model_provider = FakeModelProvider(prefix="reply:")
         memory_provider = _ScriptedMemoryProvider()
 
@@ -235,7 +232,6 @@ async def test_atomic_tx2_commit_write_scopes_disabled_policy_and_rollback(
         )
         res_user = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=model_provider,
             memory_provider=memory_provider,
             owner_id=user_id,
@@ -268,7 +264,6 @@ async def test_atomic_tx2_commit_write_scopes_disabled_policy_and_rollback(
         )
         res_conv = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=model_provider,
             memory_provider=memory_provider,
             owner_id=user_id,
@@ -293,7 +288,6 @@ async def test_atomic_tx2_commit_write_scopes_disabled_policy_and_rollback(
         )
         res_disabled = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=model_provider,
             memory_provider=memory_provider,
             owner_id=user_id,
@@ -326,7 +320,6 @@ async def test_atomic_tx2_commit_write_scopes_disabled_policy_and_rollback(
 
         prepared = await conversations_service.prepare_generation(
             session_factory,
-            persona_provider=persona_provider,
             memory_provider=memory_provider,
             owner_id=user_id,
             agent_id=user_scope_agent_id,
@@ -368,7 +361,6 @@ async def test_atomic_tx2_commit_write_scopes_disabled_policy_and_rollback(
         with pytest.raises(BadGatewayError):
             await conversations_service.run_sync_chat(
                 session_factory,
-                persona_provider=persona_provider,
                 model_provider=_FailingModelProvider(),
                 memory_provider=memory_provider,
                 owner_id=user_id,
@@ -378,7 +370,6 @@ async def test_atomic_tx2_commit_write_scopes_disabled_policy_and_rollback(
             )
         prepared_cancel = await conversations_service.prepare_generation(
             session_factory,
-            persona_provider=persona_provider,
             memory_provider=memory_provider,
             owner_id=user_id,
             agent_id=user_scope_agent_id,
@@ -484,7 +475,6 @@ async def test_worker_retries_exhaustion_reconciling_verification_and_log_redact
     mem_ai_logger.addHandler(log_handler)
     mem_ai_logger.setLevel(logging.INFO)
     try:
-        persona_provider = LocalPersonaProvider(session_factory=session_factory)
         model_provider = FakeModelProvider(prefix="answer:")
         user_id, agent_id = await _seed_user_model_and_agent(
             session_factory,
@@ -515,7 +505,6 @@ async def test_worker_retries_exhaustion_reconciling_verification_and_log_redact
         )
         chat_fail = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=model_provider,
             memory_provider=always_fail_provider,
             owner_id=user_id,
@@ -611,7 +600,6 @@ async def test_worker_retries_exhaustion_reconciling_verification_and_log_redact
         )
         chat_rec = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=model_provider,
             memory_provider=reconcile_provider,
             owner_id=user_id,
@@ -966,7 +954,6 @@ async def test_worker_crash_mid_dispatch_verifies_instead_of_re_sending_and_barr
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
     try:
-        persona_provider = LocalPersonaProvider(session_factory=session_factory)
         model_provider = FakeModelProvider(prefix="ok:")
         user_id, agent_id = await _seed_user_model_and_agent(
             session_factory,
@@ -990,7 +977,6 @@ async def test_worker_crash_mid_dispatch_verifies_instead_of_re_sending_and_barr
 
         res = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=model_provider,
             memory_provider=gated_provider,
             owner_id=user_id,
@@ -1052,7 +1038,6 @@ async def test_worker_crash_mid_dispatch_verifies_instead_of_re_sending_and_barr
         # while still committing the assistant reply as `succeeded`.
         prepared = await conversations_service.prepare_generation(
             session_factory,
-            persona_provider=persona_provider,
             memory_provider=gated_provider,
             owner_id=user_id,
             agent_id=agent_id,
@@ -1098,7 +1083,6 @@ async def test_review_regressions_reconcile_budget_confirmed_clear_requeue_and_a
     mem_ai_logger.addHandler(log_handler)
     mem_ai_logger.setLevel(logging.INFO)
     try:
-        persona_provider = LocalPersonaProvider(session_factory=session_factory)
         model_provider = FakeModelProvider(prefix="ok:")
         user_id, agent_id = await _seed_user_model_and_agent(
             session_factory,
@@ -1134,7 +1118,6 @@ async def test_review_regressions_reconcile_budget_confirmed_clear_requeue_and_a
         )
         chat_res = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=model_provider,
             memory_provider=async_provider,
             owner_id=user_id,
@@ -1183,7 +1166,6 @@ async def test_review_regressions_reconcile_budget_confirmed_clear_requeue_and_a
         clear_provider = _ScriptedMemoryProvider()
         chat_clear = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=model_provider,
             memory_provider=clear_provider,
             owner_id=user_id,

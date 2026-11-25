@@ -8,7 +8,7 @@ from typing import Literal
 
 from mem_ai.contracts.memory_provider import MemoryRecallItem
 from mem_ai.contracts.model_provider import ModelMessage
-from mem_ai.contracts.persona_provider import PersonaSnapshot
+from mem_ai.modules.agents.schemas import PersonaSnapshot
 
 DEFAULT_PLATFORM_RULES = (
     "Follow the assigned persona instructions while prioritizing the user's current message. "

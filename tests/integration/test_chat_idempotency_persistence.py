@@ -35,7 +35,6 @@ from mem_ai.modules.conversations.schemas import (
 )
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
-from mem_ai.modules.personas.provider import LocalPersonaProvider
 from mem_ai.modules.users import service as users_service
 from mem_ai.modules.users.models import User
 
@@ -105,7 +104,6 @@ async def test_same_key_concurrent_implicit_and_existing_conversation_creates_si
 ) -> None:
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
-    persona_provider = LocalPersonaProvider(session_factory=session_factory)
 
     try:
         await _seed_model(session_factory)
@@ -116,7 +114,6 @@ async def test_same_key_concurrent_implicit_and_existing_conversation_creates_si
         r1, r2 = await asyncio.gather(
             conversations_service.prepare_chat_turn(
                 session_factory,
-                persona_provider=persona_provider,
                 owner_id=alice_id,
                 agent_id=agent_id,
                 conversation_id=None,
@@ -125,7 +122,6 @@ async def test_same_key_concurrent_implicit_and_existing_conversation_creates_si
             ),
             conversations_service.prepare_chat_turn(
                 session_factory,
-                persona_provider=persona_provider,
                 owner_id=alice_id,
                 agent_id=agent_id,
                 conversation_id=None,
@@ -176,7 +172,6 @@ async def test_same_key_concurrent_implicit_and_existing_conversation_creates_si
         e1, e2 = await asyncio.gather(
             conversations_service.prepare_chat_turn(
                 session_factory,
-                persona_provider=persona_provider,
                 owner_id=alice_id,
                 agent_id=agent_id,
                 conversation_id=winner.conversation_id,
@@ -185,7 +180,6 @@ async def test_same_key_concurrent_implicit_and_existing_conversation_creates_si
             ),
             conversations_service.prepare_chat_turn(
                 session_factory,
-                persona_provider=persona_provider,
                 owner_id=alice_id,
                 agent_id=agent_id,
                 conversation_id=winner.conversation_id,
@@ -212,7 +206,6 @@ async def test_same_key_concurrent_implicit_and_existing_conversation_creates_si
         results = await asyncio.gather(
             conversations_service.prepare_chat_turn(
                 session_factory,
-                persona_provider=persona_provider,
                 owner_id=alice_id,
                 agent_id=agent_id,
                 conversation_id=winner.conversation_id,
@@ -221,7 +214,6 @@ async def test_same_key_concurrent_implicit_and_existing_conversation_creates_si
             ),
             conversations_service.prepare_chat_turn(
                 session_factory,
-                persona_provider=persona_provider,
                 owner_id=alice_id,
                 agent_id=agent_id,
                 conversation_id=winner.conversation_id,
@@ -249,7 +241,6 @@ async def test_idempotency_finalization_across_success_failure_cancel_and_lease_
 ) -> None:
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
-    persona_provider = LocalPersonaProvider(session_factory=session_factory)
     t0 = datetime(2026, 11, 23, 12, 0, 0, tzinfo=UTC)
 
     try:
@@ -259,7 +250,6 @@ async def test_idempotency_finalization_across_success_failure_cancel_and_lease_
         # 1. Active running record has NULL terminal_at & expires_at and never expires at t0 + 48h.
         p1 = await conversations_service.prepare_chat_turn(
             session_factory,
-            persona_provider=persona_provider,
             owner_id=alice_id,
             agent_id=agent_id,
             conversation_id=None,
@@ -278,7 +268,6 @@ async def test_idempotency_finalization_across_success_failure_cancel_and_lease_
 
         still_running = await conversations_service.prepare_chat_turn(
             session_factory,
-            persona_provider=persona_provider,
             owner_id=alice_id,
             agent_id=agent_id,
             conversation_id=None,
@@ -313,7 +302,6 @@ async def test_idempotency_finalization_across_success_failure_cancel_and_lease_
         #    - t1 + 24h -> treated as new request, replaces idempotency row, keeps old Generation!
         before_expiry = await conversations_service.prepare_chat_turn(
             session_factory,
-            persona_provider=persona_provider,
             owner_id=alice_id,
             agent_id=agent_id,
             conversation_id=None,
@@ -327,7 +315,6 @@ async def test_idempotency_finalization_across_success_failure_cancel_and_lease_
 
         at_expiry = await conversations_service.prepare_chat_turn(
             session_factory,
-            persona_provider=persona_provider,
             owner_id=alice_id,
             agent_id=agent_id,
             conversation_id=None,
@@ -366,7 +353,6 @@ async def test_idempotency_finalization_across_success_failure_cancel_and_lease_
         with pytest.raises(AppError) as cancel_replay:
             await conversations_service.prepare_chat_turn(
                 session_factory,
-                persona_provider=persona_provider,
                 owner_id=alice_id,
                 agent_id=agent_id,
                 conversation_id=None,
@@ -382,7 +368,6 @@ async def test_idempotency_finalization_across_success_failure_cancel_and_lease_
         # 4. Inline expired-lease takeover AND Worker recovery BOTH finalize idempotency_records.
         p_expired_inline = await conversations_service.prepare_chat_turn(
             session_factory,
-            persona_provider=persona_provider,
             owner_id=alice_id,
             agent_id=agent_id,
             conversation_id=p1.conversation_id,
@@ -396,7 +381,6 @@ async def test_idempotency_finalization_across_success_failure_cancel_and_lease_
         t_reclaim = t2 + timedelta(seconds=120)
         p_taker = await conversations_service.prepare_chat_turn(
             session_factory,
-            persona_provider=persona_provider,
             owner_id=alice_id,
             agent_id=agent_id,
             conversation_id=p1.conversation_id,
@@ -408,7 +392,6 @@ async def test_idempotency_finalization_across_success_failure_cancel_and_lease_
         with pytest.raises(AppError) as inline_lost_replay:
             await conversations_service.prepare_chat_turn(
                 session_factory,
-                persona_provider=persona_provider,
                 owner_id=alice_id,
                 agent_id=agent_id,
                 conversation_id=p1.conversation_id,
@@ -446,7 +429,6 @@ async def test_idempotency_cross_user_isolation_check_constraints_and_deleted_re
 ) -> None:
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
-    persona_provider = LocalPersonaProvider(session_factory=session_factory)
     model_provider = _StubModelProvider()
 
     try:
@@ -457,7 +439,6 @@ async def test_idempotency_cross_user_isolation_check_constraints_and_deleted_re
         # Same Idempotency-Key across different users is completely independent.
         alice_res = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=model_provider,
             owner_id=alice_id,
             agent_id=alice_agent,
@@ -467,7 +448,6 @@ async def test_idempotency_cross_user_isolation_check_constraints_and_deleted_re
         )
         bob_res = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=model_provider,
             owner_id=bob_id,
             agent_id=bob_agent,
@@ -526,7 +506,6 @@ async def test_idempotency_cross_user_isolation_check_constraints_and_deleted_re
         with pytest.raises(NotFoundError):
             await conversations_service.run_sync_chat(
                 session_factory,
-                persona_provider=persona_provider,
                 model_provider=model_provider,
                 owner_id=alice_id,
                 agent_id=alice_agent,
@@ -538,7 +517,6 @@ async def test_idempotency_cross_user_isolation_check_constraints_and_deleted_re
         with pytest.raises(ConflictError) as deleting_cont:
             await conversations_service.run_sync_chat(
                 session_factory,
-                persona_provider=persona_provider,
                 model_provider=model_provider,
                 owner_id=alice_id,
                 agent_id=alice_agent,
@@ -570,7 +548,6 @@ async def test_idempotency_cross_user_isolation_check_constraints_and_deleted_re
             with pytest.raises(ForbiddenError) as status_replay:
                 await conversations_service.run_sync_chat(
                     session_factory,
-                    persona_provider=persona_provider,
                     model_provider=model_provider,
                     owner_id=bob_id,
                     agent_id=bob_agent,

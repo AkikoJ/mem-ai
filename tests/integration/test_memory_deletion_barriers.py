@@ -54,7 +54,6 @@ from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
 from mem_ai.modules.operations import service as operations_service
 from mem_ai.modules.operations.audit import JsonlDeletionAuditArchiver
-from mem_ai.modules.personas.provider import LocalPersonaProvider
 from mem_ai.modules.users import service as users_service
 from mem_ai.workers.main import build_worker_registry
 from mem_ai.workers.runner import JobHandlerRegistry, WorkerConfig, WorkerRunner
@@ -330,11 +329,9 @@ async def test_single_delete_tombstone_filters_recall_marks_refs_and_reconciles(
         provider.seed(user_id=alice_id, memory_id="mem_del", content="Alice old address is 123 St")
 
         # 1. Run a chat turn so both memories are recalled and persisted as refs.
-        persona_provider = LocalPersonaProvider(session_factory=session_factory)
         model_provider = FakeModelProvider(prefix="reply:")
         turn1 = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=model_provider,
             memory_provider=provider,
             owner_id=alice_id,
@@ -486,7 +483,6 @@ async def test_clear_barrier_cancels_queued_suppresses_old_generation_and_conver
         user_id, agent_id = await _seed_user_model_and_agent(
             session_factory, subject="alice-clear-race"
         )
-        persona_provider = LocalPersonaProvider(session_factory=session_factory)
         model_provider = FakeModelProvider(prefix="reply:")
         provider = _ControlledMemoryProvider()
         provider.seed(user_id=user_id, memory_id="mem_initial", content="Initial epoch-0 memory")
@@ -494,7 +490,6 @@ async def test_clear_barrier_cancels_queued_suppresses_old_generation_and_conver
         # 1. Completed turn #1 enqueues a queued (pending) epoch-0 turn write job.
         await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=model_provider,
             memory_provider=provider,
             owner_id=user_id,
@@ -505,7 +500,6 @@ async def test_clear_barrier_cancels_queued_suppresses_old_generation_and_conver
         # 2. Completed turn #2 will be claimed & gated mid-flight inside Worker!
         turn2 = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=model_provider,
             memory_provider=provider,
             owner_id=user_id,
@@ -516,7 +510,6 @@ async def test_clear_barrier_cancels_queued_suppresses_old_generation_and_conver
         # 3. Old sync AND stream generations start at epoch 0 BEFORE clear, finish AFTER clear!
         old_gen = await conversations_service.prepare_generation(
             session_factory,
-            persona_provider=persona_provider,
             memory_provider=provider,
             owner_id=user_id,
             agent_id=agent_id,
@@ -526,7 +519,6 @@ async def test_clear_barrier_cancels_queued_suppresses_old_generation_and_conver
         assert old_gen.memory_epoch == 0
         old_stream_gen = await conversations_service.prepare_generation(
             session_factory,
-            persona_provider=persona_provider,
             memory_provider=provider,
             owner_id=user_id,
             agent_id=agent_id,
@@ -646,7 +638,6 @@ async def test_clear_barrier_cancels_queued_suppresses_old_generation_and_conver
         # - New chat during barrier succeeds (degraded recall) AND suppresses new turn write!
         during_barrier_chat = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=model_provider,
             memory_provider=provider,
             owner_id=user_id,

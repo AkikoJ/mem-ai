@@ -29,7 +29,6 @@ from mem_ai.modules.conversations.models import Generation
 from tests.conftest import (
     FakeMemoryProvider,
     FakeModelProvider,
-    FakePersonaProvider,
     parse_sse_text,
 )
 
@@ -385,7 +384,6 @@ async def test_allowed_hosts_cors_trusted_proxy_request_id_and_forged_headers() 
         providers=ProviderRegistry(
             model_provider=FakeModelProvider(),
             memory_provider=FakeMemoryProvider(),
-            persona_provider=FakePersonaProvider(),
         ),
     )
 

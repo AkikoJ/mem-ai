@@ -8,19 +8,15 @@ import pytest
 
 from mem_ai.contracts.memory_provider import MemoryProvider, MemoryRecallQuery, MemoryWriteInput
 from mem_ai.contracts.model_provider import ModelMessage, ModelProvider, ModelRequest
-from mem_ai.contracts.persona_provider import PersonaProvider
-from tests.conftest import FakeMemoryProvider, FakeModelProvider, FakePersonaProvider
+from tests.conftest import FakeMemoryProvider, FakeModelProvider
 
 
 @pytest.mark.anyio
 async def test_provider_protocols_accept_typed_implementations() -> None:
     model_provider: ModelProvider = FakeModelProvider(prefix="echo:")
     memory_provider: MemoryProvider = FakeMemoryProvider()
-    persona_provider: PersonaProvider = FakePersonaProvider()
-
     assert isinstance(model_provider, ModelProvider)
     assert isinstance(memory_provider, MemoryProvider)
-    assert isinstance(persona_provider, PersonaProvider)
 
     response = await model_provider.generate(
         ModelRequest(
@@ -59,7 +55,3 @@ async def test_provider_protocols_accept_typed_implementations() -> None:
         MemoryRecallQuery(user_id=user_id, query="style", scope="user", limit=5)
     )
     assert recalled[0].memory_id == created.memory_id
-
-    persona = await persona_provider.get_latest_published(owner_id=user_id, agent_id=uuid4())
-    assert persona is not None
-    assert persona.memory_policy.write_scope == "user"

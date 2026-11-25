@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
 from pathlib import Path
-from uuid import UUID, uuid4
 
 import pytest
 
-from mem_ai.contracts.persona_provider import MemoryPolicy, PersonaSnapshot
 from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import (
     ConflictError,
@@ -18,6 +15,8 @@ from mem_ai.core.exceptions import (
     UnprocessableEntityError,
 )
 from mem_ai.db.engine import create_async_engine_from_settings, create_session_factory
+from mem_ai.modules.agents import service as agents_service
+from mem_ai.modules.agents.schemas import AgentCreateRequest
 from mem_ai.modules.conversations import generation as generation_store
 from mem_ai.modules.conversations import service as conversations_service
 from mem_ai.modules.conversations.service import ChatOptions
@@ -369,48 +368,24 @@ async def test_model_routing_precedence_permissions_capabilities_and_shared_stre
             issuer="https://test.mem-ai.local",
             subject="alice-stream-cap",
         )
-        agent_id = uuid4()
-        snapshot = PersonaSnapshot(
-            agent_id=agent_id,
-            version_id=uuid4(),
-            version=1,
-            system_prompt="Batch only persona",
-            behavior_rules=(),
-            default_model_id="model-batch",
-            memory_policy=MemoryPolicy(),
-            published_at=datetime.now(UTC),
+        agent = await agents_service.create_agent(
+            session_factory,
+            owner_id=alice.id,
+            data=AgentCreateRequest(
+                name="Batch Agent",
+                systemPrompt="Batch only persona",
+                defaultModelId="model-batch",
+            ),
         )
-
-        class _SinglePersonaProvider:
-            async def get_latest_published(
-                self,
-                *,
-                owner_id: UUID,
-                agent_id: UUID,
-            ) -> PersonaSnapshot | None:
-                return snapshot if owner_id == alice.id and agent_id == snapshot.agent_id else None
-
-            async def get_version(
-                self,
-                *,
-                owner_id: UUID,
-                agent_id: UUID,
-                version_id: UUID,
-            ) -> PersonaSnapshot | None:
-                if (
-                    owner_id == alice.id
-                    and agent_id == snapshot.agent_id
-                    and version_id == snapshot.version_id
-                ):
-                    return snapshot
-                return None
+        await agents_service.publish_agent(
+            session_factory, owner_id=alice.id, agent_id=agent.agent_id
+        )
 
         with pytest.raises(UnprocessableEntityError) as prep_err:
             await conversations_service.prepare_generation(
                 session_factory,
-                persona_provider=_SinglePersonaProvider(),
                 owner_id=alice.id,
-                agent_id=agent_id,
+                agent_id=agent.agent_id,
                 conversation_id=None,
                 user_message="Try streaming on batch model",
                 options=ChatOptions(
@@ -423,9 +398,8 @@ async def test_model_routing_precedence_permissions_capabilities_and_shared_stre
         # Confirm zero conversations/messages were created on pre-call rejection.
         prepared_sync = await conversations_service.prepare_generation(
             session_factory,
-            persona_provider=_SinglePersonaProvider(),
             owner_id=alice.id,
-            agent_id=agent_id,
+            agent_id=agent.agent_id,
             conversation_id=None,
             user_message="Sync works on batch model",
             options=ChatOptions(

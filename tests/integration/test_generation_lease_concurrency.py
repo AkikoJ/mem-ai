@@ -27,7 +27,6 @@ from mem_ai.modules.conversations.models import Conversation, Generation, Messag
 from mem_ai.modules.conversations.service import ChatOptions
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
-from mem_ai.modules.personas.provider import LocalPersonaProvider
 from mem_ai.modules.users import service as users_service
 
 
@@ -113,8 +112,6 @@ async def test_concurrent_same_conversation_conflicts_while_different_conversati
     engine_competing = create_async_engine_from_settings(migrated_pg_settings)
     sf_primary = create_session_factory(engine_primary)
     sf_competing = create_session_factory(engine_competing)
-    persona_primary = LocalPersonaProvider(session_factory=sf_primary)
-    persona_competing = LocalPersonaProvider(session_factory=sf_competing)
 
     try:
         alice_id, agent_id = await _seed_user_model_and_agent(
@@ -126,7 +123,6 @@ async def test_concurrent_same_conversation_conflicts_while_different_conversati
         # Seed conversation A and conversation B.
         conv_a_seed = await conversations_service.run_sync_chat(
             sf_primary,
-            persona_provider=persona_primary,
             model_provider=provider,
             owner_id=alice_id,
             agent_id=agent_id,
@@ -135,7 +131,6 @@ async def test_concurrent_same_conversation_conflicts_while_different_conversati
         )
         conv_b_seed = await conversations_service.run_sync_chat(
             sf_primary,
-            persona_provider=persona_primary,
             model_provider=provider,
             owner_id=alice_id,
             agent_id=agent_id,
@@ -147,7 +142,6 @@ async def test_concurrent_same_conversation_conflicts_while_different_conversati
         paused_task = asyncio.create_task(
             conversations_service.run_sync_chat(
                 sf_primary,
-                persona_provider=persona_primary,
                 model_provider=provider,
                 owner_id=alice_id,
                 agent_id=agent_id,
@@ -163,7 +157,6 @@ async def test_concurrent_same_conversation_conflicts_while_different_conversati
         with pytest.raises(ConflictError) as conflict_exc:
             await conversations_service.run_sync_chat(
                 sf_competing,
-                persona_provider=persona_competing,
                 model_provider=provider,
                 owner_id=alice_id,
                 agent_id=agent_id,
@@ -187,7 +180,6 @@ async def test_concurrent_same_conversation_conflicts_while_different_conversati
         # Meanwhile, a different conversation completes in parallel without waiting for conv A.
         conv_b_turn2 = await conversations_service.run_sync_chat(
             sf_competing,
-            persona_provider=persona_competing,
             model_provider=provider,
             owner_id=alice_id,
             agent_id=agent_id,
@@ -213,7 +205,6 @@ async def test_concurrent_same_conversation_conflicts_while_different_conversati
 
         conv_a_turn3 = await conversations_service.run_sync_chat(
             sf_competing,
-            persona_provider=persona_competing,
             model_provider=provider,
             owner_id=alice_id,
             agent_id=agent_id,
@@ -233,13 +224,14 @@ async def test_lease_renewal_commit_and_failure_enforce_token_expiry_user_and_co
 ) -> None:
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
-    persona_provider = LocalPersonaProvider(session_factory=session_factory)
     try:
         alice_id, agent_id = await _seed_user_model_and_agent(
             session_factory,
             subject="alice-lease-guards",
         )
-        persona = await persona_provider.get_latest_published(owner_id=alice_id, agent_id=agent_id)
+        persona = await agents_service.get_latest_published_version_for_owner(
+            session_factory, owner_id=alice_id, agent_id=agent_id
+        )
         assert persona is not None
 
         t0 = datetime(2026, 11, 22, 12, 0, 0, tzinfo=UTC)
@@ -466,13 +458,14 @@ async def test_expired_lease_inline_takeover_and_worker_fallback_recovery(
 ) -> None:
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
-    persona_provider = LocalPersonaProvider(session_factory=session_factory)
     try:
         alice_id, agent_id = await _seed_user_model_and_agent(
             session_factory,
             subject="alice-lease-recovery",
         )
-        persona = await persona_provider.get_latest_published(owner_id=alice_id, agent_id=agent_id)
+        persona = await agents_service.get_latest_published_version_for_owner(
+            session_factory, owner_id=alice_id, agent_id=agent_id
+        )
         assert persona is not None
 
         t0 = datetime(2026, 11, 22, 13, 0, 0, tzinfo=UTC)
@@ -620,7 +613,6 @@ async def test_lease_renewal_heartbeat_keeps_slow_generation_alive_and_handles_r
 ) -> None:
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
-    persona_provider = LocalPersonaProvider(session_factory=session_factory)
     try:
         alice_id, agent_id = await _seed_user_model_and_agent(
             session_factory,
@@ -638,7 +630,6 @@ async def test_lease_renewal_heartbeat_keeps_slow_generation_alive_and_handles_r
         # Seed conversation.
         seed = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=provider,
             owner_id=alice_id,
             agent_id=agent_id,
@@ -655,7 +646,6 @@ async def test_lease_renewal_heartbeat_keeps_slow_generation_alive_and_handles_r
         slow_task = asyncio.create_task(
             conversations_service.run_sync_chat(
                 session_factory,
-                persona_provider=persona_provider,
                 model_provider=provider,
                 owner_id=alice_id,
                 agent_id=agent_id,
@@ -673,7 +663,6 @@ async def test_lease_renewal_heartbeat_keeps_slow_generation_alive_and_handles_r
         with pytest.raises(ConflictError) as still_locked:
             await conversations_service.run_sync_chat(
                 session_factory,
-                persona_provider=persona_provider,
                 model_provider=provider,
                 owner_id=alice_id,
                 agent_id=agent_id,
@@ -706,7 +695,6 @@ async def test_lease_renewal_heartbeat_keeps_slow_generation_alive_and_handles_r
         stale_task = asyncio.create_task(
             conversations_service.run_sync_chat(
                 session_factory,
-                persona_provider=persona_provider,
                 model_provider=provider,
                 owner_id=alice_id,
                 agent_id=agent_id,
@@ -726,7 +714,6 @@ async def test_lease_renewal_heartbeat_keeps_slow_generation_alive_and_handles_r
         # New turn reclaims expired lease immediately and commits.
         fresh_result = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=provider,
             owner_id=alice_id,
             agent_id=agent_id,
@@ -759,7 +746,6 @@ async def test_lease_renewal_heartbeat_keeps_slow_generation_alive_and_handles_r
         midflight_task = asyncio.create_task(
             conversations_service.run_sync_chat(
                 session_factory,
-                persona_provider=persona_provider,
                 model_provider=provider,
                 owner_id=alice_id,
                 agent_id=agent_id,
@@ -805,7 +791,6 @@ async def test_lease_renewal_heartbeat_keeps_slow_generation_alive_and_handles_r
         deleting_task = asyncio.create_task(
             conversations_service.run_sync_chat(
                 session_factory,
-                persona_provider=persona_provider,
                 model_provider=provider,
                 owner_id=alice_id,
                 agent_id=agent_id,

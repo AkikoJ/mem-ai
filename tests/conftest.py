@@ -39,7 +39,6 @@ from mem_ai.contracts.model_provider import (
     ModelStreamChunk,
     ModelUsage,
 )
-from mem_ai.contracts.persona_provider import MemoryPolicy, PersonaSnapshot
 from mem_ai.core.config import Settings
 from mem_ai.db.engine import create_sync_engine_from_settings
 from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
@@ -233,50 +232,6 @@ class FakeMemoryProvider:
         return MemoryOperationStatus(status="succeeded", external_ref=external_ref)
 
 
-class FakePersonaProvider:
-    """Controlled in-memory PersonaProvider double for deterministic tests."""
-
-    def __init__(self) -> None:
-        self.snapshots: dict[tuple[UUID, UUID], PersonaSnapshot] = {}
-
-    def register(self, *, owner_id: UUID, snapshot: PersonaSnapshot) -> None:
-        self.snapshots[(owner_id, snapshot.agent_id)] = snapshot
-
-    async def get_latest_published(
-        self,
-        *,
-        owner_id: UUID,
-        agent_id: UUID,
-    ) -> PersonaSnapshot | None:
-        existing = self.snapshots.get((owner_id, agent_id))
-        if existing is not None:
-            return existing
-        return PersonaSnapshot(
-            agent_id=agent_id,
-            version_id=uuid4(),
-            version=1,
-            system_prompt="You are a helpful test assistant.",
-            behavior_rules=("Be concise",),
-            tone="neutral",
-            language="en",
-            default_model_id="test-model",
-            memory_policy=MemoryPolicy(),
-            published_at=datetime.now(UTC),
-        )
-
-    async def get_version(
-        self,
-        *,
-        owner_id: UUID,
-        agent_id: UUID,
-        version_id: UUID,
-    ) -> PersonaSnapshot | None:
-        existing = self.snapshots.get((owner_id, agent_id))
-        if existing is not None and existing.version_id == version_id:
-            return existing
-        return None
-
-
 def make_alembic_config(settings: Settings) -> Config:
     """Build an Alembic Config pointing at an isolated test database."""
     config = Config("alembic.ini")
@@ -300,7 +255,15 @@ def empty_pg_settings() -> Iterator[Settings]:
     try:
         with admin_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
             conn.execute(text(f'CREATE DATABASE "{test_db}"'))
-        yield base_settings.model_copy(update={"app_env": "test", "postgres_db": test_db})
+        yield Settings(
+            _env_file=None,
+            app_env="test",
+            postgres_host=base_settings.postgres_host,
+            postgres_port=base_settings.postgres_port,
+            postgres_user=base_settings.postgres_user,
+            postgres_password=base_settings.postgres_password,
+            postgres_db=test_db,
+        )
     finally:
         with admin_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
             conn.execute(text(f'DROP DATABASE IF EXISTS "{test_db}" WITH (FORCE)'))
@@ -378,16 +341,10 @@ def fake_memory_provider() -> FakeMemoryProvider:
 
 
 @pytest.fixture
-def fake_persona_provider() -> FakePersonaProvider:
-    return FakePersonaProvider()
-
-
-@pytest.fixture
 def app(
     migrated_pg_settings: Settings,
     fake_model_provider: FakeModelProvider,
     fake_memory_provider: FakeMemoryProvider,
-    fake_persona_provider: FakePersonaProvider,
 ) -> FastAPI:
     """Construct a FastAPI app wired with isolated PostgreSQL and controlled providers."""
     return create_app(
@@ -395,7 +352,6 @@ def app(
         providers=ProviderRegistry(
             model_provider=fake_model_provider,
             memory_provider=fake_memory_provider,
-            persona_provider=fake_persona_provider,
         ),
     )
 

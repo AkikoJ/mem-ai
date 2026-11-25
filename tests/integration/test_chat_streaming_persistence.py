@@ -38,7 +38,6 @@ from mem_ai.modules.conversations.service import ChatOptions
 from mem_ai.modules.jobs.models import Job
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
-from mem_ai.modules.personas.provider import LocalPersonaProvider
 from mem_ai.modules.users import service as users_service
 from tests.conftest import FakeMemoryProvider, parse_sse_text
 
@@ -72,7 +71,7 @@ class _ScriptedStreamingModelProvider:
 
 async def _seed_user_agent_and_model(
     session_factory: Any,
-) -> tuple[Any, Any, LocalPersonaProvider]:
+) -> tuple[Any, Any]:
     user = await users_service.resolve_or_create_user(
         session_factory,
         issuer="https://test.mem-ai.local",
@@ -103,7 +102,7 @@ async def _seed_user_agent_and_model(
     published = await agents_service.publish_agent(
         session_factory, owner_id=user.id, agent_id=created.agent_id
     )
-    return user, published, LocalPersonaProvider(session_factory=session_factory)
+    return user, published
 
 
 @pytest.mark.integration
@@ -117,12 +116,11 @@ async def test_stream_shared_lifecycle_atomic_commit_and_commit_failure_rollback
     model_provider = _ScriptedStreamingModelProvider(["Hello ", "world!"])
 
     try:
-        user, agent, persona_provider = await _seed_user_agent_and_model(session_factory)
+        user, agent = await _seed_user_agent_and_model(session_factory)
 
         # 1. Successful streaming turn commits reply + succeeded + idempotency + memory job.
         prepared1 = await conversations_service.prepare_chat_turn(
             session_factory,
-            persona_provider=persona_provider,
             memory_provider=memory_provider,
             owner_id=user.id,
             agent_id=agent.agent_id,
@@ -193,7 +191,6 @@ async def test_stream_shared_lifecycle_atomic_commit_and_commit_failure_rollback
 
         prepared2 = await conversations_service.prepare_chat_turn(
             session_factory,
-            persona_provider=persona_provider,
             memory_provider=memory_provider,
             owner_id=user.id,
             agent_id=agent.agent_id,
@@ -254,7 +251,6 @@ async def test_stream_shared_lifecycle_atomic_commit_and_commit_failure_rollback
         # 3. Subsequent sync turn shares history rules: failed streaming user input is filtered out.
         sync_turn3 = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=model_provider,
             memory_provider=memory_provider,
             owner_id=user.id,
@@ -283,12 +279,11 @@ async def test_stream_commit_vs_cancel_race_produces_single_terminal_state(
     memory_provider = FakeMemoryProvider()
 
     try:
-        user, agent, persona_provider = await _seed_user_agent_and_model(session_factory)
+        user, agent = await _seed_user_agent_and_model(session_factory)
 
         # Case A: Commit enters Tx 2 first; concurrent cancel waits on row lock and loses.
         prepared_a = await conversations_service.prepare_chat_turn(
             session_factory,
-            persona_provider=persona_provider,
             memory_provider=memory_provider,
             owner_id=user.id,
             agent_id=agent.agent_id,
@@ -362,7 +357,6 @@ async def test_stream_commit_vs_cancel_race_produces_single_terminal_state(
         # Case B: Cancel commits first; subsequent Tx 2 commit raises ConflictError & rolls back.
         prepared_b = await conversations_service.prepare_chat_turn(
             session_factory,
-            persona_provider=persona_provider,
             memory_provider=memory_provider,
             owner_id=user.id,
             agent_id=agent.agent_id,
@@ -436,13 +430,12 @@ async def test_stream_expired_lease_recovery_via_worker_and_inline_takeover(
     session_factory = create_session_factory(engine)
 
     try:
-        user, agent, persona_provider = await _seed_user_agent_and_model(session_factory)
+        user, agent = await _seed_user_agent_and_model(session_factory)
         t0 = datetime(2026, 11, 23, 12, 0, 0, tzinfo=UTC)
 
         # 1. Worker fallback recovery converges orphaned streaming generation to queryable failed.
         crashed_stream = await conversations_service.prepare_chat_turn(
             session_factory,
-            persona_provider=persona_provider,
             owner_id=user.id,
             agent_id=agent.agent_id,
             conversation_id=None,
@@ -476,7 +469,6 @@ async def test_stream_expired_lease_recovery_via_worker_and_inline_takeover(
         # 2. Inline takeover when a new streaming turn arrives after an expired lease.
         stale_stream = await conversations_service.prepare_chat_turn(
             session_factory,
-            persona_provider=persona_provider,
             owner_id=user.id,
             agent_id=agent.agent_id,
             conversation_id=crashed_stream.conversation_id,
@@ -491,7 +483,6 @@ async def test_stream_expired_lease_recovery_via_worker_and_inline_takeover(
 
         takeover_stream = await conversations_service.prepare_chat_turn(
             session_factory,
-            persona_provider=persona_provider,
             owner_id=user.id,
             agent_id=agent.agent_id,
             conversation_id=crashed_stream.conversation_id,
@@ -528,10 +519,9 @@ async def test_stream_late_disconnect_after_tx2_commit_preserves_succeeded(
     model_provider = _ScriptedStreamingModelProvider(["Done ", "reply"])
 
     try:
-        user, agent, persona_provider = await _seed_user_agent_and_model(session_factory)
+        user, agent = await _seed_user_agent_and_model(session_factory)
         prepared = await conversations_service.prepare_chat_turn(
             session_factory,
-            persona_provider=persona_provider,
             memory_provider=memory_provider,
             owner_id=user.id,
             agent_id=agent.agent_id,
@@ -605,14 +595,13 @@ async def test_stream_mid_flight_lease_loss_isolates_stale_executor_and_respects
                 self.upstream_closed.set()
 
     try:
-        user, agent, persona_provider = await _seed_user_agent_and_model(session_factory)
+        user, agent = await _seed_user_agent_and_model(session_factory)
 
         # Case 1: Lease expires AND Worker recovers it to `failed` -> stale stream cancels
         # upstream and emits `conversation.failed(code="generation_lease_lost")`.
         provider1 = _SlowStreamingProvider()
         prepared1 = await conversations_service.prepare_chat_turn(
             session_factory,
-            persona_provider=persona_provider,
             owner_id=user.id,
             agent_id=agent.agent_id,
             conversation_id=None,
@@ -666,7 +655,6 @@ async def test_stream_mid_flight_lease_loss_isolates_stale_executor_and_respects
         provider2 = _SlowStreamingProvider()
         prepared2 = await conversations_service.prepare_chat_turn(
             session_factory,
-            persona_provider=persona_provider,
             owner_id=user.id,
             agent_id=agent.agent_id,
             conversation_id=None,

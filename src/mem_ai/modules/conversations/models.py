@@ -56,7 +56,7 @@ class Conversation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("users.id", ondelete="RESTRICT"),
         nullable=False,
     )
-    # Logical references so PersonaProvider can be swapped to a remote service without DB coupling.
+    # Logical references keep conversations independent of Agent persistence details.
     agent_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
     persona_version_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
     persona_version_number: Mapped[int] = mapped_column(Integer, nullable=False)

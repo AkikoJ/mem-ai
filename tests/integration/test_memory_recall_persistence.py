@@ -45,7 +45,6 @@ from mem_ai.modules.conversations.service import ChatOptions
 from mem_ai.modules.memories.models import MemoryScopeState
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
-from mem_ai.modules.personas.provider import LocalPersonaProvider
 from mem_ai.modules.users import service as users_service
 
 
@@ -171,7 +170,6 @@ async def test_recalled_memory_table_stores_metadata_only_and_enforces_uniquenes
 ) -> None:
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
-    persona_provider = LocalPersonaProvider(session_factory=session_factory)
     try:
         # Verify schema has strictly metadata columns (NO content/text column).
         async with engine.connect() as conn:
@@ -221,7 +219,6 @@ async def test_recalled_memory_table_stores_metadata_only_and_enforces_uniquenes
         recall_provider = _ScriptedRecallProvider()
         prepared = await conversations_service.prepare_generation(
             session_factory,
-            persona_provider=persona_provider,
             memory_provider=recall_provider,
             owner_id=alice_id,
             agent_id=agent_id,
@@ -288,7 +285,6 @@ async def test_prepare_context_persists_only_injected_refs_and_handles_degraded_
 ) -> None:
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
-    persona_provider = LocalPersonaProvider(session_factory=session_factory)
     try:
         alice_id, agent_id = await _seed_user_model_and_agent(
             session_factory,
@@ -301,7 +297,6 @@ async def test_prepare_context_persists_only_injected_refs_and_handles_degraded_
         # First turn establishes conversation_id; empty recall writes 0 reference rows.
         turn1 = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=model_provider,
             memory_provider=recall_provider,
             owner_id=alice_id,
@@ -365,7 +360,6 @@ async def test_prepare_context_persists_only_injected_refs_and_handles_degraded_
 
         turn2 = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=model_provider,
             memory_provider=recall_provider,
             owner_id=alice_id,
@@ -406,7 +400,6 @@ async def test_prepare_context_persists_only_injected_refs_and_handles_degraded_
         )
         turn3 = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=model_provider,
             memory_provider=recall_provider,
             owner_id=alice_id,
@@ -440,7 +433,6 @@ async def test_persist_recalled_memories_enforces_lease_midflight_barrier_and_to
 ) -> None:
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
-    persona_provider = LocalPersonaProvider(session_factory=session_factory)
     try:
         alice_id, agent_id = await _seed_user_model_and_agent(
             session_factory,
@@ -497,7 +489,6 @@ async def test_persist_recalled_memories_enforces_lease_midflight_barrier_and_to
 
         prepared_tomb = await conversations_service.prepare_generation(
             session_factory,
-            persona_provider=persona_provider,
             memory_provider=recall_provider,
             owner_id=alice_id,
             agent_id=agent_id,
@@ -557,7 +548,6 @@ async def test_persist_recalled_memories_enforces_lease_midflight_barrier_and_to
         recall_provider.on_recall = _flip_barrier_midflight
         prepared_barrier = await conversations_service.prepare_generation(
             session_factory,
-            persona_provider=persona_provider,
             memory_provider=recall_provider,
             owner_id=alice_id,
             agent_id=agent_id,

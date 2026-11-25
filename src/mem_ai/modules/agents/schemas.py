@@ -8,9 +8,42 @@ from uuid import UUID
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
-from mem_ai.contracts.persona_provider import MemoryPolicy, MemoryWriteScope
+MemoryWriteScope = Literal["user", "conversation"]
 
 AgentStatus = Literal["active", "retired"]
+
+
+class MemoryPolicy(BaseModel):
+    """Memory recall and write rules pinned to a published persona version."""
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = True
+    write_enabled: bool = True
+    write_scope: MemoryWriteScope = "user"
+    recall_limit: int = Field(default=5, ge=0, le=50)
+
+
+class _PersonaVersionBase(BaseModel):
+    """Shared immutable persona fields carried by version DTOs and published snapshots."""
+
+    model_config = ConfigDict(from_attributes=True, frozen=True, populate_by_name=True)
+
+    version_id: UUID = Field(validation_alias="id")
+    agent_id: UUID
+    version: int = Field(ge=1)
+    system_prompt: str
+    behavior_rules: tuple[str, ...] = ()
+    tone: str | None = None
+    language: str | None = None
+    default_model_id: str | None = None
+    memory_policy: MemoryPolicy = Field(default_factory=MemoryPolicy)
+
+
+class PersonaSnapshot(_PersonaVersionBase):
+    """Immutable published persona version resolved outside DB write transactions."""
+
+    published_at: datetime
 
 
 def _strip_required_text(value: str, *, field_name: str, max_length: int) -> str:
@@ -162,20 +195,9 @@ class AgentDraftRecord(BaseModel):
     memory_policy: MemoryPolicy = Field(default_factory=MemoryPolicy)
 
 
-class PersonaVersionRecord(BaseModel):
+class PersonaVersionRecord(_PersonaVersionBase):
     """Immutable application-layer DTO for a persisted `persona_versions` row."""
 
-    model_config = ConfigDict(from_attributes=True, frozen=True)
-
-    version_id: UUID = Field(validation_alias="id")
-    agent_id: UUID
-    version: int = Field(ge=1)
-    system_prompt: str
-    behavior_rules: tuple[str, ...] = ()
-    tone: str | None = None
-    language: str | None = None
-    default_model_id: str | None = None
-    memory_policy: MemoryPolicy = Field(default_factory=MemoryPolicy)
     published_at: datetime | None = None
     created_at: datetime
 

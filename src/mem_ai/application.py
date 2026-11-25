@@ -44,7 +44,6 @@ from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.adapters.openai_compatible import OpenAICompatibleModelProvider
 from mem_ai.modules.models.schemas import ModelConfigSeed
 from mem_ai.modules.operations.audit import build_deletion_audit_archiver
-from mem_ai.modules.personas.provider import LocalPersonaProvider
 
 _OFFLINE_DOCS_STATIC_DIR = Path(fastapi_offline.__file__).resolve().parent / "static"
 _OFFLINE_DOCS_STATIC_PREFIX = "/static/docs"
@@ -175,15 +174,9 @@ def create_app(
                 snapshot_ttl_seconds=resolved_settings.memory_list_snapshot_ttl_seconds,
             )
 
-        resolved_persona_provider = (
-            base_providers.persona_provider
-            if base_providers.persona_provider is not None
-            else LocalPersonaProvider(session_factory=session_factory)
-        )
         app.state.providers = ProviderRegistry(
             model_provider=resolved_model_provider,
             memory_provider=resolved_memory_provider,
-            persona_provider=resolved_persona_provider,
         )
         app.state.ready = True
 

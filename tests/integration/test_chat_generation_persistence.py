@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,7 +14,6 @@ from mem_ai.contracts.model_provider import (
     ModelStreamChunk,
     ModelUsage,
 )
-from mem_ai.contracts.persona_provider import MemoryPolicy, PersonaSnapshot
 from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import (
     BadGatewayError,
@@ -32,7 +30,6 @@ from mem_ai.modules.conversations import service as conversations_service
 from mem_ai.modules.conversations.schemas import GenerationRecord, MessageRecord
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
-from mem_ai.modules.personas.provider import LocalPersonaProvider
 from mem_ai.modules.users import service as users_service
 
 
@@ -61,7 +58,6 @@ async def test_sync_chat_commits_user_message_before_model_and_filters_failed_tu
 ) -> None:
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
-    persona_provider = LocalPersonaProvider(session_factory=session_factory)
     try:
         alice = await users_service.resolve_or_create_user(
             session_factory,
@@ -131,7 +127,6 @@ async def test_sync_chat_commits_user_message_before_model_and_filters_failed_tu
         # Prepare Turn 1 through shared preparation entry to inspect exact IDs mid-flight.
         prepared_turn1 = await conversations_service.prepare_generation(
             session_factory,
-            persona_provider=persona_provider,
             owner_id=alice.id,
             agent_id=agent.agent_id,
             conversation_id=None,
@@ -194,7 +189,6 @@ async def test_sync_chat_commits_user_message_before_model_and_filters_failed_tu
         with pytest.raises(GatewayTimeoutError) as timeout_exc:
             await conversations_service.run_sync_chat(
                 session_factory,
-                persona_provider=persona_provider,
                 model_provider=_InspectingModelProvider(on_generate=timeout_model),
                 owner_id=alice.id,
                 agent_id=agent.agent_id,
@@ -206,7 +200,6 @@ async def test_sync_chat_commits_user_message_before_model_and_filters_failed_tu
         # Turn 3: cancelled generation -> user message retained, must also be filtered out.
         prepared_cancelled = await conversations_service.prepare_generation(
             session_factory,
-            persona_provider=persona_provider,
             owner_id=alice.id,
             agent_id=agent.agent_id,
             conversation_id=prepared_turn1.conversation_id,
@@ -239,7 +232,6 @@ async def test_sync_chat_commits_user_message_before_model_and_filters_failed_tu
         provider4 = _InspectingModelProvider(on_generate=turn4_model)
         committed_turn4 = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=provider4,
             owner_id=alice.id,
             agent_id=agent.agent_id,
@@ -299,52 +291,23 @@ async def test_commit_failure_rolls_back_assistant_reply_atomically_and_converge
             ],
         )
 
-        # Use an in-memory PersonaProvider to prove Conversation Core does not couple to local DB
-        # tables for persona lookup and resolves PersonaSnapshot strictly outside DB write tx.
-        agent_id = uuid4()
-        version_id = uuid4()
-        snapshot = PersonaSnapshot(
-            agent_id=agent_id,
-            version_id=version_id,
-            version=1,
-            system_prompt="Remote persona prompt",
-            behavior_rules=(),
-            default_model_id="gpt-4o-mini",
-            memory_policy=MemoryPolicy(),
-            published_at=datetime.now(UTC),
+        agent = await agents_service.create_agent(
+            session_factory,
+            owner_id=alice.id,
+            data=AgentCreateRequest(
+                name="Atomic Agent",
+                systemPrompt="Remote persona prompt",
+                defaultModelId="gpt-4o-mini",
+            ),
         )
-
-        class _StaticPersonaProvider:
-            async def get_latest_published(
-                self,
-                *,
-                owner_id: UUID,
-                agent_id: UUID,
-            ) -> PersonaSnapshot | None:
-                if owner_id == alice.id and agent_id == snapshot.agent_id:
-                    return snapshot
-                return None
-
-            async def get_version(
-                self,
-                *,
-                owner_id: UUID,
-                agent_id: UUID,
-                version_id: UUID,
-            ) -> PersonaSnapshot | None:
-                if (
-                    owner_id == alice.id
-                    and agent_id == snapshot.agent_id
-                    and version_id == snapshot.version_id
-                ):
-                    return snapshot
-                return None
+        await agents_service.publish_agent(
+            session_factory, owner_id=alice.id, agent_id=agent.agent_id
+        )
 
         prepared = await conversations_service.prepare_generation(
             session_factory,
-            persona_provider=_StaticPersonaProvider(),
             owner_id=alice.id,
-            agent_id=agent_id,
+            agent_id=agent.agent_id,
             conversation_id=None,
             user_message="Trigger commit rollback",
             requested_model_id=None,
@@ -422,7 +385,6 @@ async def test_unavailable_default_model_and_upstream_error_paths(
 ) -> None:
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
-    persona_provider = LocalPersonaProvider(session_factory=session_factory)
     try:
         alice = await users_service.resolve_or_create_user(
             session_factory,
@@ -482,7 +444,6 @@ async def test_unavailable_default_model_and_upstream_error_paths(
         with pytest.raises(ConflictError) as model_err:
             await conversations_service.run_sync_chat(
                 session_factory,
-                persona_provider=persona_provider,
                 model_provider=provider,
                 owner_id=alice.id,
                 agent_id=agent_disabled.agent_id,
@@ -513,7 +474,6 @@ async def test_unavailable_default_model_and_upstream_error_paths(
         with pytest.raises(BadGatewayError) as upstream_err:
             await conversations_service.run_sync_chat(
                 session_factory,
-                persona_provider=persona_provider,
                 model_provider=provider,
                 owner_id=alice.id,
                 agent_id=agent_ok.agent_id,
@@ -536,7 +496,6 @@ async def test_unavailable_default_model_and_upstream_error_paths(
 
         prepared_slow = await conversations_service.prepare_generation(
             session_factory,
-            persona_provider=persona_provider,
             owner_id=alice.id,
             agent_id=agent_ok.agent_id,
             conversation_id=None,

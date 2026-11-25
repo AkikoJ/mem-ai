@@ -9,7 +9,7 @@ import pytest
 
 from mem_ai.contracts.memory_provider import MemoryRecallItem
 from mem_ai.contracts.model_provider import ModelMessage
-from mem_ai.contracts.persona_provider import MemoryPolicy, PersonaSnapshot
+from mem_ai.modules.agents.schemas import MemoryPolicy, PersonaSnapshot
 from mem_ai.modules.conversations.prompt import (
     DEFAULT_PLATFORM_RULES,
     CompiledPrompt,

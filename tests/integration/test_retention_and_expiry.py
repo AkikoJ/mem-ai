@@ -44,7 +44,6 @@ from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
 from mem_ai.modules.operations import service as operations_service
 from mem_ai.modules.operations.models import Operation
-from mem_ai.modules.personas.provider import LocalPersonaProvider
 from mem_ai.modules.retention import service as retention_service
 from mem_ai.modules.retention.schemas import RetentionPolicy
 from mem_ai.modules.retention.service import (
@@ -119,7 +118,6 @@ async def test_idempotency_24h_boundary_late_terminal_running_and_key_reuse(
             session_factory,
             subject="idem-retention-user",
         )
-        persona_provider = LocalPersonaProvider(session_factory=session_factory)
         model_provider = FakeModelProvider(prefix="reply:")
         t0 = datetime(2026, 11, 1, 12, 0, 0, tzinfo=UTC)
 
@@ -132,9 +130,8 @@ async def test_idempotency_24h_boundary_late_terminal_running_and_key_reuse(
             requested_model_id=None,
             retention_seconds=24 * 3600,
         )
-        persona = await persona_provider.get_latest_published(
-            owner_id=user_id,
-            agent_id=agent_id,
+        persona = await agents_service.get_latest_published_version_for_owner(
+            session_factory, owner_id=user_id, agent_id=agent_id
         )
         prep_succ = await generation_store.prepare_generation_phase(
             session_factory,
@@ -343,7 +340,6 @@ async def test_idempotency_24h_boundary_late_terminal_running_and_key_reuse(
         # Reusing the expired key behaves as a brand-new chat request creating a new generation.
         reused = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=model_provider,
             owner_id=user_id,
             agent_id=agent_id,
@@ -842,10 +838,8 @@ async def test_worker_periodic_dedupe_batch_interruption_resume_idempotency_and_
             session_factory,
             subject="worker-retention-user",
         )
-        persona_provider = LocalPersonaProvider(session_factory=session_factory)
-        persona = await persona_provider.get_latest_published(
-            owner_id=user_id,
-            agent_id=agent_id,
+        persona = await agents_service.get_latest_published_version_for_owner(
+            session_factory, owner_id=user_id, agent_id=agent_id
         )
         t0 = datetime(2026, 11, 1, 0, 0, 0, tzinfo=UTC)
 
@@ -1034,13 +1028,11 @@ async def test_explicit_conversation_and_user_deletion_take_precedence_over_long
             session_factory,
             subject="explicit-precedence-user",
         )
-        persona_provider = LocalPersonaProvider(session_factory=session_factory)
         model_provider = FakeModelProvider(prefix="answer:")
         memory_provider = FakeMemoryProvider()
 
         conv_a = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=model_provider,
             owner_id=user_id,
             agent_id=agent_id,
@@ -1050,7 +1042,6 @@ async def test_explicit_conversation_and_user_deletion_take_precedence_over_long
         )
         conv_b = await conversations_service.run_sync_chat(
             session_factory,
-            persona_provider=persona_provider,
             model_provider=model_provider,
             owner_id=user_id,
             agent_id=agent_id,
@@ -1278,10 +1269,8 @@ async def test_budget_capped_worker_retention_yields_reconciling_and_completes_l
             session_factory,
             subject="budget-cap-retention-user",
         )
-        persona_provider = LocalPersonaProvider(session_factory=session_factory)
-        persona = await persona_provider.get_latest_published(
-            owner_id=user_id,
-            agent_id=agent_id,
+        persona = await agents_service.get_latest_published_version_for_owner(
+            session_factory, owner_id=user_id, agent_id=agent_id
         )
         t0 = datetime(2026, 11, 1, 0, 0, 0, tzinfo=UTC)
 

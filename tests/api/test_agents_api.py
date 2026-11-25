@@ -166,13 +166,16 @@ async def test_agent_create_publish_list_detail_patch_and_versions_persist_acros
             assert detail_data["publishedVersion"]["versionId"] == v2_id
             assert detail_data["publishedVersion"]["systemPrompt"] == "Draft prompt v2"
 
-            # Verify default LocalPersonaProvider resolves both v2 (latest) and v1 (pinned).
-            persona_provider = app2.state.providers.persona_provider
-            latest_snap = await persona_provider.get_latest_published(
+            # Verify the public agents read service resolves latest and pinned snapshots.
+            from mem_ai.modules.agents import service as agents_service
+
+            latest_snap = await agents_service.get_latest_published_version_for_owner(
+                app2.state.session_factory,
                 owner_id=UUID(alice_id),
                 agent_id=UUID(agent_id),
             )
-            pinned_v1 = await persona_provider.get_version(
+            pinned_v1 = await agents_service.get_published_persona_version_for_owner(
+                app2.state.session_factory,
                 owner_id=UUID(alice_id),
                 agent_id=UUID(agent_id),
                 version_id=UUID(v1_id),

@@ -28,10 +28,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mem_ai.contracts.memory_provider import MemoryRecallItem
 from mem_ai.contracts.model_provider import ModelUsage
-from mem_ai.contracts.persona_provider import PersonaSnapshot
 from mem_ai.core.exceptions import AppError, ConflictError, ForbiddenError, NotFoundError
 from mem_ai.core.telemetry import current_telemetry
 from mem_ai.db.base import is_unique_violation
+from mem_ai.modules.agents.schemas import PersonaSnapshot
 from mem_ai.modules.conversations import idempotency, queries, repository
 from mem_ai.modules.conversations.models import (
     GENERATION_ACTIVE_CONVERSATION_UNIQUE_INDEX,

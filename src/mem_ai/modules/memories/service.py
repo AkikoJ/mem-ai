@@ -18,7 +18,6 @@ from mem_ai.contracts.memory_provider import (
     MemoryWriteInput,
     MemoryWriteResult,
 )
-from mem_ai.contracts.persona_provider import MemoryPolicy
 from mem_ai.core.exceptions import (
     AppError,
     BadGatewayError,
@@ -28,6 +27,7 @@ from mem_ai.core.exceptions import (
     NotFoundError,
     UnprocessableEntityError,
 )
+from mem_ai.modules.agents.schemas import MemoryPolicy
 from mem_ai.modules.jobs import service as jobs_service
 from mem_ai.modules.jobs.schemas import JobRecord
 from mem_ai.modules.memories import repository

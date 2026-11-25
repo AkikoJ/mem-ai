@@ -1,4 +1,4 @@
-"""User deletion through real PostgreSQL, LocalPersonaProvider, and the shared Worker."""
+"""User deletion through real PostgreSQL and the shared Worker."""
 
 from __future__ import annotations
 
@@ -32,7 +32,6 @@ from mem_ai.modules.memories.snapshots import MemoryListScopeKey, MemorySnapshot
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
 from mem_ai.modules.operations.audit import DeletionAuditEvent
-from mem_ai.modules.personas.provider import LocalPersonaProvider
 from mem_ai.modules.users.cleanup import JOB_TYPE_USER_DELETE, UserCleanupJobHandler
 from mem_ai.workers.main import build_worker_registry
 from mem_ai.workers.runner import JobHandlerRegistry, WorkerConfig, WorkerRunner
@@ -804,7 +803,6 @@ async def test_expired_generation_is_recovered_before_user_cleanup_finishes(
     )
     prepared = await conversations_service.prepare_chat_turn(
         harness.sessions,
-        persona_provider=LocalPersonaProvider(session_factory=harness.sessions),
         owner_id=user_id,
         agent_id=UUID(agent_id),
         conversation_id=None,

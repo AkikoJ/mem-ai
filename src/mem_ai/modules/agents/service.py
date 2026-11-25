@@ -16,7 +16,6 @@ from mem_ai.api.pagination import (
     decode_cursor,
     encode_cursor,
 )
-from mem_ai.contracts.persona_provider import MemoryPolicy
 from mem_ai.core.exceptions import ConflictError, NotFoundError, UnprocessableEntityError
 from mem_ai.db.base import is_unique_violation
 from mem_ai.modules.agents import repository
@@ -29,6 +28,8 @@ from mem_ai.modules.agents.schemas import (
     AgentStatus,
     AgentSummaryRecord,
     AgentUpdateDraftRequest,
+    MemoryPolicy,
+    PersonaSnapshot,
     PersonaVersionRecord,
 )
 from mem_ai.modules.users import service as users_service
@@ -47,6 +48,12 @@ def _draft_from_agent(agent: Agent) -> AgentDraftRecord:
 
 def _to_persona_version_record(row: PersonaVersion) -> PersonaVersionRecord:
     return PersonaVersionRecord.model_validate(row)
+
+
+def _to_persona_snapshot(row: PersonaVersion) -> PersonaSnapshot | None:
+    if row.published_at is None:
+        return None
+    return PersonaSnapshot.model_validate(row)
 
 
 def _summary_kwargs(
@@ -499,25 +506,25 @@ async def get_latest_published_version_for_owner(
     *,
     owner_id: UUID,
     agent_id: UUID,
-) -> PersonaVersionRecord | None:
-    """Read-only lookup used by `personas.provider` for new conversation snapshot resolution."""
+) -> PersonaSnapshot | None:
+    """Resolve the latest published snapshot for a new conversation owned by `owner_id`."""
     async with session_factory() as session:
         row = await repository.get_latest_published_version_for_owner(
             session,
             owner_id=owner_id,
             agent_id=agent_id,
         )
-        return _to_persona_version_record(row) if row is not None else None
+        return _to_persona_snapshot(row) if row is not None else None
 
 
-async def get_persona_version_for_owner(
+async def get_published_persona_version_for_owner(
     session_factory: async_sessionmaker[AsyncSession],
     *,
     owner_id: UUID,
     agent_id: UUID,
     version_id: UUID,
-) -> PersonaVersionRecord | None:
-    """Read-only lookup used by `personas.provider` for pinned published conversation versions."""
+) -> PersonaSnapshot | None:
+    """Resolve a pinned published snapshot while preserving owner isolation."""
     async with session_factory() as session:
         row = await repository.get_published_persona_version_for_owner(
             session,
@@ -525,7 +532,7 @@ async def get_persona_version_for_owner(
             agent_id=agent_id,
             version_id=version_id,
         )
-        return _to_persona_version_record(row) if row is not None else None
+        return _to_persona_snapshot(row) if row is not None else None
 
 
 async def cleanup_user_agents_in_session(

@@ -240,13 +240,15 @@ async def test_chat_api_rejects_overlapping_generation_allows_parallel_and_recov
 
             # 3. Orphaned expired running generation (crashed process, no Worker) is reclaimed
             #    inline by the next `POST /v1/chat` without returning 409.
-            persona_provider = app.state.providers.persona_provider
             conv_a_record = await generation_store.ensure_conversation_accessible(
                 app.state.session_factory,
                 owner_id=alice_user_id,
                 conversation_id=UUID(conv_a),
             )
-            pinned_persona = await persona_provider.get_version(
+            from mem_ai.modules.agents import service as agents_service
+
+            pinned_persona = await agents_service.get_published_persona_version_for_owner(
+                app.state.session_factory,
                 owner_id=alice_user_id,
                 agent_id=UUID(agent_id),
                 version_id=conv_a_record.persona_version_id,

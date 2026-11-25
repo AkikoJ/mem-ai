@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import func, select, text, update
@@ -25,6 +25,7 @@ from mem_ai.modules.agents.schemas import (
     AgentUpdateDraftRequest,
     MemoryPolicyPatch,
     MemoryPolicyPayload,
+    PersonaSnapshot,
 )
 from mem_ai.modules.users import service as users_service
 
@@ -103,6 +104,40 @@ async def test_agent_draft_and_first_publish_persist_across_restart_with_unique_
         assert reloaded.published_version.default_model_id == "gpt-4.1-mini"
         assert reloaded.published_version.memory_policy.write_scope == "conversation"
 
+        # Public snapshot reads return typed PersonaSnapshot and enforce owner/agent isolation.
+        latest_snap = await agents_service.get_latest_published_version_for_owner(
+            sf2, owner_id=alice.id, agent_id=created.agent_id
+        )
+        assert isinstance(latest_snap, PersonaSnapshot)
+        assert latest_snap.version_id == published.current_published_version_id
+        assert latest_snap.version == 1
+
+        pinned_snap = await agents_service.get_published_persona_version_for_owner(
+            sf2,
+            owner_id=alice.id,
+            agent_id=created.agent_id,
+            version_id=published.current_published_version_id,
+        )
+        assert isinstance(pinned_snap, PersonaSnapshot)
+        assert pinned_snap.version_id == published.current_published_version_id
+
+        foreign_owner_id = uuid4()
+        assert (
+            await agents_service.get_latest_published_version_for_owner(
+                sf2, owner_id=foreign_owner_id, agent_id=created.agent_id
+            )
+            is None
+        )
+        assert (
+            await agents_service.get_published_persona_version_for_owner(
+                sf2,
+                owner_id=foreign_owner_id,
+                agent_id=created.agent_id,
+                version_id=published.current_published_version_id,
+            )
+            is None
+        )
+
         # Verify PostgreSQL directly enforces UNIQUE (agent_id, version) on persona_versions.
         with pytest.raises(IntegrityError):
             async with sf2.begin() as session:
@@ -124,6 +159,16 @@ async def test_agent_draft_and_first_publish_persist_across_restart_with_unique_
             sf2,
             owner_id=alice.id,
             data=AgentCreateRequest(name="Other", systemPrompt="Other prompt"),
+        )
+        # Wrong agent_id for an existing version_id of the same owner must return None.
+        assert (
+            await agents_service.get_published_persona_version_for_owner(
+                sf2,
+                owner_id=alice.id,
+                agent_id=other.agent_id,
+                version_id=published.current_published_version_id,
+            )
+            is None
         )
         with pytest.raises(IntegrityError):
             async with sf2.begin() as session:
@@ -204,8 +249,8 @@ async def test_draft_edit_and_version_snapshot_do_not_mutate_or_switch_published
         assert v2_snapshot.system_prompt == "Prompt v2 draft"
         assert v2_snapshot.default_model_id == "model-b"
 
-        # Unpublished v2 snapshot must not be returned by PersonaProvider read-only lookup.
-        unpublished_lookup = await agents_service.get_persona_version_for_owner(
+        # Unpublished v2 snapshot must not be returned by agents read-only lookup.
+        unpublished_lookup = await agents_service.get_published_persona_version_for_owner(
             sf,
             owner_id=alice.id,
             agent_id=created.agent_id,
@@ -231,13 +276,13 @@ async def test_draft_edit_and_version_snapshot_do_not_mutate_or_switch_published
         assert published_v2.published_version.published_at is not None
         assert published_v2.published_version.system_prompt == "Prompt v2 draft"
 
-        pinned_v1 = await agents_service.get_persona_version_for_owner(
+        pinned_v1 = await agents_service.get_published_persona_version_for_owner(
             sf,
             owner_id=alice.id,
             agent_id=created.agent_id,
             version_id=v1_id,
         )
-        assert pinned_v1 is not None
+        assert isinstance(pinned_v1, PersonaSnapshot)
         assert pinned_v1.version == 1
         assert pinned_v1.system_prompt == "Prompt v1"
     finally:
@@ -577,13 +622,13 @@ async def test_retire_agent_persists_across_restart_is_idempotent_and_blocks_mut
         )
         assert latest_for_new_chat is None
 
-        pinned_for_existing_chat = await agents_service.get_persona_version_for_owner(
+        pinned_for_existing_chat = await agents_service.get_published_persona_version_for_owner(
             sf2,
             owner_id=alice.id,
             agent_id=created.agent_id,
             version_id=v1_id,
         )
-        assert pinned_for_existing_chat is not None
+        assert isinstance(pinned_for_existing_chat, PersonaSnapshot)
         assert pinned_for_existing_chat.system_prompt == "Pinned prompt v1"
     finally:
         await engine2.dispose()

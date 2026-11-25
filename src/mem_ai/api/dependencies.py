@@ -11,7 +11,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mem_ai.contracts.memory_provider import MemoryProvider
 from mem_ai.contracts.model_provider import ModelProvider
-from mem_ai.contracts.persona_provider import PersonaProvider
 from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import ServiceUnavailableError
 from mem_ai.core.limits import ConcurrencyLimiter
@@ -45,7 +44,6 @@ class ProviderRegistry:
 
     model_provider: ModelProvider | None = None
     memory_provider: MemoryProvider | None = None
-    persona_provider: PersonaProvider | None = None
 
 
 def get_settings(request: Request) -> Settings:
@@ -79,12 +77,6 @@ def get_optional_memory_provider(request: Request) -> MemoryProvider | None:
     """Return the configured MemoryProvider or None when memory is disabled for chat."""
     registry = cast(ProviderRegistry, request.app.state.providers)
     return registry.memory_provider
-
-
-def get_persona_provider(request: Request) -> PersonaProvider:
-    """Return the configured PersonaProvider (overridable via `app.dependency_overrides`)."""
-    registry = cast(ProviderRegistry, request.app.state.providers)
-    return _require_provider(registry.persona_provider, name="persona")
 
 
 def get_telemetry(request: Request) -> TelemetryRegistry:
@@ -128,7 +120,6 @@ HttpClientDep = Annotated[httpx.AsyncClient, Depends(get_http_client)]
 ModelProviderDep = Annotated[ModelProvider, Depends(get_model_provider)]
 MemoryProviderDep = Annotated[MemoryProvider, Depends(get_memory_provider)]
 OptionalMemoryProviderDep = Annotated[MemoryProvider | None, Depends(get_optional_memory_provider)]
-PersonaProviderDep = Annotated[PersonaProvider, Depends(get_persona_provider)]
 DeletionAuditArchiverDep = Annotated[DeletionAuditArchiver, Depends(get_deletion_audit_archiver)]
 TelemetryDep = Annotated[TelemetryRegistry, Depends(get_telemetry)]
 GenerationLimiterDep = Annotated[

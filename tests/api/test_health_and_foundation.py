@@ -14,7 +14,6 @@ from fastapi import Depends, Query
 from mem_ai.api.dependencies import (
     get_memory_provider,
     get_model_provider,
-    get_persona_provider,
 )
 from mem_ai.application import create_app
 from mem_ai.contracts.memory_provider import MemoryProvider
@@ -25,7 +24,6 @@ from mem_ai.contracts.model_provider import (
     ModelResponse,
     ModelUsage,
 )
-from mem_ai.contracts.persona_provider import PersonaProvider
 from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import ConflictError
 from mem_ai.core.logging import JsonLogFormatter
@@ -206,7 +204,6 @@ async def test_provider_assembly_and_dependency_override_seam(
     migrated_pg_settings: Settings,
     fake_model_provider: ModelProvider,
     fake_memory_provider: MemoryProvider,
-    fake_persona_provider: PersonaProvider,
 ) -> None:
     app = create_app(migrated_pg_settings)
 
@@ -214,7 +211,6 @@ async def test_provider_assembly_and_dependency_override_seam(
     async def inspect_providers(
         model: Annotated[ModelProvider, Depends(get_model_provider)],
         memory: Annotated[MemoryProvider, Depends(get_memory_provider)],
-        persona: Annotated[PersonaProvider, Depends(get_persona_provider)],
     ) -> dict[str, str]:
         resp = await model.generate(
             ModelRequest(
@@ -222,12 +218,10 @@ async def test_provider_assembly_and_dependency_override_seam(
                 messages=[ModelMessage(role="user", content="ping")],
             )
         )
-        assert isinstance(persona, PersonaProvider)
         return {"reply": resp.content, "memory_provider_id": memory.provider_id}
 
     app.dependency_overrides[get_model_provider] = lambda: fake_model_provider
     app.dependency_overrides[get_memory_provider] = lambda: fake_memory_provider
-    app.dependency_overrides[get_persona_provider] = lambda: fake_persona_provider
 
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)

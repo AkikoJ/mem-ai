@@ -503,7 +503,6 @@ async def test_chat_api_end_to_end_with_memos_adapter_encapsulates_vendor_format
             app.state.providers = ProviderRegistry(
                 model_provider=model_provider,
                 memory_provider=memos_provider,
-                persona_provider=app.state.providers.persona_provider,
             )
 
             await models_service.sync_model_configs(

@@ -10,7 +10,7 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
 from mem_ai.contracts.memory_provider import MemoryRecallItem, MemoryScope
 from mem_ai.contracts.model_provider import ModelMessage, ModelUsage
-from mem_ai.contracts.persona_provider import PersonaSnapshot
+from mem_ai.modules.agents.schemas import PersonaSnapshot
 from mem_ai.modules.conversations.prompt import PromptHistoryMessage
 
 ConversationStatus = Literal["active", "deleting"]
