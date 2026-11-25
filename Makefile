@@ -1,7 +1,8 @@
 .PHONY: help sync db-up db-down db-ps migrate migrate-check sync-models api api-prod worker ops-health ops-budget test check
 
-APP_HOST ?= 127.0.0.1
-APP_PORT ?= 8000
+# Shell and command-line variables take precedence over `.env`.
+APP_HOST ?= $(or $(shell sed -n 's/^APP_HOST=//p' .env 2>/dev/null | head -n 1),127.0.0.1)
+APP_PORT ?= $(or $(shell sed -n 's/^APP_PORT=//p' .env 2>/dev/null | head -n 1),8000)
 API_REPLICAS ?= 2
 WORKER_REPLICAS ?= 1
 POSTGRES_MAX_CONNECTIONS ?= 100
@@ -45,10 +46,10 @@ sync-models:
 	uv run python -m mem_ai.modules.models.sync
 
 api:
-	uv run uvicorn mem_ai.main:app --reload --host $(APP_HOST) --port $(APP_PORT)
+	uv run uvicorn mem_ai.main:app --reload --host "$(APP_HOST)" --port "$(APP_PORT)"
 
 api-prod:
-	uv run uvicorn mem_ai.main:app --host $(APP_HOST) --port $(APP_PORT)
+	uv run uvicorn mem_ai.main:app --host "$(APP_HOST)" --port "$(APP_PORT)"
 
 worker:
 	uv run python -m mem_ai.workers.main

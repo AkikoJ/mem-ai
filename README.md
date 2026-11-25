@@ -9,13 +9,15 @@ Basic MemOS AI memory system
 make db-up          # 启动本地 PostgreSQL 容器并等待健康检查通过
 make db-down        # 停止本地 PostgreSQL 容器（保留数据卷）
 make migrate        # 执行 Alembic 升级到 head
-make api            # 启动带 --reload 的本地 FastAPI 开发服务
+make api            # 使用 .env 的 APP_HOST/APP_PORT 启动本地 FastAPI 开发服务
 make worker         # 启动独立后台 Worker 进程
 make ops-health     # 检查数据库就绪、任务积压、过期租约与记忆删除屏障
 make ops-budget     # 校验 API 与 Worker 副本的 PostgreSQL 连接总预算
 make test           # 运行 pytest 测试集
 make check          # 执行 Ruff lint/format、mypy 与架构检查
 ```
+
+`make api` 和 `make api-prod` 会读取 `.env` 中的 `APP_HOST`、`APP_PORT`；未设置时默认使用 `127.0.0.1:8000`。终端已导出的变量或命令行参数优先级更高，例如 `make api APP_PORT=8848`。
 
 生产容器构建（[`Dockerfile`](Dockerfile)）、发布迁移、备份恢复与故障处置见 [`docs/operations/deployment-and-recovery.md`](docs/operations/deployment-and-recovery.md)。
 
