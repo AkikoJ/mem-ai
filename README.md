@@ -1,18 +1,29 @@
 # mem-ai
-Basic MemOS AI memory system
+
+一体化单进程 AI 对话应用 Python 后端服务（FastAPI + PostgreSQL 17 + SQLAlchemy 2.x + MemOS）。
+
+项目不追求将内部模块拆分为独立微服务或插件运行时，而是以单一 Python 服务与 PostgreSQL 这一唯一必选基础设施，提供内置认证、私有 Agent 与人设版本、同步与 SSE 流式对话、长期记忆与删除屏障、内嵌持久后台任务、观测限流与恢复运维的完整后端体系。
+
+核心设计入口：
+
+- 总体定位与完整体系：[`DESIGN.md`](DESIGN.md)
+- 工程目录、职责与收敛状态：[`docs/backend-scaffold-design.md`](docs/backend-scaffold-design.md)
+- 领域术语表：[`GLOSSARY.md`](GLOSSARY.md)
+- 一体化单进程架构决策：[`docs/adr/0007-unified-single-process-backend.md`](docs/adr/0007-unified-single-process-backend.md)
+- 生产发布、恢复与运维手册：[`docs/operations/deployment-and-recovery.md`](docs/operations/deployment-and-recovery.md)
 
 ## 快捷命令（Makefile）
 
-根目录提供职责分离的 [`Makefile`](Makefile)，数据库容器、迁移和 API 进程各自独立控制：
+根目录提供 [`Makefile`](Makefile) 管理本地数据库、迁移、服务运行与静态检查：
 
 ```bash
 make db-up          # 启动本地 PostgreSQL 容器并等待健康检查通过
 make db-down        # 停止本地 PostgreSQL 容器（保留数据卷）
 make migrate        # 执行 Alembic 升级到 head
-make api            # 使用 .env 的 APP_HOST/APP_PORT 启动本地 FastAPI 开发服务
-make worker         # 启动独立后台 Worker 进程
+make api            # 使用 .env 的 APP_HOST/APP_PORT 启动带 --reload 的本地 FastAPI 开发服务
+make worker         # （V1 过渡入口，目标收敛为内嵌进主进程 lifespan）启动后台任务执行器
 make ops-health     # 检查数据库就绪、任务积压、过期租约与记忆删除屏障
-make ops-budget     # 校验 API 与 Worker 副本的 PostgreSQL 连接总预算
+make ops-budget     # 校验服务副本的 PostgreSQL 连接总预算
 make test           # 运行 pytest 测试集
 make check          # 执行 Ruff lint/format、mypy 与架构检查
 ```
@@ -61,7 +72,7 @@ docker compose ps
 docker compose exec postgres psql -U mem_ai -d mem_ai
 ```
 
-如果修改了 `.env` 中的用户名或数据库名，连接命令也需要使用对应的值。PostgreSQL 的初始化变量仅在数据卷首次初始化时生效，修改 `.env` 不会更改已有数据库中的用户、密码或数据库名。当前配置只启动数据库，业务表后续由数据库迁移创建。
+如果修改了 `.env` 中的用户名或数据库名，连接命令也需要使用对应的值。PostgreSQL 的初始化变量仅在数据卷首次初始化时生效，修改 `.env` 不会更改已有数据库中的用户、密码或数据库名。业务表由 Alembic 迁移管理。
 
 ## MemOS Cloud Skills
 
