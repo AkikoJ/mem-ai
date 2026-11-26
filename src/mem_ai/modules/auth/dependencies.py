@@ -12,9 +12,9 @@ from mem_ai.api.dependencies import SessionFactoryDep
 from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import UnauthorizedError
 from mem_ai.core.logging import bind_log_context
+from mem_ai.modules.auth import service as auth_service
 from mem_ai.modules.auth.adapters import AuthRequest, CredentialVerifier
 from mem_ai.modules.auth.context import AuthenticationContext
-from mem_ai.modules.auth.tokens import BUILTIN_JWT_ISSUER, try_peek_jwt_issuer, verify_access_token
 from mem_ai.modules.users import service as users_service
 
 
@@ -65,45 +65,6 @@ def get_credential_verifier(request: Request) -> CredentialVerifier:
 CredentialVerifierDep = Annotated[CredentialVerifier, Depends(get_credential_verifier)]
 
 
-def _extract_single_bearer_token(request: Request) -> str | None:
-    """Return the sole Bearer token, or None when absent/not Bearer; reject duplicate headers."""
-    headers = request.headers.getlist("authorization")
-    if not headers:
-        return None
-    if len(headers) > 1:
-        raise UnauthorizedError(
-            code="invalid_credentials",
-            message="duplicate authentication header",
-        )
-    parts = headers[0].strip().split(None, 1)
-    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
-        return None
-    return parts[1].strip()
-
-
-async def _resolve_builtin_context(
-    request: Request,
-    session_factory: SessionFactoryDep,
-    bearer_token: str,
-) -> AuthenticationContext:
-    """Verify a built-in Access Token and resolve the active local user."""
-    settings = cast(Settings, request.app.state.settings)
-    claims = verify_access_token(
-        bearer_token,
-        secret=settings.auth_jwt_secret.get_secret_value().strip(),
-        leeway_seconds=settings.auth_jwt_leeway_seconds,
-    )
-    user = await users_service.get_active_user(session_factory, user_id=claims.user_id)
-    return AuthenticationContext(
-        actor_id=user.email or str(user.id),
-        user_id=user.id,
-        auth_method="builtin_jwt",
-        permissions=frozenset(),
-        email=user.email,
-        session_id=claims.session_id,
-    )
-
-
 async def get_auth_context(
     request: Request,
     verifier: CredentialVerifierDep,
@@ -116,9 +77,15 @@ async def get_auth_context(
             message="deletion receipts can only query their deletion operation",
         )
 
-    bearer_token = _extract_single_bearer_token(request)
-    if bearer_token is not None and try_peek_jwt_issuer(bearer_token) == BUILTIN_JWT_ISSUER:
-        context = await _resolve_builtin_context(request, session_factory, bearer_token)
+    bearer_token = auth_service.extract_bearer_token(request.headers.getlist("authorization"))
+    if bearer_token is not None and auth_service.is_builtin_access_token(bearer_token):
+        settings = cast(Settings, request.app.state.settings)
+        context = await auth_service.authenticate_builtin_access_token(
+            session_factory,
+            bearer_token=bearer_token,
+            jwt_secret=settings.auth_jwt_secret.get_secret_value().strip(),
+            leeway_seconds=settings.auth_jwt_leeway_seconds,
+        )
         bind_log_context(user_id=str(context.user_id))
         return context
 

@@ -123,7 +123,7 @@ Service  ←──────────────────────�
 - Conversation Core 通过生成阶段入口访问应用持久化，通过 `agents` 公开接口读取人设快照，通过外部适配协议访问外部模型与外部记忆引擎。SQLAlchemy 和供应商 HTTP 封装在对应实现中。
 - Prompt 编译是纯数据转换，SSE 编码负责传输表达，生成状态转换通过共享生成入口执行。
 - `jobs` 依赖通用任务数据和处理器协议，业务处理器依赖资源服务。处理器注册集中在应用/后台任务装配处，通用任务模块保持单向依赖。
-- 数据库模型注册、迁移元数据导入、应用装配（`application.py`/`main.py`/`api/router.py`）、任务装配（`application.py` 调用 `workers/assembly.py`）和运维恢复装配（`ops.py`，包括复用 `auth.tokens.verify_access_token` 与 `users.service.get_active_user` 核验内置凭据和用户状态）属于显式基础设施入口，架构检查按具体文件列出例外。为新增依赖补充这里的用途与方向。
+- 数据库模型注册、迁移元数据导入、应用装配（`application.py`/`main.py`/`api/router.py`）、任务装配（`application.py` 调用 `workers/assembly.py`）和运维恢复装配（`ops.py`，包括复用 `auth.service` 内置令牌校验公开入口核验内置凭据和活跃用户状态）属于显式基础设施入口，架构检查按具体文件列出例外。为新增依赖补充这里的用途与方向。
 
 实现时在模块首次提供公共行为时确定公开符号，并在对应 ticket 记录路径和调用方式。公共接口和允许依赖随实际实现更新，现有调用方一并迁移。
 
@@ -291,7 +291,7 @@ mem-ai/                                    # 项目根目录，管理应用、�
 │       │   │   ├── repository.py          # `auth_sessions` 查询、行锁轮换、会话家族吊销与有界游标清理 SQL
 │       │   │   ├── tokens.py              # 邮箱规范化、密码策略与 PBKDF2 哈希、Refresh Token 摘要及内置 JWT 签发/验签纯函数
 │       │   │   ├── schemas.py             # `/v1/auth/*` 请求响应契约、令牌配置值对象与保留清理批次结果
-│       │   │   ├── service.py             # 注册、登录、刷新轮换、注销、改密、批量吊销与保留清理；签发采用用户→会话锁顺序
+│       │   │   ├── service.py             # 注册、登录、刷新轮换、注销、改密、内置 Access Token 统一核验、批量吊销与保留清理；签发采用用户→会话锁顺序
 │       │   │   └── router.py              # `POST /v1/auth/{register,login,refresh,logout,password}` 路由适配
 │       │   ├── users/                     # 本地用户凭据、当前用户邮箱与删除协调（外部映射待收敛 07 移除）
 │       │   │   └── cleanup.py             # 删除受理与审计重放原子吊销会话、邮箱占位及最终用户/会话移除

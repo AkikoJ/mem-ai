@@ -16,10 +16,6 @@ from mem_ai.modules.users import service as users_service
 from tests.conftest import BuiltinUsers
 
 
-def _auth_headers(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}"}
-
-
 @pytest.mark.integration
 @pytest.mark.anyio
 async def test_agent_create_publish_list_detail_patch_and_versions_persist_across_restart(
@@ -30,16 +26,14 @@ async def test_agent_create_publish_list_detail_patch_and_versions_persist_acros
     async with app1.router.lifespan_context(app1):
         transport1 = httpx.ASGITransport(app=app1)
         async with httpx.AsyncClient(transport=transport1, base_url="http://test") as client:
-            me_resp = await client.get(
-                "/v1/users/me", headers=_auth_headers(builtin_users.alice.access_token)
-            )
+            me_resp = await client.get("/v1/users/me", headers=builtin_users.alice.headers)
             assert me_resp.status_code == 200
             alice_id = me_resp.json()["data"]["userId"]
 
             # 1. Create private Agent (initial draft stored on agents row; not yet published).
             create_resp = await client.post(
                 "/v1/agents",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
                 json={
                     "name": "Architecture Tutor",
                     "systemPrompt": "Guide the user through clean modular designs.",
@@ -74,7 +68,7 @@ async def test_agent_create_publish_list_detail_patch_and_versions_persist_acros
             # 2. Publish first persona version from draft (empty body supported).
             publish_resp = await client.post(
                 f"/v1/agents/{agent_id}/publish",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
             )
             assert publish_resp.status_code == 200
             pub_data = publish_resp.json()["data"]
@@ -94,7 +88,7 @@ async def test_agent_create_publish_list_detail_patch_and_versions_persist_acros
             # 3. PATCH draft does not alter published v1.
             patch_resp = await client.patch(
                 f"/v1/agents/{agent_id}",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
                 json={
                     "systemPrompt": "Draft prompt v2",
                     "tone": None,
@@ -116,7 +110,7 @@ async def test_agent_create_publish_list_detail_patch_and_versions_persist_acros
             # 4. POST /versions creates v2 snapshot without switching currentPublishedVersionId.
             ver_resp = await client.post(
                 f"/v1/agents/{agent_id}/versions",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
             )
             assert ver_resp.status_code == 201
             v2_data = ver_resp.json()["data"]
@@ -127,7 +121,7 @@ async def test_agent_create_publish_list_detail_patch_and_versions_persist_acros
 
             detail_before_switch = await client.get(
                 f"/v1/agents/{agent_id}",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
             )
             assert detail_before_switch.status_code == 200
             assert detail_before_switch.json()["data"]["currentPublishedVersionId"] == v1_id
@@ -136,7 +130,7 @@ async def test_agent_create_publish_list_detail_patch_and_versions_persist_acros
             # 5. Publish explicit v2 snapshot and confirm publishedAt is stamped.
             switch_resp = await client.post(
                 f"/v1/agents/{agent_id}/publish",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
                 json={"versionId": v2_id},
             )
             assert switch_resp.status_code == 200
@@ -149,9 +143,7 @@ async def test_agent_create_publish_list_detail_patch_and_versions_persist_acros
     async with app2.router.lifespan_context(app2):
         transport2 = httpx.ASGITransport(app=app2)
         async with httpx.AsyncClient(transport=transport2, base_url="http://test") as client:
-            list_resp = await client.get(
-                "/v1/agents", headers=_auth_headers(builtin_users.alice.access_token)
-            )
+            list_resp = await client.get("/v1/agents", headers=builtin_users.alice.headers)
             assert list_resp.status_code == 200
             list_data = list_resp.json()["data"]
             assert list_data["has_more"] is False
@@ -163,7 +155,7 @@ async def test_agent_create_publish_list_detail_patch_and_versions_persist_acros
 
             detail_resp = await client.get(
                 f"/v1/agents/{agent_id}",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
             )
             assert detail_resp.status_code == 200
             detail_data = detail_resp.json()["data"]
@@ -199,20 +191,16 @@ async def test_cross_user_access_returns_uniform_404_and_client_user_id_cannot_a
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             alice_id = (
-                await client.get(
-                    "/v1/users/me", headers=_auth_headers(builtin_users.alice.access_token)
-                )
+                await client.get("/v1/users/me", headers=builtin_users.alice.headers)
             ).json()["data"]["userId"]
-            bob_id = (
-                await client.get(
-                    "/v1/users/me", headers=_auth_headers(builtin_users.bob.access_token)
-                )
-            ).json()["data"]["userId"]
+            bob_id = (await client.get("/v1/users/me", headers=builtin_users.bob.headers)).json()[
+                "data"
+            ]["userId"]
 
             # Body ownerId / userId rejected by extra="forbid".
             forged_body_resp = await client.post(
                 "/v1/agents",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
                 json={
                     "name": "Forged",
                     "systemPrompt": "Prompt",
@@ -226,7 +214,7 @@ async def test_cross_user_access_returns_uniform_404_and_client_user_id_cannot_a
             create_resp = await client.post(
                 f"/v1/agents?ownerId={bob_id}&userId={bob_id}",
                 headers={
-                    **_auth_headers(builtin_users.alice.access_token),
+                    **builtin_users.alice.headers,
                     "X-User-Id": bob_id,
                     "X-Auth-Subject": "bob",
                 },
@@ -237,9 +225,7 @@ async def test_cross_user_access_returns_uniform_404_and_client_user_id_cannot_a
             assert create_resp.json()["data"]["ownerId"] == alice_id
 
             # Bob cannot see Alice's agent in list.
-            bob_list = await client.get(
-                "/v1/agents", headers=_auth_headers(builtin_users.bob.access_token)
-            )
+            bob_list = await client.get("/v1/agents", headers=builtin_users.bob.headers)
             assert bob_list.status_code == 200
             assert bob_list.json()["data"]["items"] == []
 
@@ -247,7 +233,7 @@ async def test_cross_user_access_returns_uniform_404_and_client_user_id_cannot_a
             missing_id = str(uuid4())
             missing_resp = await client.get(
                 f"/v1/agents/{missing_id}",
-                headers=_auth_headers(builtin_users.bob.access_token),
+                headers=builtin_users.bob.headers,
             )
             assert missing_resp.status_code == 404
             expected_code = missing_resp.json()["code"]
@@ -255,24 +241,24 @@ async def test_cross_user_access_returns_uniform_404_and_client_user_id_cannot_a
 
             bob_get = await client.get(
                 f"/v1/agents/{agent_id}",
-                headers=_auth_headers(builtin_users.bob.access_token),
+                headers=builtin_users.bob.headers,
             )
             bob_patch = await client.patch(
                 f"/v1/agents/{agent_id}",
-                headers=_auth_headers(builtin_users.bob.access_token),
+                headers=builtin_users.bob.headers,
                 json={"name": "Hijacked"},
             )
             bob_version = await client.post(
                 f"/v1/agents/{agent_id}/versions",
-                headers=_auth_headers(builtin_users.bob.access_token),
+                headers=builtin_users.bob.headers,
             )
             bob_publish = await client.post(
                 f"/v1/agents/{agent_id}/publish",
-                headers=_auth_headers(builtin_users.bob.access_token),
+                headers=builtin_users.bob.headers,
             )
             bob_delete = await client.delete(
                 f"/v1/agents/{agent_id}",
-                headers=_auth_headers(builtin_users.bob.access_token),
+                headers=builtin_users.bob.headers,
             )
 
             for resp in (bob_get, bob_patch, bob_version, bob_publish, bob_delete):
@@ -285,19 +271,19 @@ async def test_cross_user_access_returns_uniform_404_and_client_user_id_cannot_a
             # Bob also cannot reference Alice's versionId when publishing Bob's own Agent.
             alice_pub = await client.post(
                 f"/v1/agents/{agent_id}/publish",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
             )
             alice_v1_id = alice_pub.json()["data"]["currentPublishedVersionId"]
 
             bob_own = await client.post(
                 "/v1/agents",
-                headers=_auth_headers(builtin_users.bob.access_token),
+                headers=builtin_users.bob.headers,
                 json={"name": "Bob Own", "systemPrompt": "Bob prompt"},
             )
             bob_agent_id = bob_own.json()["data"]["agentId"]
             cross_ver_pub = await client.post(
                 f"/v1/agents/{bob_agent_id}/publish",
-                headers=_auth_headers(builtin_users.bob.access_token),
+                headers=builtin_users.bob.headers,
                 json={"versionId": alice_v1_id},
             )
             assert cross_ver_pub.status_code == 404
@@ -312,9 +298,7 @@ async def test_cross_user_access_returns_uniform_404_and_client_user_id_cannot_a
                 user_id=UUID(bob_id),
                 status="disabled",
             )
-            disabled_resp = await client.get(
-                "/v1/agents", headers=_auth_headers(builtin_users.bob.access_token)
-            )
+            disabled_resp = await client.get("/v1/agents", headers=builtin_users.bob.headers)
             assert disabled_resp.status_code == 403
             assert disabled_resp.json()["code"] == "user_disabled"
 
@@ -333,7 +317,7 @@ async def test_agents_list_http_pagination_handles_identical_timestamps_and_inva
             for idx in range(5):
                 resp = await client.post(
                     "/v1/agents",
-                    headers=_auth_headers(builtin_users.alice.access_token),
+                    headers=builtin_users.alice.headers,
                     json={"name": f"Agent {idx}", "systemPrompt": f"Prompt {idx}"},
                 )
                 assert resp.status_code == 201
@@ -353,7 +337,7 @@ async def test_agents_list_http_pagination_handles_identical_timestamps_and_inva
                     params["cursor"] = cursor
                 resp = await client.get(
                     "/v1/agents",
-                    headers=_auth_headers(builtin_users.alice.access_token),
+                    headers=builtin_users.alice.headers,
                     params=params,
                 )
                 assert resp.status_code == 200
@@ -372,7 +356,7 @@ async def test_agents_list_http_pagination_handles_identical_timestamps_and_inva
             # Malformed cursor returns 422 invalid_cursor.
             bad_cursor_resp = await client.get(
                 "/v1/agents",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
                 params={"cursor": "not-valid-base64!!!"},
             )
             assert bad_cursor_resp.status_code == 422
@@ -381,7 +365,7 @@ async def test_agents_list_http_pagination_handles_identical_timestamps_and_inva
             # Reject empty PATCH, empty memoryPolicy, explicit null, snake_case, and null versionId.
             empty_patch_resp = await client.patch(
                 f"/v1/agents/{created_ids[0]}",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
                 json={},
             )
             assert empty_patch_resp.status_code == 422
@@ -389,7 +373,7 @@ async def test_agents_list_http_pagination_handles_identical_timestamps_and_inva
 
             empty_policy_patch_resp = await client.patch(
                 f"/v1/agents/{created_ids[0]}",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
                 json={"memoryPolicy": {}},
             )
             assert empty_policy_patch_resp.status_code == 422
@@ -397,7 +381,7 @@ async def test_agents_list_http_pagination_handles_identical_timestamps_and_inva
 
             null_policy_field_resp = await client.patch(
                 f"/v1/agents/{created_ids[0]}",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
                 json={"memoryPolicy": {"writeScope": None}},
             )
             assert null_policy_field_resp.status_code == 422
@@ -405,7 +389,7 @@ async def test_agents_list_http_pagination_handles_identical_timestamps_and_inva
 
             snake_case_create_resp = await client.post(
                 "/v1/agents",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
                 json={"name": "Snake", "system_prompt": "Not allowed on wire"},
             )
             assert snake_case_create_resp.status_code == 422
@@ -413,7 +397,7 @@ async def test_agents_list_http_pagination_handles_identical_timestamps_and_inva
 
             null_version_publish_resp = await client.post(
                 f"/v1/agents/{created_ids[0]}/publish",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
                 json={"versionId": None},
             )
             assert null_version_publish_resp.status_code == 422
@@ -431,19 +415,15 @@ async def test_retire_agent_http_route_is_idempotent_blocks_mutations_and_persis
         transport1 = httpx.ASGITransport(app=app1)
         async with httpx.AsyncClient(transport=transport1, base_url="http://test") as client:
             alice_id = (
-                await client.get(
-                    "/v1/users/me", headers=_auth_headers(builtin_users.alice.access_token)
-                )
+                await client.get("/v1/users/me", headers=builtin_users.alice.headers)
             ).json()["data"]["userId"]
-            bob_id = (
-                await client.get(
-                    "/v1/users/me", headers=_auth_headers(builtin_users.bob.access_token)
-                )
-            ).json()["data"]["userId"]
+            bob_id = (await client.get("/v1/users/me", headers=builtin_users.bob.headers)).json()[
+                "data"
+            ]["userId"]
 
             create_resp = await client.post(
                 "/v1/agents",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
                 json={
                     "name": "Lifecycle Agent",
                     "systemPrompt": "Original published prompt",
@@ -458,7 +438,7 @@ async def test_retire_agent_http_route_is_idempotent_blocks_mutations_and_persis
 
             publish_resp = await client.post(
                 f"/v1/agents/{agent_id}/publish",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
             )
             assert publish_resp.status_code == 200
             v1_id = publish_resp.json()["data"]["currentPublishedVersionId"]
@@ -467,7 +447,7 @@ async def test_retire_agent_http_route_is_idempotent_blocks_mutations_and_persis
             assert (await client.delete(f"/v1/agents/{agent_id}")).status_code == 401
             missing_delete = await client.delete(
                 f"/v1/agents/{uuid4()}",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
             )
             assert missing_delete.status_code == 404
             assert missing_delete.json()["code"] == "agent_not_found"
@@ -476,7 +456,7 @@ async def test_retire_agent_http_route_is_idempotent_blocks_mutations_and_persis
             retire_resp_1 = await client.delete(
                 f"/v1/agents/{agent_id}?ownerId={bob_id}&userId={bob_id}",
                 headers={
-                    **_auth_headers(builtin_users.alice.access_token),
+                    **builtin_users.alice.headers,
                     "X-User-Id": bob_id,
                     "X-Auth-Subject": "bob",
                 },
@@ -497,7 +477,7 @@ async def test_retire_agent_http_route_is_idempotent_blocks_mutations_and_persis
             # Repeat DELETE is idempotent 200 with unchanged retiredAt and publishedVersion.
             retire_resp_2 = await client.delete(
                 f"/v1/agents/{agent_id}",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
             )
             assert retire_resp_2.status_code == 200
             data_2 = retire_resp_2.json()["data"]
@@ -508,7 +488,7 @@ async def test_retire_agent_http_route_is_idempotent_blocks_mutations_and_persis
             # Cross-user DELETE on an already-retired Agent still returns 404 agent_not_found.
             bob_delete_retired = await client.delete(
                 f"/v1/agents/{agent_id}",
-                headers=_auth_headers(builtin_users.bob.access_token),
+                headers=builtin_users.bob.headers,
             )
             assert bob_delete_retired.status_code == 404
             assert bob_delete_retired.json()["code"] == "agent_not_found"
@@ -516,7 +496,7 @@ async def test_retire_agent_http_route_is_idempotent_blocks_mutations_and_persis
             # Retired Agent rejects draft update, version snapshot, and publish with 409.
             patch_retired = await client.patch(
                 f"/v1/agents/{agent_id}",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
                 json={"systemPrompt": "Disallowed edit"},
             )
             assert patch_retired.status_code == 409
@@ -524,14 +504,14 @@ async def test_retire_agent_http_route_is_idempotent_blocks_mutations_and_persis
 
             version_retired = await client.post(
                 f"/v1/agents/{agent_id}/versions",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
             )
             assert version_retired.status_code == 409
             assert version_retired.json()["code"] == "agent_retired"
 
             publish_retired = await client.post(
                 f"/v1/agents/{agent_id}/publish",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
             )
             assert publish_retired.status_code == 409
             assert publish_retired.json()["code"] == "agent_retired"
@@ -543,7 +523,7 @@ async def test_retire_agent_http_route_is_idempotent_blocks_mutations_and_persis
         async with httpx.AsyncClient(transport=transport2, base_url="http://test") as client:
             detail_resp = await client.get(
                 f"/v1/agents/{agent_id}",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
             )
             assert detail_resp.status_code == 200
             detail_data = detail_resp.json()["data"]
@@ -552,9 +532,7 @@ async def test_retire_agent_http_route_is_idempotent_blocks_mutations_and_persis
             assert detail_data["publishedVersion"]["versionId"] == v1_id
             assert detail_data["publishedVersion"]["systemPrompt"] == "Original published prompt"
 
-            list_resp = await client.get(
-                "/v1/agents", headers=_auth_headers(builtin_users.alice.access_token)
-            )
+            list_resp = await client.get("/v1/agents", headers=builtin_users.alice.headers)
             assert list_resp.status_code == 200
             items = list_resp.json()["data"]["items"]
             assert len(items) == 1

@@ -27,13 +27,13 @@ from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import AppError
 from mem_ai.db.engine import create_async_engine_from_settings, create_session_factory
 from mem_ai.integrations.http import create_http_client
+from mem_ai.modules.auth import service as auth_service
 from mem_ai.modules.auth.adapters import (
     AuthRequest,
     DevelopmentAuthAdapter,
     StaticTokenAuthAdapter,
     build_credential_verifier,
 )
-from mem_ai.modules.auth.tokens import BUILTIN_JWT_ISSUER, try_peek_jwt_issuer, verify_access_token
 from mem_ai.modules.conversations import cleanup as conversation_cleanup
 from mem_ai.modules.conversations import queries as conversation_queries
 from mem_ai.modules.conversations.queries import DatabaseRecalledMemoryReferenceMarker
@@ -323,6 +323,7 @@ async def verify_providers(
 ) -> ProviderVerificationReport:
     """Run controlled limited-privilege checks for production auth, model, and MemOS adapters."""
     auth_ok: bool | None = None
+    verified_user_id: UUID | None = None
     model_sync_ok: bool | None = None
     model_stream_ok: bool | None = None
     model_cancel_ok: bool | None = None
@@ -338,21 +339,20 @@ async def verify_providers(
         if auth_headers is None:
             raise ValueError("auth_headers (--bearer-token) is required when --check-auth is set")
         auth_request = AuthRequest(headers=auth_headers, client_host=client_host)
-        authorization = auth_request.get_single_header("Authorization") or ""
-        parts = authorization.strip().split(None, 1)
-        if (
-            len(parts) == 2
-            and parts[0].lower() == "bearer"
-            and try_peek_jwt_issuer(parts[1].strip()) == BUILTIN_JWT_ISSUER
-        ):
+        raw_authorization = auth_request.get_single_header("Authorization")
+        bearer_token = auth_service.extract_bearer_token(
+            [raw_authorization] if raw_authorization is not None else []
+        )
+        if bearer_token is not None and auth_service.is_builtin_access_token(bearer_token):
             if session_factory is None:
                 raise ValueError("session_factory is required to verify a built-in user")
-            claims = verify_access_token(
-                parts[1].strip(),
-                secret=settings.auth_jwt_secret.get_secret_value().strip(),
+            auth_context = await auth_service.authenticate_builtin_access_token(
+                session_factory,
+                bearer_token=bearer_token,
+                jwt_secret=settings.auth_jwt_secret.get_secret_value().strip(),
                 leeway_seconds=settings.auth_jwt_leeway_seconds,
             )
-            await users_service.get_active_user(session_factory, user_id=claims.user_id)
+            verified_user_id = auth_context.user_id
             auth_ok = True
         else:
             verifier = build_credential_verifier(settings)
@@ -432,6 +432,8 @@ async def verify_providers(
                 )
             if probe_user_id is not None:
                 test_uid = probe_user_id
+            elif verified_user_id is not None:
+                test_uid = verified_user_id
             elif session_factory is not None:
                 probe_user = await users_service.resolve_or_create_user(
                     session_factory,

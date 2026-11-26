@@ -37,12 +37,12 @@ from mem_ai.ops import (
 )
 from mem_ai.workers.assembly import build_worker_registry
 from mem_ai.workers.runner import WorkerConfig, WorkerRunner
-from tests.api.test_builtin_auth import PASSWORD, _bearer, _login, _refresh, _register
 from tests.conftest import (
     TEST_PASSWORD,
     FakeMemoryProvider,
     FakeModelProvider,
     create_builtin_user,
+    login_builtin_user,
     parse_sse_text,
     register_builtin_user,
 )
@@ -695,6 +695,19 @@ async def test_verify_providers_harness_validates_auth_model_and_memos_capabilit
             # Two unique probe writes + one repeated write_id idempotency probe
             assert len(memos_writes_seen) == 3
             assert memos_writes_seen[0] == memos_writes_seen[1]
+            # Combined --check-auth + --check-memory reuses the verified built-in user
+            # without creating legacy user_identities rows.
+            async with sf() as session:
+                assert (await session.scalar(text("SELECT count(*) FROM user_identities"))) == 0
+                assert (await session.scalars(text("SELECT id FROM users"))).all() == [
+                    registered.user_id
+                ]
+                snapshot_users = (
+                    await session.scalars(
+                        text("SELECT DISTINCT user_id FROM memory_list_snapshots")
+                    )
+                ).all()
+                assert snapshot_users == [registered.user_id]
             # The operational probe verifies the token signature and current local status.
             header, payload, signature = token.split(".")
             wrong_signature = ("A" if signature[0] != "A" else "B") + signature[1:]
@@ -744,12 +757,12 @@ async def test_audit_replay_revokes_restored_builtin_sessions(
         app.router.lifespan_context(app),
         httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
     ):
-        registered = await _register(client, "restore@example.com")
-        other = await _login(client, "restore@example.com")
-        user_id = UUID(registered["userId"])
+        registered = await register_builtin_user(client, email="restore@example.com")
+        other = await login_builtin_user(client, email="restore@example.com")
+        user_id = registered.user_id
         sessions = app.state.session_factory
         if restored_status == "deleting":
-            deleted = await client.delete("/v1/users/me", headers=_bearer(registered["tokens"]))
+            deleted = await client.delete("/v1/users/me", headers=registered.headers)
             assert deleted.status_code == 202
             # A restored legacy deletion can retain both its job and unrevoked sessions.
             async with sessions.begin() as session:
@@ -781,17 +794,20 @@ async def test_audit_replay_revokes_restored_builtin_sessions(
             ).all()
             assert len(restored) == 2
             assert all(row.revoked_at is not None for row in restored)
-        for tokens in (registered["tokens"], other["tokens"]):
-            denied = await client.get("/v1/users/me", headers=_bearer(tokens))
+        for user in (registered, other):
+            denied = await client.get("/v1/users/me", headers=user.headers)
             assert denied.status_code == 403
             assert denied.json()["code"] == "user_deleting"
-            assert (await _refresh(client, tokens["refreshToken"])).status_code == 401
+            refreshed = await client.post(
+                "/v1/auth/refresh", json={"refreshToken": user.refresh_token}
+            )
+            assert refreshed.status_code == 401
         login = await client.post(
-            "/v1/auth/login", json={"email": "restore@example.com", "password": PASSWORD}
+            "/v1/auth/login", json={"email": "restore@example.com", "password": TEST_PASSWORD}
         )
         assert login.status_code == 403
         duplicate = await client.post(
-            "/v1/auth/register", json={"email": "RESTORE@example.com", "password": PASSWORD}
+            "/v1/auth/register", json={"email": "RESTORE@example.com", "password": TEST_PASSWORD}
         )
         assert duplicate.status_code == 409
         repeated = await replay_deletion_audit_archive(

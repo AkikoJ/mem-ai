@@ -36,10 +36,9 @@ from mem_ai.modules.users.cleanup import JOB_TYPE_USER_DELETE, UserCleanupJobHan
 from mem_ai.modules.users.models import User
 from mem_ai.workers.assembly import build_worker_registry
 from mem_ai.workers.runner import JobHandlerRegistry, WorkerConfig, WorkerRunner
-from tests.api.test_builtin_auth import PASSWORD, _bearer, _login, _register
 from tests.api.test_chat_idempotency_and_generations_api import _ControllableModelProvider
 from tests.api.test_conversations_api import GatedMemoryProvider
-from tests.conftest import BuiltinUsers, register_builtin_user
+from tests.conftest import TEST_PASSWORD, BuiltinUsers, login_builtin_user, register_builtin_user
 
 
 class DeletionMemoryProvider(GatedMemoryProvider):
@@ -332,10 +331,10 @@ async def test_builtin_email_stays_reserved_until_remote_and_local_cleanup_finis
         app.router.lifespan_context(app),
         httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
     ):
-        registered = await _register(client, "cleanup@example.com")
-        await _login(client, "cleanup@example.com")
-        user_id = UUID(registered["userId"])
-        headers = _bearer(registered["tokens"])
+        registered = await register_builtin_user(client, email="cleanup@example.com")
+        await login_builtin_user(client, email="cleanup@example.com")
+        user_id = registered.user_id
+        headers = registered.headers
         created = await client.post(
             "/v1/memories", headers=headers, json={"content": "delete with account"}
         )
@@ -364,7 +363,7 @@ async def test_builtin_email_stays_reserved_until_remote_and_local_cleanup_finis
                 == 2
             )
         conflict = await client.post(
-            "/v1/auth/register", json={"email": "CLEANUP@example.com", "password": PASSWORD}
+            "/v1/auth/register", json={"email": "CLEANUP@example.com", "password": TEST_PASSWORD}
         )
         assert conflict.status_code == 409
 
@@ -385,8 +384,8 @@ async def test_builtin_email_stays_reserved_until_remote_and_local_cleanup_finis
                 )
                 == 0
             )
-        replacement = await _register(client, "CLEANUP@example.com")
-        assert replacement["userId"] != registered["userId"]
+        replacement = await register_builtin_user(client, email="CLEANUP@example.com")
+        assert replacement.user_id != registered.user_id
         assert (await client.get("/v1/users/me", headers=headers)).status_code == 403
         assert (await client.get(accepted["statusUrl"], headers=receipt_headers)).status_code == 200
 

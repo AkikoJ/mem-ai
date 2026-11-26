@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 from uuid import UUID
 
@@ -18,6 +19,7 @@ from mem_ai.core.exceptions import (
 )
 from mem_ai.db.base import get_database_now, normalize_utc
 from mem_ai.modules.auth import repository, tokens
+from mem_ai.modules.auth.context import AuthenticationContext
 from mem_ai.modules.auth.schemas import (
     AuthSessionPurgeBatch,
     AuthTokenSettings,
@@ -30,6 +32,50 @@ from mem_ai.modules.auth.schemas import (
 from mem_ai.modules.users import service as users_service
 
 _INVALID_LOGIN_MESSAGE = "invalid email or password"
+
+
+def extract_bearer_token(authorization_headers: Sequence[str]) -> str | None:
+    """提取唯一 Bearer 令牌；未携带或非 Bearer 返回 None，重复头返回 401。"""
+    if not authorization_headers:
+        return None
+    if len(authorization_headers) > 1:
+        raise UnauthorizedError(
+            code="invalid_credentials",
+            message="duplicate authentication header",
+        )
+    parts = authorization_headers[0].strip().split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
+        return None
+    return parts[1].strip()
+
+
+def is_builtin_access_token(bearer_token: str) -> bool:
+    """判断 Bearer 令牌是否声明由内置认证签发。"""
+    return tokens.try_peek_jwt_issuer(bearer_token) == tokens.BUILTIN_JWT_ISSUER
+
+
+async def authenticate_builtin_access_token(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    bearer_token: str,
+    jwt_secret: str,
+    leeway_seconds: int,
+) -> AuthenticationContext:
+    """验签内置 Access Token 并校验当前本地用户仍处于 `active` 状态。"""
+    claims = tokens.verify_access_token(
+        bearer_token,
+        secret=jwt_secret,
+        leeway_seconds=leeway_seconds,
+    )
+    user = await users_service.get_active_user(session_factory, user_id=claims.user_id)
+    return AuthenticationContext(
+        actor_id=user.email or str(user.id),
+        user_id=user.id,
+        auth_method="builtin_jwt",
+        permissions=frozenset(),
+        email=user.email,
+        session_id=claims.session_id,
+    )
 
 
 async def _issue_token_pair_in_session(

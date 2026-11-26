@@ -32,19 +32,18 @@
 - `tests/api/`：用户、Agent、人设、模型、同步/SSE/并发/幂等聊天、召回/写入、会话、记忆、删除、资源预算与观测测试全部迁至真实内置认证。保留跨用户 404、停用/删除中 403、回执越权拒绝、重启与并发断言；用户删除后显式重新注册邮箱获得新用户，旧令牌不再隐式重建身份。
 - `tests/integration/`：种子用户经公开内置注册创建；用户持久化改为规范化邮箱并发注册、登录及重启验证；删除资源图以 `auth_sessions`、邮箱占位和最终级联删除为断言，恢复重放与生产生命周期也使用内置用户。仅 `test_database_and_migrations.py` 保留历史 `user_identities` 插入作为 07 历史库升级兼容基线。
 - `tests/unit/`：移除外部适配器专用的 `test_auth_adapters.py` 和旧认证配置断言，将适用的非有限过期时间、非法用户/会话/邮箱声明校验迁入 `test_builtin_auth.py`；移除模型权限夹具与断言，保留模型注册、启用、强制选择、覆盖与能力约束。
-- `src/mem_ai/ops.py::verify_providers`：迁移真实内置令牌后，原认证探针报 `untrusted credential issuer`。补齐内置令牌分派，复用 `auth.tokens.verify_access_token` 与 `users.service.get_active_user` 核验签名、时效与当前用户状态；内置核验需要数据库 Session 工厂。保留旧分派至 07，未新增认证实现或外部适配器。
+- `src/mem_ai/modules/auth/service.py` 与 `src/mem_ai/modules/auth/dependencies.py`：提取公开入口 `extract_bearer_token`、`is_builtin_access_token` 与 `authenticate_builtin_access_token`，统一 Bearer 解析、内置 issuer 判断、JWT 验签与当前 `active` 用户状态校验。
+- `src/mem_ai/ops.py::verify_providers`（为解阻 `test_production_deployment_and_recovery.py` 迁移内置令牌而补齐的最小前置修正）：复用 `auth.service` 公开入口核验内置令牌并记录 `verified_user_id`；当同时执行 `check_auth` 与 `check_memory` 且未显式传入 `probe_user_id` 时自动复用已验签的内置用户 ID，不再回退写入 `user_identities`（集成测试已断言 `user_identities` 为 0 行且快照归属该内置用户）。保留旧外部分派分支至 07，未新增外部适配器。
 
 ### 验证证据
 
-- 运维探针红→绿：原实现拒绝注册接口签发的内置令牌；修复后通过，且篡改签名、停用用户和缺失数据库接缝均被拒绝。
-- 分批验证：85 个迁移范围 API 测试、50 个相关单元测试、92 个完整集成测试通过；基础/健康测试 8 个通过。
-- `python3 tools/check_architecture.py`、`.venv/bin/ruff check .`、`.venv/bin/ruff format --check .`、`.venv/bin/mypy src` 和 `git diff --check` 通过，mypy 覆盖 119 个源文件。
-- 最终 `.venv/bin/pytest -q --tb=short --show-capture=no` 全量通过：**287 passed in 98.43s**。
-- 按 `code-review` 对基线后的实际变更完成两路独立只读审查：Standards 与 Spec 均无待修复问题。
+- 运维探针红→绿：原实现拒绝注册接口签发的内置令牌且 `check_memory` 回退写入 `user_identities`；修复后通过，且篡改签名、停用用户、缺失数据库接缝均被拒绝，同时 `user_identities` 保持 0 行。
+- 分批与全量验证：`python3 tools/check_architecture.py`、`.venv/bin/ruff check .`、`.venv/bin/ruff format --check .`、`.venv/bin/mypy src`（119 个源文件）与 `git diff --check` 全部通过。
+- 最终 `.venv/bin/pytest -q --tb=short --show-capture=no` 全量通过：**287 passed in 98.53s**。
 - 测试使用本机 PostgreSQL 的隔离临时数据库及受控模型/记忆提供方；未执行构建或真实外部供应商请求。
 
 ### 文档与后续边界
 
-已同步 `docs/backend-scaffold-design.md` 的目录状态、功能索引、测试夹具说明、测试契约和运维装配依赖，以及 `docs/operations/deployment-and-recovery.md` 的内置认证探针使用方式。资源与事务所有权不变。
+已同步 `docs/backend-scaffold-design.md` 的目录状态、功能索引、测试夹具说明、测试契约和运维装配依赖，以及 `docs/operations/deployment-and-recovery.md` 的内置认证探针与 `check_memory` 用户 ID 复用说明（术语已按 `GLOSSARY.md` 统一为“用户”）。资源与事务所有权不变。
 
 当前生产配置仍只提供旧 `auth_mode` 选项，因此测试配置暂保留严格 JWT 回退所需的 issuer/audience/secret，以拒绝匿名请求；没有有效业务请求使用该外部签发路径，所有有效令牌均由内置认证签发。07 应移除该过渡配置及生产外部认证/权限结构，并继续扩展保留的历史迁移兼容测试。

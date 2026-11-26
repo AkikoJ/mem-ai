@@ -44,10 +44,6 @@ class _RecordingModelProvider:
         yield ModelStreamChunk(sequence=1)
 
 
-def _auth_headers(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}"}
-
-
 def _chat_headers(token: str, *, key: str | None = None) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {token}",
@@ -101,7 +97,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             # 1. Create Agent and publish v1.
             create_resp = await client.post(
                 "/v1/agents",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
                 json={
                     "name": "Versioned Coach",
                     "systemPrompt": "PERSONA_V1_INSTRUCTIONS",
@@ -117,7 +113,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
 
             pub_v1 = await client.post(
                 f"/v1/agents/{agent_id}/publish",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
             )
             assert pub_v1.status_code == 200
             v1_id = pub_v1.json()["data"]["currentPublishedVersionId"]
@@ -145,7 +141,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             # 3. Edit draft AND create unpublished v2 snapshot: published v1 must stay active!
             patch_resp = await client.patch(
                 f"/v1/agents/{agent_id}",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
                 json={
                     "systemPrompt": "PERSONA_V2_INSTRUCTIONS",
                     "behaviorRules": ["RULE_V2_PLAYFUL"],
@@ -160,7 +156,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
 
             ver_v2_resp = await client.post(
                 f"/v1/agents/{agent_id}/versions",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
             )
             assert ver_v2_resp.status_code == 201
             v2_id = ver_v2_resp.json()["data"]["versionId"]
@@ -182,7 +178,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             # 4. Publish explicit v2 snapshot.
             pub_v2 = await client.post(
                 f"/v1/agents/{agent_id}/publish",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
                 json={"versionId": v2_id},
             )
             assert pub_v2.status_code == 200
@@ -227,7 +223,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             # 5. Update draft again and publish v3 directly from draft (empty body).
             patch_v3 = await client.patch(
                 f"/v1/agents/{agent_id}",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
                 json={
                     "systemPrompt": "PERSONA_V3_INSTRUCTIONS",
                     "defaultModelId": "model-v3",
@@ -236,7 +232,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             assert patch_v3.status_code == 200
             pub_v3 = await client.post(
                 f"/v1/agents/{agent_id}/publish",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
             )
             assert pub_v3.status_code == 200
             v3_id = pub_v3.json()["data"]["currentPublishedVersionId"]
@@ -245,7 +241,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             # 6. Retire Agent (and repeat idempotently).
             retire_1 = await client.delete(
                 f"/v1/agents/{agent_id}",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
             )
             assert retire_1.status_code == 200
             retired_at = retire_1.json()["data"]["retiredAt"]
@@ -254,7 +250,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
 
             retire_2 = await client.delete(
                 f"/v1/agents/{agent_id}",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
             )
             assert retire_2.status_code == 200
             assert retire_2.json()["data"]["retiredAt"] == retired_at
@@ -322,7 +318,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             # Retired Agent and its last published persona snapshot (v3) remain readable.
             detail_after_restart = await client.get(
                 f"/v1/agents/{agent_id}",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
             )
             assert detail_after_restart.status_code == 200
             detail_data = detail_after_restart.json()["data"]
@@ -364,7 +360,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             # Prior generation record remains readable after restart.
             gen_resp = await client.get(
                 f"/v1/conversations/{conv1_id}/generations/{conv1_gen1_id}",
-                headers=_auth_headers(builtin_users.alice.access_token),
+                headers=builtin_users.alice.headers,
             )
             assert gen_resp.status_code == 200
             assert gen_resp.json()["data"]["status"] == "succeeded"
