@@ -273,12 +273,6 @@ def empty_pg_settings() -> Iterator[Settings]:
             worker_loop_enabled=False,
             auth_jwt_secret=SecretStr(TEST_AUTH_SECRET),
             auth_jwt_leeway_seconds=0,
-            # Until ticket 07 removes legacy dispatch, reject unauthenticated fallback.
-            # Every valid test credential is issued by the built-in auth endpoints.
-            auth_mode="jwt_hs256",
-            auth_jwt_hs256_secret=SecretStr(TEST_AUTH_SECRET),
-            auth_trusted_issuers=["mem-ai-test-unused-external-issuer"],
-            auth_trusted_audience="mem-ai-test-unused-external-audience",
         )
     finally:
         with admin_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:

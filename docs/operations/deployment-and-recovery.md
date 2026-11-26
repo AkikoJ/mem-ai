@@ -179,8 +179,8 @@ psql -U "$POSTGRES_USER" -d postgres -c "DROP DATABASE mem_ai_restore_drill WITH
 
 ### 4.1 密钥注入与零落盘原则
 
-- 严禁将任何真实密钥写入镜像、Git 仓库或 `.env.example`。所有敏感配置（`POSTGRES_PASSWORD`、`AUTH_JWT_HS256_SECRET`、`AUTH_GATEWAY_SHARED_SECRET`、`DELETION_RECEIPT_SECRET`、`METRICS_BEARER_TOKEN`、`OPENAI_COMPAT_API_KEY`、`MEMOS_API_KEY`）通过平台 Secret Manager 或运行时只读环境变量/文件注入。
-- 生产环境（`APP_ENV=production`）启动强校验会自动拒绝：`AUTH_MODE=development`、通配 `ALLOWED_HOSTS=["*"]`、公网开放 `METRICS_ALLOWED_NETWORKS`（如 `0.0.0.0/0` 或 `::/0`），以及短于 32 字符的签名/回执密钥。
+- 严禁将任何真实密钥写入镜像、Git 仓库或 `.env.example`。所有敏感配置（`POSTGRES_PASSWORD`、`AUTH_JWT_SECRET`、`DELETION_RECEIPT_SECRET`、`METRICS_BEARER_TOKEN`、`OPENAI_COMPAT_API_KEY`、`MEMOS_API_KEY`）通过平台 Secret Manager 或运行时只读环境变量/文件注入。
+- 生产环境（`APP_ENV=production`）启动强校验会自动拒绝：默认或短于 32 字符的 `AUTH_JWT_SECRET`、默认 `POSTGRES_PASSWORD`、通配 `ALLOWED_HOSTS=["*"]`、通配 `CORS_ALLOWED_ORIGINS=["*"]`、公网开放 `METRICS_ALLOWED_NETWORKS`（如 `0.0.0.0/0` 或 `::/0`）以及短于 32 字符的 `DELETION_RECEIPT_SECRET`/`METRICS_BEARER_TOKEN`。
 
 ### 4.2 密钥轮换步骤与影响范围
 
@@ -189,12 +189,12 @@ psql -U "$POSTGRES_USER" -d postgres -c "DROP DATABASE mem_ai_restore_drill WITH
 | `OPENAI_COMPAT_API_KEY` / `MEMOS_API_KEY` | 上游签发新 Key -> 更新 Secret -> 滚动重启服务副本 -> 观察请求正常后吊销旧 Key | 零停机；旧 Key 在全部副本滚动完成后吊销 |
 | `METRICS_BEARER_TOKEN` | 先向采集端配置新 Token 或短暂双配置 -> 更新应用 Secret 滚动重启 -> 确认抓取成功 | 仅影响内部监控抓取出入，不影响业务流量 |
 | `POSTGRES_PASSWORD` | 推荐新建过渡 DB 角色或分阶段切密 -> 更新 Secret 滚动重启服务副本 -> 清理旧凭据 | 滚动期间保留连接预算余量 |
-| `AUTH_JWT_HS256_SECRET` / `AUTH_GATEWAY_SHARED_SECRET` | 与上游 IdP/网关协同窗口切换；若需零中断，建议在网关层或 IdP 侧做短暂双签过渡 | 切换瞬间未更新的旧令牌将返回 `401` |
+| `AUTH_JWT_SECRET` | 更新 Secret 并滚动重启服务副本 | 切换后旧 Access Token 将返回 `401`，持有有效 Refresh Token 的客户端可通过 `/v1/auth/refresh` 自动获取新 Access Token；若未配置独立 `DELETION_RECEIPT_SECRET`，轮换也会使未到期删除回执失效 |
 | `DELETION_RECEIPT_SECRET` | 仅在密钥泄漏或定期计划窗口轮换；保持密钥在 `DELETION_RECEIPT_TTL_SECONDS`（默认 30 天）内稳定 | **注意**：轮换会使所有未到期的既有用户删除回执立即失效；若仅需作废单个回执，应走单条回执撤销时间（`deletion_receipt_revoked_at`）而非全局轮换 |
 
 ### 4.3 TLS、反向代理与入口限流基线
 
-- **TLS 与反向代理**：生产入口必须启用 TLS 终止，配置显式 `ALLOWED_HOSTS`、`CORS_ALLOWED_ORIGINS`、`AUTH_TRUSTED_PROXIES` 与 `TRUST_REQUEST_ID_FROM_PROXIES_ONLY=true`。网关必须覆盖或剔除客户端伪造的身份头（`X-Gateway-Auth`、`X-Auth-*`、`X-Forwarded-For`）。
+- **TLS 与反向代理**：生产入口必须启用 TLS 终止，配置显式 `ALLOWED_HOSTS`、`CORS_ALLOWED_ORIGINS`、`AUTH_TRUSTED_PROXIES` 与 `TRUST_REQUEST_ID_FROM_PROXIES_ONLY=true`。应用中间件会始终剔除伪造身份头（`X-User-Id`、`X-Actor-Id`、`X-Gateway-Auth`、`X-Auth-*`），并对非可信代理来源剔除转发头（`X-Forwarded-*`、`X-Real-Ip`、`Forwarded`）。
 - **SSE 与超时协调**：
   - 反向代理对 `/v1/chat` 关闭缓冲（Nginx：`proxy_buffering off; proxy_cache off; chunked_transfer_encoding on;`），并设置 `proxy_read_timeout >= PROXY_READ_TIMEOUT_SECONDS`（且须满足 `CHAT_STREAM_HEARTBEAT_INTERVAL_SECONDS < PROXY_READ_TIMEOUT_SECONDS`，应用启动时已强校验）。
 - **两层限流与进程资源预算**：
@@ -277,12 +277,12 @@ uv run pytest
 python3 tools/check_architecture.py
 ```
 
-### 本地演练实测记录（2026-11-24）
+### 本地演练实测记录（2026-11-26）
 
-- **CI 与静态检查**：`uv lock --check`、`ruff check`、`ruff format --check`、`mypy src`（strict）、`tools/check_architecture.py` 全部通过。
-- **PostgreSQL 17 迁移与历史升级**：空库 `upgrade head` / `downgrade base` / `upgrade head` / 元数据漂移检测、含历史数据（`20261122_0005` -> `20261124_0012`）无损升级与多版本兼容就绪校验均通过实测。
-- **PostgreSQL 17 备份与恢复演练**：实测 `pg_dump -Fc` -> `pg_restore -l` 可读性验证 -> 隔离库 `pg_restore --single-transaction` -> `alembic_version = 20261124_0012` 通过；`tests/integration/test_production_deployment_and_recovery.py` 完整演练了统一单进程生命周期、心跳与任务恢复、基线 A 独立删除审计归档干跑/重放/幂等/防旧任务复活、耗尽任务受控重入队、受控提供方核验及全部已落地公开 HTTP 契约。
+- **CI 与静态检查**：`uv lock --check`、`ruff check`、`ruff format --check`、`mypy src`（strict）、`tools/check_architecture.py`（含已退役路径防回归守卫）全部通过。
+- **PostgreSQL 17 迁移与历史升级**：空库 `upgrade head` / `downgrade base` / `upgrade head` / 元数据漂移检测、含历史数据（`20261122_0005` 及 V1 终版 `20261124_0012` -> `20261126_0014`）无损升级（确定性回填历史用户并删除 `user_identities` 与 `model_configs.required_permission`）与多版本兼容就绪校验均通过实测。
+- **单进程 V2 端到端与备份恢复演练**：`tests/integration/test_production_deployment_and_recovery.py` 完整演练了统一单进程生命周期（注册登录 → 创建发布私有 Agent → 同步/SSE 流式聊天与跨会话异步记忆写入/召回 → 刷新轮换/重放吊销/改密 → 清空屏障 → 删除用户、防同邮箱重注册与回执查询 → 优雅停机与基线 A 删除审计归档重放）、耗尽任务受控重入队与提供方核验；全量 pytest 通过。
 - **剩余上线前置条件（需在拥有真实外部凭据的 Staging 环境执行）**：
-  1. 注入受控测试用 `MEMOS_API_KEY`、`OPENAI_COMPAT_API_KEY` 与真实 IdP JWT/网关凭据，执行一次 `python -m mem_ai.ops verify-providers --check-auth --check-model --check-memory` 验证真实上游分页、幂等、取消与 `get/status` 收敛延迟。
+  1. 注入受控测试用 `MEMOS_API_KEY`、`OPENAI_COMPAT_API_KEY` 并通过内置 `/v1/auth/register` 或 `/v1/auth/login` 获取验收 Access Token，执行一次 `python -m mem_ai.ops verify-providers --check-auth --bearer-token "$STAGING_JWT" --check-model --check-memory` 验证真实上游分页、幂等、取消与 `get/status` 收敛延迟。
   2. 在目标集群配置外部对象存储/独立审计卷挂载 `DELETION_AUDIT_ARCHIVE_PATH`（基线 A）或配置 PostgreSQL WAL 连续归档（基线 B）并完成一次平台级演练签核。
   3. 在入口网关落盘 TLS 证书、分布式频率限制规则、SSE 禁缓冲与 `ALLOWED_HOSTS`/`AUTH_TRUSTED_PROXIES` 生产白名单。

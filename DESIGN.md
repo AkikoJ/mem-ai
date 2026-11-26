@@ -249,8 +249,6 @@ PostgreSQL 保存全部应用主数据、登录会话与可恢复后台任务。
 | `operations` | 删除与异步记忆操作的聚合进度、回执摘要与审计导出源 |
 | `memory_scopes`、`memory_tombstones`、`memory_list_snapshots` | 用户与提供方记忆代次、屏障、待删除标记及多副本分页快照 |
 
-> **现状衔接说明**：现有 V1 源码仍使用 `user_identities` 承接过渡期外部身份映射，待内置认证重构切片落地后切换至 `users` 本地凭据 + `auth_sessions` 目标结构。
-
 ### 6.1 召回记忆与对话消息的关联
 
 `message_recalled_memories` 关联本次生成的原始用户消息，仅记录实际注入 Prompt 的记忆元数据（`provider_id`、`memory_id`、`scope`、`relevance`、`prompt_position`、`memory_epoch`、`recalled_at`、`deleted_at`），记忆正文由外部记忆提供方管理。
@@ -282,7 +280,7 @@ Content-Type: application/json
 
 | 资源 | 路由 |
 | --- | --- |
-| 内置认证（目标收敛） | `POST /v1/auth/register`、`POST /v1/auth/login`、`POST /v1/auth/refresh`、`POST /v1/auth/logout`、`POST /v1/auth/password` |
+| 内置认证 | `POST /v1/auth/register`、`POST /v1/auth/login`、`POST /v1/auth/refresh`、`POST /v1/auth/logout`、`POST /v1/auth/password` |
 | 当前用户 | `GET /v1/users/me`、`DELETE /v1/users/me` |
 | 聊天 | `POST /v1/chat` |
 | 会话历史 | `GET /v1/conversations`、`GET /v1/conversations/{conversationId}`、`GET /v1/conversations/{conversationId}/messages` |
@@ -328,11 +326,11 @@ Content-Type: application/json
 
 本服务明确**不拆分为多服务、不引入 Cordis 插件运行时**。所有新增能力（例如后续若需知识库、工具调用或多模态附件）均以本仓内新增领域模块的方式演进，共享同一进程、同一 PostgreSQL 连接与同一工程检查基线。
 
-基于已全部落地的 V1 基础实现（18 个垂直切片，见 [实施规格](.scratch/ai-chat-memory/spec.md#implementation-plan)），向新定位目标体系收敛聚焦以下 3 项清晰重构：
+基于已全部落地的 V1 基础实现（18 个垂直切片，见 [实施规格](.scratch/ai-chat-memory/spec.md#implementation-plan)），向一体化单进程目标体系的 3 项架构收敛（[收敛规格](.scratch/unified-single-process-backend/spec.md#implementation-plan)，ticket 01–07）已全部完成：
 
-1. **单进程任务内嵌收敛**：将 `workers/main.py` 独立进程装配迁入 FastAPI `application.py` `lifespan` 启动与优雅排空，移除独立 Worker 进程与独立探针端口，合并连接池与并发预算配置。
-2. **人设边界内聚收敛（已完成，ticket 01）**：不可变快照类型与按拥有者读取最新/固定版本的服务入口已归入 `modules/agents/`；`conversations` 直接调用该公开服务，旧 `personas` 模块与 `PersonaProvider` 协议已移除。
-3. **纯内置认证与权限裁剪收敛**：落地内置 `email` + 密码 + `auth_sessions` 认证闭环，移除 `trusted_gateway`、外部 `user_identities` 映射、`AuthenticationContext.permissions` 与 `model_configs.required_permission`。
+1. **单进程任务内嵌收敛（已完成，ticket 02–03）**：将后台任务执行器装配、周期调度、心跳与优雅排空迁入 FastAPI `application.py` `lifespan`，移除独立 Worker 进程入口与独立探针端口，统一单进程连接池与并发预算校验。
+2. **人设边界内聚收敛（已完成，ticket 01）**：不可变快照类型与按拥有者读取最新/固定版本的服务入口归入 `modules/agents/`；`conversations` 直接调用该公开服务，旧 `personas` 模块与 `PersonaProvider` 协议已移除。
+3. **纯内置认证与权限裁剪收敛（已完成，ticket 04–07）**：落地内置 `email` + 密码 + `auth_sessions` 认证闭环，移除所有外部认证适配器、`trusted_gateway`、`user_identities` 表、`VerifiedPrincipal`、`AuthenticationContext.permissions` 与 `model_configs.required_permission` 列。
 
 ## 11. 验证重点
 

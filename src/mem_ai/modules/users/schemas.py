@@ -18,7 +18,7 @@ class UserRecord(BaseModel):
 
     id: UUID
     status: UserStatus
-    email: str | None = None
+    email: str
     created_at: datetime
     updated_at: datetime
     deleted_at: datetime | None = None
@@ -31,8 +31,8 @@ class UserCredentialRecord(BaseModel):
 
     id: UUID
     status: UserStatus
-    email: str | None = None
-    password_hash: str | None = None
+    email: str
+    password_hash: str
     created_at: datetime
     updated_at: datetime
     deleted_at: datetime | None = None
@@ -44,9 +44,7 @@ class UserMeResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 
     user_id: UUID = Field(alias="userId", serialization_alias="userId")
-    actor_id: str = Field(alias="actorId", serialization_alias="actorId")
+    email: str
     auth_method: str = Field(alias="authMethod", serialization_alias="authMethod")
-    permissions: list[str]
-    email: str | None
     status: UserStatus
     created_at: datetime = Field(alias="createdAt", serialization_alias="createdAt")

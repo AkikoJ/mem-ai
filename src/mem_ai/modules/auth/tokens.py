@@ -186,19 +186,6 @@ def _decode_json_object(segment: str) -> dict[str, Any]:
     return decoded
 
 
-def try_peek_jwt_issuer(token: str) -> str | None:
-    """不验签读取 `iss`，仅用于将内置令牌分派给 `verify_access_token` 完整验签。"""
-    segments = token.split(".")
-    if len(segments) != 3:
-        return None
-    try:
-        payload = _decode_json_object(segments[1])
-    except UnauthorizedError:
-        return None
-    issuer = payload.get("iss")
-    return issuer if isinstance(issuer, str) else None
-
-
 def _parse_uuid_claim(value: object, *, name: str) -> UUID:
     try:
         return UUID(str(value))

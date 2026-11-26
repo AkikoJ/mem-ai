@@ -80,7 +80,7 @@ def test_access_token_round_trip_preserves_claims() -> None:
     assert claims.session_id == session_id
     assert claims.email == "a@example.com"
     assert claims.issuer == tokens.BUILTIN_JWT_ISSUER
-    assert tokens.try_peek_jwt_issuer(token) == tokens.BUILTIN_JWT_ISSUER
+    assert not hasattr(tokens, "try_peek_jwt_issuer")
 
 
 def _payload(**overrides: object) -> dict[str, object]:
@@ -150,7 +150,6 @@ def test_access_token_expired_and_malformed() -> None:
     for bad in ("", "a.b", "a..c", "not-a-jwt"):
         with pytest.raises(UnauthorizedError):
             tokens.verify_access_token(bad, secret=SECRET)
-    assert tokens.try_peek_jwt_issuer("not-a-jwt") is None
 
 
 def test_production_requires_strong_non_default_auth_jwt_secret() -> None:
@@ -158,10 +157,6 @@ def test_production_requires_strong_non_default_auth_jwt_secret() -> None:
         "_env_file": None,
         "app_env": "production",
         "postgres_password": "strong-prod-password-123",
-        "auth_mode": "jwt_hs256",
-        "auth_jwt_hs256_secret": "super-secret-jwt-signing-key-at-least-32-chars",
-        "auth_trusted_issuers": ["https://idp.example.com"],
-        "auth_trusted_audience": "mem-ai-api",
         "allowed_hosts": ["api.example.com"],
         "cors_allowed_origins": ["https://app.example.com"],
     }
@@ -174,6 +169,28 @@ def test_production_requires_strong_non_default_auth_jwt_secret() -> None:
         auth_jwt_secret="a-sufficiently-long-builtin-jwt-secret-1234",
     )
     assert settings.auth_jwt_secret.get_secret_value().startswith("a-sufficiently")
+    assert settings.deletion_receipt_signing_key() == (
+        b"a-sufficiently-long-builtin-jwt-secret-1234"
+    )
+    assert not hasattr(settings, "auth_mode")
+    assert not hasattr(settings, "auth_jwt_hs256_secret")
+    assert not hasattr(settings, "auth_gateway_shared_secret")
+    assert not hasattr(settings, "auth_trusted_issuers")
+    assert not hasattr(settings, "auth_trusted_audience")
+
+
+def test_auth_context_excludes_legacy_principal_actor_and_permissions() -> None:
+    from mem_ai.modules.auth import context as auth_context
+
+    assert not hasattr(auth_context, "VerifiedPrincipal")
+    ctx = auth_context.AuthenticationContext(
+        user_id=uuid4(),
+        email="alice@example.com",
+        auth_method="builtin_jwt",
+    )
+    assert not hasattr(ctx, "actor_id")
+    assert not hasattr(ctx, "permissions")
+    assert not hasattr(ctx, "has_permission")
 
 
 def test_retention_policy_and_summary_include_auth_sessions() -> None:

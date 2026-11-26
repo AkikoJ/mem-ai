@@ -56,7 +56,6 @@ class ModelConfigSeed(BaseModel):
     supports_streaming: StrictBool = True
     max_context_tokens: int | None = Field(default=None, ge=1)
     max_output_tokens: int | None = Field(default=None, ge=1)
-    required_permission: OptionalModelText128 = None
     credential_ref: OptionalModelText128 = None
     capabilities_json: dict[str, Any] = Field(default_factory=dict)
 
@@ -81,7 +80,6 @@ class ModelConfigRecord(BaseModel):
     supports_streaming: bool
     max_context_tokens: int | None = None
     max_output_tokens: int | None = None
-    required_permission: str | None = None
     credential_ref: str | None = None
     capabilities_json: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime

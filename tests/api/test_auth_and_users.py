@@ -17,7 +17,12 @@ from mem_ai.core.logging import JsonLogFormatter
 from mem_ai.modules.auth.dependencies import AuthContextDep
 from mem_ai.modules.auth.tokens import create_access_token
 from mem_ai.modules.users import service as users_service
-from tests.conftest import BuiltinUsers, login_builtin_user, register_builtin_user
+from tests.conftest import (
+    BuiltinUsers,
+    login_builtin_user,
+    register_builtin_user,
+    sign_hs256_jwt,
+)
 
 
 @pytest.mark.integration
@@ -62,6 +67,8 @@ async def test_users_me_returns_builtin_profile_correlates_logs_and_survives_res
                 assert data["authMethod"] == "builtin_jwt"
                 assert data["status"] == "active"
                 assert data["createdAt"]
+                assert "actorId" not in data
+                assert "permissions" not in data
     finally:
         logger.removeHandler(handler)
         logger.setLevel(original_level)
@@ -110,6 +117,20 @@ async def test_expired_malformed_tampered_and_duplicate_bearer_credentials_are_r
             response = await client.get(
                 "/v1/users/me", headers={"Authorization": f"Bearer {invalid}"}
             )
+            assert response.status_code == 401
+            assert response.json()["code"] == "invalid_credentials"
+        external_jwt = sign_hs256_jwt(
+            {
+                "iss": "https://external-idp.example.com",
+                "aud": "mem-ai-api",
+                "sub": str(alice.user_id),
+                "typ": "access",
+                "exp": 9999999999,
+            },
+            secret=migrated_pg_settings.auth_jwt_secret.get_secret_value(),
+        )
+        for bad_header in ("Basic dXNlcjpwYXNz", f"Bearer {external_jwt}", "Bearer   "):
+            response = await client.get("/v1/users/me", headers={"Authorization": bad_header})
             assert response.status_code == 401
             assert response.json()["code"] == "invalid_credentials"
         duplicate = await client.get(

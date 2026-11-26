@@ -41,6 +41,11 @@ _ALWAYS_UNTRUSTED_IDENTITY_HEADERS = frozenset(
         b"x-actor-id",
         b"x-forwarded-user",
         b"x-remote-user",
+        b"x-gateway-auth",
+        b"x-auth-issuer",
+        b"x-auth-subject",
+        b"x-auth-actor-id",
+        b"x-auth-permissions",
     }
 )
 _UNTRUSTED_PROXY_FORWARDING_HEADERS = frozenset(
@@ -187,32 +192,22 @@ class AllowedHostMiddleware:
 
 
 class IdentityHeaderSanitizerMiddleware:
-    """Strip forged identity and forwarding headers when peer is not a trusted proxy."""
+    """Strip forged identity headers always and proxy forwarding headers from untrusted peers."""
 
     def __init__(self, app: ASGIApp, *, settings: Settings) -> None:
         self.app = app
-        self._trusted_gateway_enabled = settings.auth_mode == "trusted_gateway"
         self._trusted_proxies = settings.trusted_proxy_networks()
-        self._gateway_headers = frozenset(
-            name.lower().encode("latin-1") for name in settings.gateway_headers().all_names()
-        )
-        self._non_gateway_untrusted = _ALWAYS_UNTRUSTED_IDENTITY_HEADERS - self._gateway_headers
         self._all_spoofable = (
-            _ALWAYS_UNTRUSTED_IDENTITY_HEADERS
-            | self._gateway_headers
-            | _UNTRUSTED_PROXY_FORWARDING_HEADERS
+            _ALWAYS_UNTRUSTED_IDENTITY_HEADERS | _UNTRUSTED_PROXY_FORWARDING_HEADERS
         )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http":
             client_host = _client_host_from_scope(scope)
             is_trusted_peer = is_ip_in_networks(client_host, self._trusted_proxies)
-            if self._trusted_gateway_enabled and is_trusted_peer:
-                strip_headers = self._non_gateway_untrusted
-            elif is_trusted_peer:
-                strip_headers = _ALWAYS_UNTRUSTED_IDENTITY_HEADERS | self._gateway_headers
-            else:
-                strip_headers = self._all_spoofable
+            strip_headers = (
+                _ALWAYS_UNTRUSTED_IDENTITY_HEADERS if is_trusted_peer else self._all_spoofable
+            )
 
             raw_headers = scope.get("headers")
             if raw_headers:

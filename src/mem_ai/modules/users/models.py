@@ -1,25 +1,14 @@
-"""SQLAlchemy ORM models for `users` and `user_identities`."""
+"""SQLAlchemy ORM model for `users`."""
 
 from __future__ import annotations
 
 from datetime import datetime
-from uuid import UUID
 
-from sqlalchemy import (
-    CheckConstraint,
-    DateTime,
-    ForeignKey,
-    Index,
-    String,
-    UniqueConstraint,
-    text,
-)
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy import CheckConstraint, DateTime, Index, String
 from sqlalchemy.orm import Mapped, mapped_column
 
-from mem_ai.db.base import Base, CreatedAtMixin, TimestampMixin, UUIDPrimaryKeyMixin
+from mem_ai.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
-USER_IDENTITY_UNIQUE_CONSTRAINT = "uq_user_identities_issuer_subject"
 USER_EMAIL_UNIQUE_INDEX = "ix_users_email_unique"
 
 
@@ -29,14 +18,9 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "users"
     __table_args__ = (
         CheckConstraint("status IN ('active', 'disabled', 'deleting')", name="status_valid"),
-        CheckConstraint("email IS NULL OR email = lower(email)", name="email_lowercase"),
+        CheckConstraint("email <> '' AND email = lower(email)", name="email_lowercase"),
         Index("ix_users_status", "status"),
-        Index(
-            USER_EMAIL_UNIQUE_INDEX,
-            "email",
-            unique=True,
-            postgresql_where=text("email IS NOT NULL"),
-        ),
+        Index(USER_EMAIL_UNIQUE_INDEX, "email", unique=True),
     )
 
     status: Mapped[str] = mapped_column(
@@ -50,32 +34,12 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=True,
         default=None,
     )
-    # 内置认证凭据：规范化小写邮箱与强哈希密码
-    email: Mapped[str | None] = mapped_column(
+    # 内置认证凭据：规范化小写唯一邮箱与强哈希密码
+    email: Mapped[str] = mapped_column(
         String(255),
-        nullable=True,  # 兼容历史行升级
-        default=None,
+        nullable=False,
     )
-    password_hash: Mapped[str | None] = mapped_column(
+    password_hash: Mapped[str] = mapped_column(
         String(255),
-        nullable=True,  # 兼容历史行升级
-        default=None,
-    )
-
-
-class UserIdentity(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
-    """Unique mapping from a verified external `(issuer, subject)` to a local user."""
-
-    __tablename__ = "user_identities"
-    __table_args__ = (
-        UniqueConstraint("issuer", "subject"),
-        Index("ix_user_identities_user_id", "user_id"),
-    )
-
-    issuer: Mapped[str] = mapped_column(String(255), nullable=False)
-    subject: Mapped[str] = mapped_column(String(255), nullable=False)
-    user_id: Mapped[UUID] = mapped_column(
-        PG_UUID(as_uuid=True),
-        ForeignKey("users.id", ondelete="RESTRICT"),
         nullable=False,
     )

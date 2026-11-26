@@ -47,11 +47,6 @@ class ModelConfig(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     max_context_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     max_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
-    required_permission: Mapped[str | None] = mapped_column(
-        String(128),
-        nullable=True,
-        default=None,
-    )
     credential_ref: Mapped[str | None] = mapped_column(
         String(128),
         nullable=True,

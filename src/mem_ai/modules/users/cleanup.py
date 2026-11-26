@@ -255,7 +255,7 @@ class UserCleanupJobHandler:
                     batch_size=self._batch_size,
                 ):
                     raise RuntimeError("user child operations were not settled before finalization")
-                await repository.delete_user_and_identities(session, user_id=owner)
+                await repository.delete_deleting_user(session, user_id=owner)
                 await operations_service.transition_operation_in_session(
                     session,
                     operation_id=current.id,

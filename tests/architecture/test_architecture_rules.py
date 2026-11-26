@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterator
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
@@ -13,6 +14,7 @@ from mem_ai.core.config import Settings
 from tools.check_architecture import (
     ArchitectureErrors,
     check_imports_for_source,
+    check_retired_paths,
     run_all_checks,
 )
 
@@ -48,6 +50,11 @@ def test_assembled_fastapi_app_has_unique_method_and_canonical_routes() -> None:
     assert ("GET", "/health/live") in seen
     assert ("GET", "/health/ready") in seen
     assert ("GET", "/metrics") in seen
+    assert ("POST", "/v1/auth/register") in seen
+    assert ("POST", "/v1/auth/login") in seen
+    assert ("POST", "/v1/auth/refresh") in seen
+    assert ("POST", "/v1/auth/logout") in seen
+    assert ("POST", "/v1/auth/password") in seen
     assert ("GET", "/v1/users/me") in seen
     assert ("GET", "/v1/models") in seen
     assert ("POST", "/v1/chat") in seen
@@ -73,3 +80,24 @@ def test_layered_import_rule_rejects_forbidden_contract_and_router_dependencies(
     )
     assert any("Router 禁止越层依赖" in msg and "sqlalchemy" in msg for msg in router_errors.items)
     assert any("禁止跨模块直接访问持久化层" in msg for msg in router_errors.items)
+
+
+def test_retired_paths_guard_rejects_reappearing_legacy_modules(tmp_path: Path) -> None:
+    clean_errors = ArchitectureErrors()
+    check_retired_paths(clean_errors, root=tmp_path)
+    assert clean_errors.items == []
+
+    for rel in (
+        "src/mem_ai/modules/auth/adapters.py",
+        "src/mem_ai/modules/personas/service.py",
+        "src/mem_ai/contracts/persona_provider.py",
+        "src/mem_ai/workers/main.py",
+    ):
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("# retired\n", encoding="utf-8")
+
+    retired_errors = ArchitectureErrors()
+    check_retired_paths(retired_errors, root=tmp_path)
+    assert len(retired_errors.items) == 4
+    assert all("已退役路径" in msg for msg in retired_errors.items)

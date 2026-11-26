@@ -372,11 +372,7 @@ async def test_allowed_hosts_cors_trusted_proxy_request_id_and_forged_headers() 
         postgres_password=SecretStr("strong-prod-password-123"),
         allowed_hosts=["api.example.com", "*.internal.example.com"],
         cors_allowed_origins=["https://app.example.com"],
-        auth_mode="jwt_hs256",
         auth_trusted_proxies=["10.0.0.0/8"],
-        auth_trusted_issuers=["https://unused.example.com"],
-        auth_trusted_audience="unused-test-audience",
-        auth_jwt_hs256_secret=SecretStr("unused-external-signing-key-at-least-32-chars"),
         auth_jwt_secret=SecretStr("super-secret-jwt-signing-key-at-least-32-chars"),
     )
     app = create_app(
@@ -392,7 +388,22 @@ async def test_allowed_hosts_cors_trusted_proxy_request_id_and_forged_headers() 
         return {
             "forwarded_for": request.headers.get("x-forwarded-for"),
             "user_id": request.headers.get("x-user-id"),
+            "gateway_auth": request.headers.get("x-gateway-auth"),
+            "auth_issuer": request.headers.get("x-auth-issuer"),
+            "auth_subject": request.headers.get("x-auth-subject"),
+            "auth_actor_id": request.headers.get("x-auth-actor-id"),
+            "auth_permissions": request.headers.get("x-auth-permissions"),
         }
+
+    spoofed_headers = {
+        "X-Forwarded-For": "10.0.0.5",
+        "X-User-Id": "spoofed-user",
+        "X-Gateway-Auth": "forged-secret",
+        "X-Auth-Issuer": "https://evil.idp",
+        "X-Auth-Subject": "spoofed-sub",
+        "X-Auth-Actor-Id": "spoofed-actor",
+        "X-Auth-Permissions": "admin:all",
+    }
 
     # 1. Untrusted external peer (203.0.113.9): Host reject, CORS, forged Request-ID & headers
     untrusted_transport = httpx.ASGITransport(app=_with_client_ip(app, "203.0.113.9"))
@@ -439,21 +450,20 @@ async def test_allowed_hosts_cors_trusted_proxy_request_id_and_forged_headers() 
         )
         assert "access-control-allow-origin" not in cors_denied.headers
 
-        # Forged identity & proxy forwarding headers stripped from untrusted peer
-        sanitized = await client.get(
-            "/_test/headers",
-            headers={
-                "X-Forwarded-For": "10.0.0.5",
-                "X-User-Id": "spoofed-user",
-            },
-        )
+        # Forged identity, legacy gateway & proxy forwarding headers stripped from untrusted peer
+        sanitized = await client.get("/_test/headers", headers=spoofed_headers)
         assert sanitized.status_code == 200
         assert sanitized.json() == {
             "forwarded_for": None,
             "user_id": None,
+            "gateway_auth": None,
+            "auth_issuer": None,
+            "auth_subject": None,
+            "auth_actor_id": None,
+            "auth_permissions": None,
         }
 
-    # 2. Trusted proxy peer (10.0.0.42): safe X-Request-Id preserved, unsafe X-Request-Id replaced
+    # 2. Trusted proxy peer (10.0.0.42): safe X-Request-Id & forwarding preserved, gateway stripped
     trusted_transport = httpx.ASGITransport(app=_with_client_ip(app, "10.0.0.42"))
     async with httpx.AsyncClient(
         transport=trusted_transport, base_url="http://api.example.com"
@@ -472,3 +482,15 @@ async def test_allowed_hosts_cors_trusted_proxy_request_id_and_forged_headers() 
         assert unsafe_rid.status_code == 200
         assert unsafe_rid.headers["x-request-id"] != "bad id with spaces;drop"
         assert unsafe_rid.headers["x-request-id"].startswith("req_")
+
+        trusted_sanitized = await client.get("/_test/headers", headers=spoofed_headers)
+        assert trusted_sanitized.status_code == 200
+        assert trusted_sanitized.json() == {
+            "forwarded_for": "10.0.0.5",
+            "user_id": None,
+            "gateway_auth": None,
+            "auth_issuer": None,
+            "auth_subject": None,
+            "auth_actor_id": None,
+            "auth_permissions": None,
+        }

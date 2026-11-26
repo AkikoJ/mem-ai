@@ -20,4 +20,4 @@ Mem-AI 不再定位为“为未来拆分独立记忆服务、独立人设服务�
 
 - HTTP 请求与内嵌后台任务共享同一进程的事件循环、HTTPX 连接池与 PostgreSQL 连接池，因此必须通过独立的并发预算（请求并发、生成并发、后台任务并发）与连接池总预算隔离资源竞争，并在停机时统一排空同步生成与在途后台任务。
 - 用户删除期间改为保留 `users` 行处于 `deleting` 状态（占用唯一 `email` 防同邮箱重复注册）并立即吊销全部 `auth_sessions`，待本地与远程记忆清理确认完成后再物理移除用户记录。
-- 人设收敛切片（01）及单进程内嵌后台任务与运维统一收敛切片（02–03）已完成：只读快照和类型已归入 `agents`，`workers/main.py` 独立入口与独立探针/指标端口已彻底移除；`auth` 外部适配器及 `permissions` / `required_permission` 在对应内置认证重构切片（04–07）完成前暂作为 V1 过渡实现保留。
+- 全部 7 个架构收敛切片（01–07）已落地并完成端到端验收：人设只读快照与类型归入 `agents`，独立 `workers/main.py` 入口及探针/指标端口已移除，内置 `email` + 密码 + JWT + `auth_sessions` 认证闭环已上线，且外部认证适配器、`VerifiedPrincipal`、`permissions`、`user_identities` 表与 `model_configs.required_permission` 列均已彻底移除。

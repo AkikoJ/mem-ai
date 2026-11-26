@@ -62,11 +62,7 @@ def test_production_accepts_hardened_configuration() -> None:
         postgres_password="strong-prod-password-123",
         allowed_hosts=["api.example.com"],
         cors_allowed_origins=["https://app.example.com"],
-        auth_mode="jwt_hs256",
-        auth_jwt_hs256_secret="super-secret-jwt-signing-key-at-least-32-chars",
         auth_jwt_secret="super-secret-jwt-signing-key-at-least-32-chars",
-        auth_trusted_issuers=["https://idp.example.com"],
-        auth_trusted_audience="mem-ai-api",
     )
 
     assert settings.app_env == "production"
@@ -218,6 +214,15 @@ def test_model_routing_policy_and_registry_entry_validation() -> None:
             app_env="test",
             model_registry_entries=[
                 {"model_id": "bad-entry", "api_key": "sk-never-here", "base_url": "https://x"}
+            ],
+        )
+
+    with pytest.raises(ValidationError, match="unsupported keys"):
+        Settings(
+            _env_file=None,
+            app_env="test",
+            model_registry_entries=[
+                {"model_id": "legacy-perm", "required_permission": "models:pro"}
             ],
         )
 
@@ -496,11 +501,7 @@ def test_resource_limits_observability_and_proxy_heartbeat_coordination_settings
             _env_file=None,
             app_env="production",
             postgres_password="strong-prod-password-123",
-            auth_mode="jwt_hs256",
-            auth_jwt_hs256_secret="super-secret-jwt-signing-key-at-least-32-chars",
             auth_jwt_secret="super-secret-jwt-signing-key-at-least-32-chars",
-            auth_trusted_issuers=["https://idp.example.com"],
-            auth_trusted_audience="mem-ai-api",
         )
 
     with pytest.raises(ValidationError, match="allowed_hosts"):
@@ -509,11 +510,7 @@ def test_resource_limits_observability_and_proxy_heartbeat_coordination_settings
             app_env="production",
             postgres_password="strong-prod-password-123",
             allowed_hosts=["*"],
-            auth_mode="jwt_hs256",
-            auth_jwt_hs256_secret="super-secret-jwt-signing-key-at-least-32-chars",
             auth_jwt_secret="super-secret-jwt-signing-key-at-least-32-chars",
-            auth_trusted_issuers=["https://idp.example.com"],
-            auth_trusted_audience="mem-ai-api",
         )
 
     with pytest.raises(ValidationError, match="metrics_allowed_networks"):
@@ -523,11 +520,7 @@ def test_resource_limits_observability_and_proxy_heartbeat_coordination_settings
             postgres_password="strong-prod-password-123",
             allowed_hosts=["api.example.com"],
             metrics_allowed_networks=["0.0.0.0/0"],
-            auth_mode="jwt_hs256",
-            auth_jwt_hs256_secret="super-secret-jwt-signing-key-at-least-32-chars",
             auth_jwt_secret="super-secret-jwt-signing-key-at-least-32-chars",
-            auth_trusted_issuers=["https://idp.example.com"],
-            auth_trusted_audience="mem-ai-api",
         )
 
     prod = Settings(
@@ -536,10 +529,6 @@ def test_resource_limits_observability_and_proxy_heartbeat_coordination_settings
         postgres_password="strong-prod-password-123",
         allowed_hosts=["api.example.com", "*.internal.example.com"],
         cors_allowed_origins=["https://app.example.com"],
-        auth_mode="jwt_hs256",
-        auth_jwt_hs256_secret="super-secret-jwt-signing-key-at-least-32-chars",
         auth_jwt_secret="super-secret-jwt-signing-key-at-least-32-chars",
-        auth_trusted_issuers=["https://idp.example.com"],
-        auth_trusted_audience="mem-ai-api",
     )
     assert prod.effective_trust_request_id_from_proxies_only() is True

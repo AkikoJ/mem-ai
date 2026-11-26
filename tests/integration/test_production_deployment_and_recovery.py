@@ -50,8 +50,6 @@ from tests.conftest import (
 _PROD_JWT_SECRET = "prod-drill-jwt-signing-secret-32chars!!"
 _PROD_RECEIPT_SECRET = "prod-drill-receipt-signing-key-32ch!!"
 _PROD_METRICS_TOKEN = "prod-drill-metrics-bearer-token-32ch!!"
-_PROD_ISSUER = "https://idp.prod.mem-ai.example"
-_PROD_AUDIENCE = "mem-ai-prod-api"
 _PROD_HOST = "api.prod.mem-ai.example"
 
 
@@ -66,10 +64,6 @@ def _production_settings(
 ) -> Settings:
     updates: dict[str, Any] = {
         "app_env": "production",
-        "auth_mode": "jwt_hs256",
-        "auth_trusted_issuers": [_PROD_ISSUER],
-        "auth_trusted_audience": _PROD_AUDIENCE,
-        "auth_jwt_hs256_secret": SecretStr(_PROD_JWT_SECRET),
         "auth_jwt_secret": SecretStr(_PROD_JWT_SECRET),
         "deletion_receipt_secret": SecretStr(_PROD_RECEIPT_SECRET),
         "allowed_hosts": [_PROD_HOST],
@@ -148,7 +142,7 @@ async def test_unified_single_process_lifecycle_probes_recovery_and_budget(
             assert (await client.get("/health/live")).status_code == 200
             ready_resp = await client.get("/health/ready")
             assert ready_resp.status_code == 200
-            assert ready_resp.json()["data"]["migration_revision"] == "20261126_0013"
+            assert ready_resp.json()["data"]["migration_revision"] == "20261126_0014"
 
             for _ in range(40):
                 if hb_file.exists():
@@ -696,9 +690,8 @@ async def test_verify_providers_harness_validates_auth_model_and_memos_capabilit
             assert len(memos_writes_seen) == 3
             assert memos_writes_seen[0] == memos_writes_seen[1]
             # Combined --check-auth + --check-memory reuses the verified built-in user
-            # without creating legacy user_identities rows.
+            # directly without any legacy external identity mapping table.
             async with sf() as session:
-                assert (await session.scalar(text("SELECT count(*) FROM user_identities"))) == 0
                 assert (await session.scalars(text("SELECT id FROM users"))).all() == [
                     registered.user_id
                 ]
@@ -708,6 +701,14 @@ async def test_verify_providers_harness_validates_auth_model_and_memos_capabilit
                     )
                 ).all()
                 assert snapshot_users == [registered.user_id]
+            with pytest.raises(ValueError, match="probe_user_id"):
+                await verify_providers(
+                    prod_settings,
+                    session_factory=sf,
+                    check_memory=True,
+                    memory_provider=memos_adapter,
+                    http_client=mock_http,
+                )
             # The operational probe verifies the token signature and current local status.
             header, payload, signature = token.split(".")
             wrong_signature = ("A" if signature[0] != "A" else "B") + signature[1:]
@@ -1048,3 +1049,289 @@ async def test_v1_public_contract_end_to_end_acceptance(
             )
             assert receipt_resp.status_code == 200
             assert receipt_resp.json()["data"]["operationType"] == "user_delete"
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
+async def test_v2_unified_single_process_end_to_end_acceptance(
+    migrated_pg_settings: Settings,
+    tmp_path: Path,
+) -> None:
+    """Single-process V2 closed loop: auth, chat, worker, clear, delete & audit replay."""
+    archive_path = tmp_path / "v2-e2e-audit.jsonl"
+    heartbeat_file = tmp_path / "v2-e2e-heartbeat.json"
+    prod_settings = _production_settings(
+        migrated_pg_settings,
+        archive_path=archive_path,
+        heartbeat_file=heartbeat_file,
+        worker_loop_enabled=True,
+        worker_poll_interval_seconds=0.05,
+        worker_heartbeat_interval_seconds=0.1,
+    ).model_copy(update={"worker_reconcile_delay_seconds": 0.1})
+
+    class _GateableMemoryProvider(FakeMemoryProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.block_clear: asyncio.Event | None = None
+
+        async def clear_memories(self, *, user_id: UUID) -> Any:
+            if self.block_clear is not None:
+                await self.block_clear.wait()
+            return await super().clear_memories(user_id=user_id)
+
+    memory_provider = _GateableMemoryProvider()
+    model_provider = FakeModelProvider(prefix="v2:")
+    app = create_app(
+        prod_settings,
+        providers=ProviderRegistry(
+            model_provider=model_provider,
+            memory_provider=memory_provider,
+        ),
+    )
+
+    user_email = "v2-closed-loop@example.com"
+    new_password = "Rotated-Password-99!"
+
+    async with app.router.lifespan_context(app):
+        sf = app.state.session_factory
+        transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 40030))
+        async with httpx.AsyncClient(
+            transport=transport, base_url=f"http://{_PROD_HOST}"
+        ) as client:
+            # 1. Register & login (two sessions) + clean user profile without legacy fields
+            device_a = await register_builtin_user(client, email="  V2-Closed-Loop@Example.COM ")
+            device_b = await login_builtin_user(client, email=user_email)
+            assert device_a.user_id == device_b.user_id
+            me = await client.get("/v1/users/me", headers=device_a.headers)
+            assert me.status_code == 200
+            me_data = me.json()["data"]
+            assert me_data["email"] == user_email
+            assert "actorId" not in me_data
+            assert "permissions" not in me_data
+
+            # 2. Create & publish private Agent
+            ag_resp = await client.post(
+                "/v1/agents",
+                headers=device_a.headers,
+                json={
+                    "name": "V2 Unified Agent",
+                    "systemPrompt": "Remember user preferences.",
+                    "defaultModelId": "gpt-4o-mini",
+                    "memoryPolicy": {
+                        "enabled": True,
+                        "writeEnabled": True,
+                        "writeScope": "user",
+                    },
+                },
+            )
+            assert ag_resp.status_code == 201
+            agent_id = ag_resp.json()["data"]["agentId"]
+            pub_resp = await client.post(
+                f"/v1/agents/{agent_id}/publish",
+                headers=device_a.headers,
+                json={},
+            )
+            assert pub_resp.status_code == 200
+
+            # 3. Sync chat -> embedded worker writes memory -> SSE chat in a new conversation
+            #    recalls the user-scope memory without turn-1 conversation history
+            sync_resp = await client.post(
+                "/v1/chat",
+                headers={**device_a.headers, "Idempotency-Key": f"v2-sync-{uuid4().hex}"},
+                json={"agentId": agent_id, "message": "I prefer oolong tea."},
+            )
+            assert sync_resp.status_code == 200
+            first_conv_id = sync_resp.json()["data"]["conversationId"]
+
+            for _ in range(80):
+                if any(rec.user_id == device_a.user_id for rec in memory_provider.records.values()):
+                    break
+                await asyncio.sleep(0.05)
+            assert any(rec.user_id == device_a.user_id for rec in memory_provider.records.values())
+
+            stream_resp = await client.post(
+                "/v1/chat",
+                headers={**device_a.headers, "Idempotency-Key": f"v2-sse-{uuid4().hex}"},
+                json={
+                    "agentId": agent_id,
+                    "message": "What tea do I like?",
+                    "stream": True,
+                },
+            )
+            assert stream_resp.status_code == 200
+            sse_events = parse_sse_text(stream_resp.text)
+            assert sse_events[0].event == "conversation.started"
+            second_conv_id = sse_events[0].data["conversation_id"]
+            second_user_msg_id = sse_events[0].data["message_id"]
+            assert second_conv_id != first_conv_id
+            assert any(e.event == "message.delta" for e in sse_events)
+            assert sse_events[-1].event == "conversation.completed"
+            # Verify memory recall injected into the system prompt and persisted as a recall ref.
+            assert any(
+                msg.role == "system" and "oolong tea" in msg.content
+                for msg in model_provider.requests[-1].messages
+            )
+            async with sf() as session:
+                recalled_count = await session.scalar(
+                    text(
+                        "SELECT count(*) FROM message_recalled_memories "
+                        "WHERE user_message_id = :mid"
+                    ),
+                    {"mid": UUID(second_user_msg_id)},
+                )
+            assert recalled_count == 1
+
+            # 4. Refresh token rotation, replay family revocation, and password change
+            rotated = await client.post(
+                "/v1/auth/refresh", json={"refreshToken": device_a.refresh_token}
+            )
+            assert rotated.status_code == 200
+            rotated_tokens = rotated.json()["data"]["tokens"]
+            replay = await client.post(
+                "/v1/auth/refresh", json={"refreshToken": device_a.refresh_token}
+            )
+            assert replay.status_code == 401
+            assert (
+                await client.post(
+                    "/v1/auth/refresh", json={"refreshToken": rotated_tokens["refreshToken"]}
+                )
+            ).status_code == 401
+
+            # Device B stays active; login session C, then change password from B to revoke C
+            device_c = await login_builtin_user(client, email=user_email)
+            pw_resp = await client.post(
+                "/v1/auth/password",
+                headers=device_b.headers,
+                json={"currentPassword": TEST_PASSWORD, "newPassword": new_password},
+            )
+            assert pw_resp.status_code == 200
+            assert pw_resp.json()["data"]["revokedSessions"] >= 1
+            assert (
+                await client.post("/v1/auth/refresh", json={"refreshToken": device_c.refresh_token})
+            ).status_code == 401
+            relogged = await login_builtin_user(client, email=user_email, password=new_password)
+
+            # 5. Memory clear barrier (confirm=true) -> embedded worker converges barrier to idle
+            clear_resp = await client.delete("/v1/memories?confirm=true", headers=relogged.headers)
+            assert clear_resp.status_code in (202, 204)
+            for _ in range(80):
+                async with sf() as session:
+                    barrier_state = await session.scalar(
+                        text(
+                            "SELECT barrier_state FROM memory_scopes "
+                            "WHERE user_id = :uid AND provider_id = :pid"
+                        ),
+                        {"uid": relogged.user_id, "pid": memory_provider.provider_id},
+                    )
+                if barrier_state == "idle":
+                    break
+                await asyncio.sleep(0.05)
+            assert barrier_state == "idle"
+            assert not any(
+                rec.user_id == relogged.user_id for rec in memory_provider.records.values()
+            )
+
+            # 6. User deletion: hold remote clear briefly for mid-deletion 403/401/409/receipt,
+            #    then release so embedded worker removes user and allows fresh re-signup
+            release_delete_clear = asyncio.Event()
+            memory_provider.block_clear = release_delete_clear
+            try:
+                del_resp = await client.delete("/v1/users/me", headers=relogged.headers)
+                assert del_resp.status_code == 202
+                del_data = del_resp.json()["data"]
+                receipt_headers = {
+                    "Authorization": f"DeletionReceipt {del_data['deletionReceipt']}"
+                }
+
+                # Immediate revocation, 409 email reservation & receipt isolation
+                assert (
+                    await client.get("/v1/users/me", headers=relogged.headers)
+                ).status_code == 403
+                assert (
+                    await client.post(
+                        "/v1/auth/refresh", json={"refreshToken": relogged.refresh_token}
+                    )
+                ).status_code == 401
+                assert (
+                    await client.post(
+                        "/v1/auth/login",
+                        json={"email": user_email, "password": new_password},
+                    )
+                ).status_code == 403
+                blocked_signup = await client.post(
+                    "/v1/auth/register",
+                    json={"email": user_email.upper(), "password": new_password},
+                )
+                assert blocked_signup.status_code == 409
+                assert blocked_signup.json()["code"] == "email_already_registered"
+                assert (
+                    await client.get("/v1/users/me", headers=receipt_headers)
+                ).status_code == 401
+                receipt_status = await client.get(del_data["statusUrl"], headers=receipt_headers)
+                assert receipt_status.status_code == 200
+                assert receipt_status.json()["data"]["operationType"] == "user_delete"
+            finally:
+                release_delete_clear.set()
+                memory_provider.block_clear = None
+
+            # Wait for embedded worker to finish full local + remote deletion & remove user row
+            final_status = ""
+            for _ in range(300):
+                poll = await client.get(del_data["statusUrl"], headers=receipt_headers)
+                assert poll.status_code == 200
+                final_status = poll.json()["data"]["status"]
+                if final_status == "succeeded":
+                    break
+                await asyncio.sleep(0.05)
+            assert final_status == "succeeded", poll.json()
+
+            # After physical removal, the same email can register as a brand new user
+            reborn = await register_builtin_user(client, email=user_email, password=new_password)
+            assert reborn.user_id != device_a.user_id
+
+            # Seed another user to verify audit archive replay after graceful shutdown
+            replay_target = await register_builtin_user(
+                client, email="replay-after-e2e@example.com"
+            )
+
+    # 7. Graceful shutdown completed cleanly & deletion audit archive supports idempotent replay
+    assert app.state.ready is False
+    assert app.state.http_client.is_closed is True
+    assert archive_path.exists()
+
+    engine = create_async_engine_from_settings(prod_settings)
+    sf_after = create_session_factory(engine)
+    try:
+        # Append a simulated post-backup deletion event for replay_target and replay archive
+        await JsonlDeletionAuditArchiver(archive_path).export_event(
+            DeletionAuditEvent(
+                event_type="operation_accepted",
+                user_id=replay_target.user_id,
+                operation_type="user_delete",
+                target_type="user",
+                status="pending",
+            )
+        )
+        replay_report = await replay_deletion_audit_archive(
+            sf_after,
+            archive_path=archive_path,
+            settings=prod_settings,
+            memory_provider=memory_provider,
+        )
+        assert replay_report.applied is True
+        assert replay_report.enqueued_count >= 1
+        async with sf_after() as session:
+            replayed_status = await session.scalar(
+                text("SELECT status FROM users WHERE id = :uid"),
+                {"uid": replay_target.user_id},
+            )
+            unrevoked = await session.scalar(
+                text(
+                    "SELECT count(*) FROM auth_sessions WHERE user_id = :uid AND revoked_at IS NULL"
+                ),
+                {"uid": replay_target.user_id},
+            )
+        assert replayed_status == "deleting"
+        assert unrevoked == 0
+    finally:
+        await engine.dispose()

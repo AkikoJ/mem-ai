@@ -31,12 +31,6 @@ from mem_ai.core.telemetry import (
 )
 from mem_ai.db.engine import create_async_engine_from_settings, create_session_factory
 from mem_ai.integrations.http import create_http_client
-from mem_ai.modules.auth.adapters import (
-    CredentialVerifier,
-    DevelopmentAuthAdapter,
-    StaticTokenAuthAdapter,
-    build_credential_verifier,
-)
 from mem_ai.modules.conversations.execution import SyncGenerationTaskRegistry
 from mem_ai.modules.conversations.queries import (
     DatabaseConversationAccessChecker,
@@ -92,22 +86,12 @@ def create_app(
     settings: Settings | None = None,
     *,
     providers: ProviderRegistry | None = None,
-    credential_verifier: CredentialVerifier | None = None,
     rate_limiter: RateLimiter | None = None,
     telemetry: TelemetryRegistry | None = None,
     tracer: Tracer | None = None,
 ) -> FastAPI:
     """Construct and configure the Mem-AI FastAPI application."""
     resolved_settings = settings if settings is not None else Settings()
-    resolved_verifier = (
-        credential_verifier
-        if credential_verifier is not None
-        else build_credential_verifier(resolved_settings)
-    )
-    if resolved_settings.app_env == "production" and isinstance(
-        resolved_verifier, (DevelopmentAuthAdapter, StaticTokenAuthAdapter)
-    ):
-        raise ValueError("development or test authentication adapter is forbidden in production")
 
     resolved_telemetry = telemetry if telemetry is not None else TelemetryRegistry()
     resolved_tracer: Tracer = tracer if tracer is not None else NoopTracer()
@@ -270,7 +254,6 @@ def create_app(
     )
     app.state.settings = resolved_settings
     app.state.providers = providers if providers is not None else ProviderRegistry()
-    app.state.credential_verifier = resolved_verifier
     app.state.telemetry = resolved_telemetry
     app.state.tracer = resolved_tracer
     app.state.rate_limiter = resolved_rate_limiter

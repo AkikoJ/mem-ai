@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from uuid import uuid4
+from dataclasses import dataclass
+from uuid import UUID, uuid4
 
 import pytest
 from alembic import command
@@ -19,6 +20,185 @@ from mem_ai.db.engine import (
 from mem_ai.db.model_registry import load_all_models
 from mem_ai.modules.health.service import check_readiness
 from tests.conftest import make_alembic_config
+
+
+@dataclass(frozen=True, slots=True)
+class _HistoricalV1Seed:
+    user_id: UUID
+    agent_id: UUID
+    version_id: UUID
+    model_row_id: UUID
+    conv_id: UUID
+    gen_id: UUID
+    user_msg_id: UUID
+    assistant_msg_id: UUID
+    job_id: UUID
+    op_id: UUID
+    scope_id: UUID
+    recall_ref_id: UUID | None = None
+
+
+def _seed_v1_historical_rows(
+    settings: Settings,
+    *,
+    model_id: str,
+    required_permission: str | None = None,
+    include_recall_ref: bool = False,
+    epoch: int = 2,
+) -> _HistoricalV1Seed:
+    """Populate a legacy V1 schema (`0005`..`0012`) before upgrading to Contract head."""
+    seed = _HistoricalV1Seed(
+        user_id=uuid4(),
+        agent_id=uuid4(),
+        version_id=uuid4(),
+        model_row_id=uuid4(),
+        conv_id=uuid4(),
+        gen_id=uuid4(),
+        user_msg_id=uuid4(),
+        assistant_msg_id=uuid4(),
+        job_id=uuid4(),
+        op_id=uuid4(),
+        scope_id=uuid4(),
+        recall_ref_id=uuid4() if include_recall_ref else None,
+    )
+    sync_engine = create_sync_engine_from_settings(settings)
+    try:
+        with sync_engine.begin() as conn:
+            conn.execute(
+                text("INSERT INTO users (id, status) VALUES (:id, 'active')"),
+                {"id": seed.user_id},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO user_identities (id, user_id, issuer, subject) "
+                    "VALUES (:id, :user_id, 'https://idp.example.com', :subject)"
+                ),
+                {"id": uuid4(), "user_id": seed.user_id, "subject": f"hist-{seed.user_id.hex[:8]}"},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO agents "
+                    "(id, owner_id, name, status, draft_system_prompt, draft_memory_policy, "
+                    "latest_version_number, revision) "
+                    "VALUES (:id, :owner_id, 'Legacy Agent', 'active', 'Be concise.', "
+                    '\'{"enabled": true, "write_enabled": true, "write_scope": "user"}\'::jsonb, '
+                    "1, 1)"
+                ),
+                {"id": seed.agent_id, "owner_id": seed.user_id},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO persona_versions "
+                    "(id, agent_id, version, system_prompt, memory_policy) "
+                    "VALUES (:id, :agent_id, 1, 'Be concise.', "
+                    '\'{"enabled": true, "write_enabled": true, "write_scope": "user"}\'::jsonb)'
+                ),
+                {"id": seed.version_id, "agent_id": seed.agent_id},
+            )
+            conn.execute(
+                text("UPDATE agents SET current_published_version_id = :vid WHERE id = :aid"),
+                {"vid": seed.version_id, "aid": seed.agent_id},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO model_configs "
+                    "(id, model_id, provider_id, upstream_model, display_name, "
+                    "required_permission) "
+                    "VALUES (:id, :model_id, 'openai_compatible', :model_id, 'Legacy Model', "
+                    ":required_permission)"
+                ),
+                {
+                    "id": seed.model_row_id,
+                    "model_id": model_id,
+                    "required_permission": required_permission,
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO conversations "
+                    "(id, owner_id, agent_id, persona_version_id, persona_version_number, "
+                    "status, next_message_sequence) "
+                    "VALUES (:id, :owner_id, :agent_id, :vid, 1, 'active', 3)"
+                ),
+                {
+                    "id": seed.conv_id,
+                    "owner_id": seed.user_id,
+                    "agent_id": seed.agent_id,
+                    "vid": seed.version_id,
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO generations "
+                    "(id, conversation_id, owner_id, agent_id, persona_version_id, "
+                    "model_id, memory_epoch, status) "
+                    "VALUES (:id, :cid, :owner_id, :aid, :vid, :model_id, :epoch, 'succeeded')"
+                ),
+                {
+                    "id": seed.gen_id,
+                    "cid": seed.conv_id,
+                    "owner_id": seed.user_id,
+                    "aid": seed.agent_id,
+                    "vid": seed.version_id,
+                    "model_id": model_id,
+                    "epoch": epoch,
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO messages "
+                    "(id, conversation_id, generation_id, role, content, sequence) "
+                    "VALUES (:uid, :cid, :gid, 'user', 'hello historical', 1), "
+                    "(:aid, :cid, :gid, 'assistant', 'historical reply', 2)"
+                ),
+                {
+                    "uid": seed.user_msg_id,
+                    "aid": seed.assistant_msg_id,
+                    "cid": seed.conv_id,
+                    "gid": seed.gen_id,
+                },
+            )
+            if seed.recall_ref_id is not None:
+                conn.execute(
+                    text(
+                        "INSERT INTO message_recalled_memories "
+                        "(id, user_message_id, provider_id, memory_id, scope, relevance, "
+                        "prompt_position, memory_epoch) "
+                        "VALUES (:id, :mid, 'memos', 'mem_v1_1', 'user', 0.91, 1, :epoch)"
+                    ),
+                    {"id": seed.recall_ref_id, "mid": seed.user_msg_id, "epoch": epoch},
+                )
+            conn.execute(
+                text(
+                    "INSERT INTO memory_scopes (id, user_id, provider_id, epoch, barrier_state) "
+                    "VALUES (:id, :uid, 'memos', :epoch, 'idle')"
+                ),
+                {"id": seed.scope_id, "uid": seed.user_id, "epoch": epoch},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO jobs "
+                    "(id, job_type, business_id, user_id, dedupe_key, status, metadata_json) "
+                    "VALUES (:id, 'memory_turn_write', :bid, :uid, :dk, 'succeeded', "
+                    '\'{"provider_id": "memos", "memory_epoch": 2}\'::jsonb)'
+                ),
+                {
+                    "id": seed.job_id,
+                    "bid": str(seed.gen_id),
+                    "uid": seed.user_id,
+                    "dk": f"hist:{seed.gen_id}",
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO operations (id, owner_id, operation_type, status, job_id) "
+                    "VALUES (:id, :uid, 'memory_explicit_create', 'succeeded', :jid)"
+                ),
+                {"id": seed.op_id, "uid": seed.user_id, "jid": seed.job_id},
+            )
+    finally:
+        sync_engine.dispose()
+    return seed
 
 
 @pytest.mark.integration
@@ -78,126 +258,9 @@ async def test_historical_schema_upgrade_preserves_data_and_rolling_readiness(
     load_all_models()
     alembic_cfg = make_alembic_config(empty_pg_settings)
     command.upgrade(alembic_cfg, "20261122_0005")
+    seed = _seed_v1_historical_rows(empty_pg_settings, model_id="gpt-legacy", epoch=2)
 
-    user_id = uuid4()
-    identity_id = uuid4()
-    agent_id = uuid4()
-    version_id = uuid4()
-    model_row_id = uuid4()
-    conv_id = uuid4()
-    gen_id = uuid4()
-    user_msg_id = uuid4()
-    assistant_msg_id = uuid4()
-    job_id = uuid4()
-    op_id = uuid4()
-    scope_id = uuid4()
-
-    sync_engine = create_sync_engine_from_settings(empty_pg_settings)
-    try:
-        with sync_engine.begin() as conn:
-            conn.execute(
-                text("INSERT INTO users (id, status) VALUES (:id, 'active')"),
-                {"id": user_id},
-            )
-            conn.execute(
-                text(
-                    "INSERT INTO user_identities (id, user_id, issuer, subject) "
-                    "VALUES (:id, :user_id, 'https://idp.example.com', 'hist-user-1')"
-                ),
-                {"id": identity_id, "user_id": user_id},
-            )
-            conn.execute(
-                text(
-                    "INSERT INTO agents "
-                    "(id, owner_id, name, status, draft_system_prompt, draft_memory_policy, "
-                    "latest_version_number, revision) "
-                    "VALUES (:id, :owner_id, 'Legacy Agent', 'active', 'Be concise.', "
-                    '\'{"enabled": true, "write_enabled": true, "write_scope": "user"}\'::jsonb, '
-                    "1, 1)"
-                ),
-                {"id": agent_id, "owner_id": user_id},
-            )
-            conn.execute(
-                text(
-                    "INSERT INTO persona_versions "
-                    "(id, agent_id, version, system_prompt, memory_policy) "
-                    "VALUES (:id, :agent_id, 1, 'Be concise.', "
-                    '\'{"enabled": true, "write_enabled": true, "write_scope": "user"}\'::jsonb)'
-                ),
-                {"id": version_id, "agent_id": agent_id},
-            )
-            conn.execute(
-                text("UPDATE agents SET current_published_version_id = :vid WHERE id = :aid"),
-                {"vid": version_id, "aid": agent_id},
-            )
-            conn.execute(
-                text(
-                    "INSERT INTO model_configs "
-                    "(id, model_id, provider_id, upstream_model, display_name) "
-                    "VALUES (:id, 'gpt-legacy', 'openai_compatible', 'gpt-legacy', 'Legacy Model')"
-                ),
-                {"id": model_row_id},
-            )
-            conn.execute(
-                text(
-                    "INSERT INTO conversations "
-                    "(id, owner_id, agent_id, persona_version_id, persona_version_number, "
-                    "status, next_message_sequence) "
-                    "VALUES (:id, :owner_id, :agent_id, :vid, 1, 'active', 3)"
-                ),
-                {"id": conv_id, "owner_id": user_id, "agent_id": agent_id, "vid": version_id},
-            )
-            conn.execute(
-                text(
-                    "INSERT INTO generations "
-                    "(id, conversation_id, owner_id, agent_id, persona_version_id, "
-                    "model_id, memory_epoch, status) "
-                    "VALUES (:id, :cid, :owner_id, :aid, :vid, 'gpt-legacy', 0, 'succeeded')"
-                ),
-                {
-                    "id": gen_id,
-                    "cid": conv_id,
-                    "owner_id": user_id,
-                    "aid": agent_id,
-                    "vid": version_id,
-                },
-            )
-            conn.execute(
-                text(
-                    "INSERT INTO messages "
-                    "(id, conversation_id, generation_id, role, content, sequence) "
-                    "VALUES (:uid, :cid, :gid, 'user', 'hello historical', 1), "
-                    "(:aid, :cid, :gid, 'assistant', 'historical reply', 2)"
-                ),
-                {"uid": user_msg_id, "aid": assistant_msg_id, "cid": conv_id, "gid": gen_id},
-            )
-            conn.execute(
-                text(
-                    "INSERT INTO memory_scopes (id, user_id, provider_id, epoch, barrier_state) "
-                    "VALUES (:id, :uid, 'memos', 2, 'idle')"
-                ),
-                {"id": scope_id, "uid": user_id},
-            )
-            conn.execute(
-                text(
-                    "INSERT INTO jobs "
-                    "(id, job_type, business_id, user_id, dedupe_key, status, metadata_json) "
-                    "VALUES (:id, 'memory_turn_write', :bid, :uid, :dk, 'succeeded', "
-                    '\'{"provider_id": "memos", "memory_epoch": 2}\'::jsonb)'
-                ),
-                {"id": job_id, "bid": str(gen_id), "uid": user_id, "dk": f"hist:{gen_id}"},
-            )
-            conn.execute(
-                text(
-                    "INSERT INTO operations (id, owner_id, operation_type, status, job_id) "
-                    "VALUES (:id, :uid, 'memory_explicit_create', 'succeeded', :jid)"
-                ),
-                {"id": op_id, "uid": user_id, "jid": job_id},
-            )
-    finally:
-        sync_engine.dispose()
-
-    # Apply expand/migrate upgrade to head and confirm zero metadata drift.
+    # Apply expand/migrate/contract upgrade to head and confirm zero metadata drift.
     command.upgrade(alembic_cfg, "head")
     command.check(alembic_cfg)
 
@@ -208,34 +271,133 @@ async def test_historical_schema_upgrade_preserves_data_and_rolling_readiness(
             msg_count = (
                 await session.execute(
                     text("SELECT count(*) FROM messages WHERE conversation_id = :cid"),
-                    {"cid": conv_id},
+                    {"cid": seed.conv_id},
                 )
             ).scalar_one()
             view_count = (
                 await session.execute(
                     text("SELECT count(*) FROM memory_jobs WHERE id = :jid"),
-                    {"jid": job_id},
+                    {"jid": seed.job_id},
                 )
             ).scalar_one()
             epoch = (
                 await session.execute(
                     text("SELECT epoch FROM memory_scopes WHERE id = :sid"),
-                    {"sid": scope_id},
+                    {"sid": seed.scope_id},
                 )
             ).scalar_one()
+            user_row = (
+                await session.execute(
+                    text("SELECT email, password_hash FROM users WHERE id = :uid"),
+                    {"uid": seed.user_id},
+                )
+            ).one()
+            legacy_table_exists = (
+                await session.execute(
+                    text(
+                        "SELECT EXISTS ("
+                        "  SELECT 1 FROM information_schema.tables "
+                        "  WHERE table_schema = 'public' AND table_name = 'user_identities'"
+                        ")"
+                    )
+                )
+            ).scalar_one()
+            legacy_perm_col_exists = (
+                await session.execute(
+                    text(
+                        "SELECT EXISTS ("
+                        "  SELECT 1 FROM information_schema.columns "
+                        "  WHERE table_schema = 'public' "
+                        "    AND table_name = 'model_configs' "
+                        "    AND column_name = 'required_permission'"
+                        ")"
+                    )
+                )
+            ).scalar_one()
+            users_nullable = dict(
+                (
+                    await session.execute(
+                        text(
+                            "SELECT column_name, is_nullable FROM information_schema.columns "
+                            "WHERE table_schema = 'public' AND table_name = 'users' "
+                            "  AND column_name IN ('email', 'password_hash')"
+                        )
+                    )
+                ).all()
+            )
         assert msg_count == 2
         assert view_count == 1
         assert epoch == 2
+        assert user_row.email == f"legacy-{seed.user_id}@migrated.invalid"
+        assert user_row.password_hash.startswith("!")
+        assert legacy_table_exists is False
+        assert legacy_perm_col_exists is False
+        assert users_nullable == {"email": "NO", "password_hash": "NO"}
 
         # Verify rolling-upgrade compatible revision readiness (old app reading upgraded DB).
         rolling_settings = empty_pg_settings.model_copy(
             update={
-                "expected_alembic_revision": "20261123_0011",
-                "compatible_alembic_revisions": ["20261126_0013"],
+                "expected_alembic_revision": "20261126_0013",
+                "compatible_alembic_revisions": ["20261126_0014"],
             }
         )
         readiness = await check_readiness(session_factory, rolling_settings)
         assert readiness.database == "ok"
-        assert readiness.migration_revision == "20261126_0013"
+        assert readiness.migration_revision == "20261126_0014"
+    finally:
+        await async_engine.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
+async def test_v1_final_schema_upgrades_cleanly_to_contract_head_preserving_all_records(
+    empty_pg_settings: Settings,
+) -> None:
+    """Upgrade a populated V1 final schema (`20261124_0012`) to head preserving all user records."""
+    load_all_models()
+    alembic_cfg = make_alembic_config(empty_pg_settings)
+    command.upgrade(alembic_cfg, "20261124_0012")
+    seed = _seed_v1_historical_rows(
+        empty_pg_settings,
+        model_id="gpt-v1",
+        required_permission="models:pro",
+        include_recall_ref=True,
+        epoch=1,
+    )
+
+    command.upgrade(alembic_cfg, "head")
+    command.check(alembic_cfg)
+
+    async_engine = create_async_engine_from_settings(empty_pg_settings)
+    session_factory = create_session_factory(async_engine)
+    try:
+        async with session_factory() as session:
+            counts = (
+                await session.execute(
+                    text(
+                        "SELECT "
+                        "(SELECT count(*) FROM agents WHERE id = :aid), "
+                        "(SELECT count(*) FROM persona_versions WHERE id = :vid), "
+                        "(SELECT count(*) FROM conversations WHERE id = :cid), "
+                        "(SELECT count(*) FROM messages WHERE conversation_id = :cid), "
+                        "(SELECT count(*) FROM message_recalled_memories WHERE id = :rid), "
+                        "(SELECT count(*) FROM model_configs WHERE id = :mid), "
+                        "(SELECT count(*) FROM jobs WHERE id = :jid), "
+                        "(SELECT count(*) FROM operations WHERE id = :oid), "
+                        "(SELECT count(*) FROM memory_scopes WHERE id = :sid)"
+                    ),
+                    {
+                        "aid": seed.agent_id,
+                        "vid": seed.version_id,
+                        "cid": seed.conv_id,
+                        "rid": seed.recall_ref_id,
+                        "mid": seed.model_row_id,
+                        "jid": seed.job_id,
+                        "oid": seed.op_id,
+                        "sid": seed.scope_id,
+                    },
+                )
+            ).one()
+            assert tuple(counts) == (1, 1, 1, 2, 1, 1, 1, 1, 1)
     finally:
         await async_engine.dispose()

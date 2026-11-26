@@ -34,24 +34,31 @@ from mem_ai.modules.users import service as users_service
 _INVALID_LOGIN_MESSAGE = "invalid email or password"
 
 
-def extract_bearer_token(authorization_headers: Sequence[str]) -> str | None:
-    """提取唯一 Bearer 令牌；未携带或非 Bearer 返回 None，重复头返回 401。"""
+def extract_bearer_token(authorization_headers: Sequence[str]) -> str:
+    """提取唯一 Bearer 令牌；缺失或非法头统一抛出 401。"""
     if not authorization_headers:
-        return None
+        raise UnauthorizedError(
+            code="missing_credentials",
+            message="missing authorization credentials",
+        )
     if len(authorization_headers) > 1:
         raise UnauthorizedError(
             code="invalid_credentials",
             message="duplicate authentication header",
         )
-    parts = authorization_headers[0].strip().split(None, 1)
+    raw = authorization_headers[0].strip()
+    if not raw:
+        raise UnauthorizedError(
+            code="missing_credentials",
+            message="missing authorization credentials",
+        )
+    parts = raw.split(None, 1)
     if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
-        return None
+        raise UnauthorizedError(
+            code="invalid_credentials",
+            message="invalid bearer authorization header",
+        )
     return parts[1].strip()
-
-
-def is_builtin_access_token(bearer_token: str) -> bool:
-    """判断 Bearer 令牌是否声明由内置认证签发。"""
-    return tokens.try_peek_jwt_issuer(bearer_token) == tokens.BUILTIN_JWT_ISSUER
 
 
 async def authenticate_builtin_access_token(
@@ -69,11 +76,9 @@ async def authenticate_builtin_access_token(
     )
     user = await users_service.get_active_user(session_factory, user_id=claims.user_id)
     return AuthenticationContext(
-        actor_id=user.email or str(user.id),
         user_id=user.id,
-        auth_method="builtin_jwt",
-        permissions=frozenset(),
         email=user.email,
+        auth_method="builtin_jwt",
         session_id=claims.session_id,
     )
 
@@ -158,7 +163,7 @@ async def login_user(
             email=normalized_email,
         )
 
-    if credentials is None or credentials.password_hash is None:
+    if credentials is None or not credentials.password_hash:
         tokens.verify_dummy_password(password)
         raise UnauthorizedError(code="invalid_credentials", message=_INVALID_LOGIN_MESSAGE)
     if not tokens.verify_password(password, credentials.password_hash):
@@ -172,15 +177,14 @@ async def login_user(
             for_share=True,
         )
         now = await get_database_now(session)
-        resolved_email = active_user.email or normalized_email
         token_pair = await _issue_token_pair_in_session(
             session,
             user_id=active_user.id,
-            email=resolved_email,
+            email=active_user.email,
             token_settings=token_settings,
             now=now,
         )
-    return LoginResponse(user_id=active_user.id, email=resolved_email, tokens=token_pair)
+    return LoginResponse(user_id=active_user.id, email=active_user.email, tokens=token_pair)
 
 
 async def refresh_tokens(
@@ -249,7 +253,7 @@ async def refresh_tokens(
             token_pair = TokenPair(
                 access_token=tokens.create_access_token(
                     user_id=active_user.id,
-                    email=active_user.email or "",
+                    email=active_user.email,
                     secret=token_settings.jwt_secret,
                     expires_in_seconds=token_settings.access_token_ttl,
                     session_id=new_session.id,
@@ -328,7 +332,7 @@ async def change_password(
             user_id=user_id,
         )
 
-    if credentials is None or credentials.password_hash is None:
+    if credentials is None or not credentials.password_hash:
         tokens.verify_dummy_password(current_password)
         raise UnauthorizedError(code="invalid_credentials", message="invalid current password")
     if not tokens.verify_password(current_password, credentials.password_hash):

@@ -29,10 +29,8 @@ async def get_current_user(
     user = await users_service.get_active_user(session_factory, user_id=auth.user_id)
     payload = UserMeResponse(
         user_id=user.id,
-        actor_id=auth.actor_id,
-        auth_method=auth.auth_method,
-        permissions=sorted(auth.permissions),
         email=user.email,
+        auth_method=auth.auth_method,
         status=user.status,
         created_at=user.created_at,
     )

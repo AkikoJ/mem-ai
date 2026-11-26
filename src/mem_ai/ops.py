@@ -28,12 +28,6 @@ from mem_ai.core.exceptions import AppError
 from mem_ai.db.engine import create_async_engine_from_settings, create_session_factory
 from mem_ai.integrations.http import create_http_client
 from mem_ai.modules.auth import service as auth_service
-from mem_ai.modules.auth.adapters import (
-    AuthRequest,
-    DevelopmentAuthAdapter,
-    StaticTokenAuthAdapter,
-    build_credential_verifier,
-)
 from mem_ai.modules.conversations import cleanup as conversation_cleanup
 from mem_ai.modules.conversations import queries as conversation_queries
 from mem_ai.modules.conversations.queries import DatabaseRecalledMemoryReferenceMarker
@@ -50,7 +44,6 @@ from mem_ai.modules.operations.audit import (
     plan_deletion_audit_replay,
 )
 from mem_ai.modules.users import cleanup as user_cleanup
-from mem_ai.modules.users import service as users_service
 
 
 class ConnectionBudgetReport(BaseModel):
@@ -116,7 +109,6 @@ class ProviderVerificationReport(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     app_env: str
-    auth_mode: str
     auth_checked: bool = False
     auth_ok: bool | None = None
     model_checked: bool = False
@@ -312,7 +304,6 @@ async def verify_providers(
     session_factory: async_sessionmaker[AsyncSession] | None = None,
     check_auth: bool = False,
     auth_headers: dict[str, str] | None = None,
-    client_host: str | None = None,
     check_model: bool = False,
     model_id: str | None = None,
     model_provider: ModelProvider | None = None,
@@ -338,30 +329,20 @@ async def verify_providers(
     if check_auth:
         if auth_headers is None:
             raise ValueError("auth_headers (--bearer-token) is required when --check-auth is set")
-        auth_request = AuthRequest(headers=auth_headers, client_host=client_host)
-        raw_authorization = auth_request.get_single_header("Authorization")
-        bearer_token = auth_service.extract_bearer_token(
-            [raw_authorization] if raw_authorization is not None else []
+        if session_factory is None:
+            raise ValueError("session_factory is required to verify a built-in user")
+        auth_values = [
+            value for key, value in auth_headers.items() if key.lower() == "authorization"
+        ]
+        bearer_token = auth_service.extract_bearer_token(auth_values)
+        auth_context = await auth_service.authenticate_builtin_access_token(
+            session_factory,
+            bearer_token=bearer_token,
+            jwt_secret=settings.auth_jwt_secret.get_secret_value().strip(),
+            leeway_seconds=settings.auth_jwt_leeway_seconds,
         )
-        if bearer_token is not None and auth_service.is_builtin_access_token(bearer_token):
-            if session_factory is None:
-                raise ValueError("session_factory is required to verify a built-in user")
-            auth_context = await auth_service.authenticate_builtin_access_token(
-                session_factory,
-                bearer_token=bearer_token,
-                jwt_secret=settings.auth_jwt_secret.get_secret_value().strip(),
-                leeway_seconds=settings.auth_jwt_leeway_seconds,
-            )
-            verified_user_id = auth_context.user_id
-            auth_ok = True
-        else:
-            verifier = build_credential_verifier(settings)
-            if settings.app_env == "production" and isinstance(
-                verifier, (DevelopmentAuthAdapter, StaticTokenAuthAdapter)
-            ):
-                raise ValueError("development/static auth adapter is forbidden in production")
-            principal = await verifier.verify(auth_request)
-            auth_ok = bool(principal.issuer and principal.subject)
+        verified_user_id = auth_context.user_id
+        auth_ok = True
 
     owned_http = http_client is None
     client = http_client if http_client is not None else create_http_client(settings)
@@ -435,12 +416,10 @@ async def verify_providers(
             elif verified_user_id is not None:
                 test_uid = verified_user_id
             elif session_factory is not None:
-                probe_user = await users_service.resolve_or_create_user(
-                    session_factory,
-                    issuer="mem-ai:ops-probe",
-                    subject="provider-verification",
+                raise ValueError(
+                    "probe_user_id (--probe-user-id) or --check-auth is required "
+                    "when --check-memory uses a database session"
                 )
-                test_uid = probe_user.id
             else:
                 test_uid = uuid4()
 
@@ -533,7 +512,6 @@ async def verify_providers(
 
     return ProviderVerificationReport(
         app_env=settings.app_env,
-        auth_mode=settings.auth_mode,
         auth_checked=check_auth,
         auth_ok=auth_ok,
         model_checked=check_model,

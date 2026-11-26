@@ -11,8 +11,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DESIGN = ROOT / "docs/backend-scaffold-design.md"
-SPEC = ROOT / ".scratch/ai-chat-memory/spec.md"
-ISSUES_DIR = ROOT / ".scratch/ai-chat-memory/issues"
+SPEC_DIRS = (
+    (ROOT / ".scratch/ai-chat-memory/spec.md", ROOT / ".scratch/ai-chat-memory/issues"),
+    (
+        ROOT / ".scratch/unified-single-process-backend/spec.md",
+        ROOT / ".scratch/unified-single-process-backend/issues",
+    ),
+)
+RETIRED_PATHS = (
+    "src/mem_ai/modules/personas",
+    "src/mem_ai/contracts/persona_provider.py",
+    "src/mem_ai/workers/main.py",
+    "src/mem_ai/modules/auth/adapters.py",
+)
 MAX_SOURCE_LINES = 800
 LOCAL_DOCS = (
     ROOT / "AGENTS.md",
@@ -23,6 +34,7 @@ LOCAL_DOCS = (
     ROOT / "docs/operations/deployment-and-recovery.md",
     ROOT / "docs/agents/issue-tracker.md",
     ROOT / ".scratch/ai-chat-memory/spec.md",
+    ROOT / ".scratch/unified-single-process-backend/spec.md",
 )
 LINK_PATTERN = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 CODE_PATTERN = re.compile(r"`([^`]+)`")
@@ -297,18 +309,29 @@ def check_layered_imports(errors: ArchitectureErrors) -> None:
         )
 
 
-def check_ticket_dependency_graph(errors: ArchitectureErrors) -> None:
-    if not SPEC.exists() or not ISSUES_DIR.exists():
+def check_retired_paths(errors: ArchitectureErrors, *, root: Path = ROOT) -> None:
+    """Fail if any retired transitional module or entry point reappears."""
+    for rel_path in RETIRED_PATHS:
+        if (root / rel_path).exists():
+            errors.add(f"已退役路径不应重新出现 {rel_path}")
+
+
+def _check_single_ticket_graph(
+    spec_path: Path,
+    issues_dir: Path,
+    errors: ArchitectureErrors,
+) -> None:
+    if not spec_path.exists() or not issues_dir.exists():
         return
 
-    spec_text = SPEC.read_text(encoding="utf-8")
+    spec_text = spec_path.read_text(encoding="utf-8")
     mermaid_edges: set[tuple[str, str]] = {
         (src, dst) for src, dst in MERMAID_EDGE_PATTERN.findall(spec_text)
     }
 
     ticket_ids: set[str] = set()
     ticket_edges: set[tuple[str, str]] = set()
-    for issue_file in sorted(ISSUES_DIR.glob("*.md")):
+    for issue_file in sorted(issues_dir.glob("*.md")):
         match = re.match(r"^(\d{2})-", issue_file.name)
         if not match:
             continue
@@ -325,17 +348,18 @@ def check_ticket_dependency_graph(errors: ArchitectureErrors) -> None:
 
     missing_in_spec = sorted(ticket_edges - mermaid_edges)
     extra_in_spec = sorted(mermaid_edges - ticket_edges)
+    rel_spec = spec_path.relative_to(ROOT)
     for src, dst in missing_in_spec:
-        errors.add(f"spec 依赖图缺少 ticket 阻塞边 T{src} -> T{dst}")
+        errors.add(f"spec 依赖图缺少 ticket 阻塞边（{rel_spec}）T{src} -> T{dst}")
     for src, dst in extra_in_spec:
-        errors.add(f"spec 依赖图存在未在 ticket 中声明的边 T{src} -> T{dst}")
+        errors.add(f"spec 依赖图存在未在 ticket 中声明的边（{rel_spec}）T{src} -> T{dst}")
 
     # Verify DAG has no cycles via Kahn topological sort.
     adjacency: defaultdict[str, list[str]] = defaultdict(list)
     indegree: dict[str, int] = {tid: 0 for tid in ticket_ids}
     for src, dst in ticket_edges:
         if src not in ticket_ids or dst not in ticket_ids:
-            errors.add(f"ticket 依赖边引用了不存在的编号 T{src} -> T{dst}")
+            errors.add(f"ticket 依赖边引用了不存在的编号（{rel_spec}）T{src} -> T{dst}")
             continue
         adjacency[src].append(dst)
         indegree[dst] += 1
@@ -351,7 +375,12 @@ def check_ticket_dependency_graph(errors: ArchitectureErrors) -> None:
                 queue.append(nxt)
 
     if visited != len(ticket_ids):
-        errors.add("ticket 依赖图存在循环依赖")
+        errors.add(f"ticket 依赖图存在循环依赖（{rel_spec}）")
+
+
+def check_ticket_dependency_graph(errors: ArchitectureErrors) -> None:
+    for spec_path, issues_dir in SPEC_DIRS:
+        _check_single_ticket_graph(spec_path, issues_dir, errors)
 
 
 def _extract_router_prefixes(tree: ast.AST) -> dict[str, str]:
@@ -451,6 +480,7 @@ def run_all_checks() -> list[str]:
     errors = ArchitectureErrors()
     check_navigation(errors)
     check_links(errors)
+    check_retired_paths(errors)
     check_source_file_sizes(errors)
     check_source_module_ownership(errors)
     check_layered_imports(errors)

@@ -1,4 +1,4 @@
-"""FastAPI auth dependencies resolving layer-1 credentials into layer-2 local users."""
+"""FastAPI auth dependencies verifying built-in Bearer JWT credentials against active users."""
 
 from __future__ import annotations
 
@@ -13,9 +13,7 @@ from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import UnauthorizedError
 from mem_ai.core.logging import bind_log_context
 from mem_ai.modules.auth import service as auth_service
-from mem_ai.modules.auth.adapters import AuthRequest, CredentialVerifier
 from mem_ai.modules.auth.context import AuthenticationContext
-from mem_ai.modules.users import service as users_service
 
 
 def _has_deletion_receipt_scheme(authorization_headers: list[str]) -> bool:
@@ -57,59 +55,25 @@ class UserOperationAccess:
 OperationAuthContext = DeletionReceiptAccess | UserOperationAccess
 
 
-def get_credential_verifier(request: Request) -> CredentialVerifier:
-    """Return the configured CredentialVerifier (overridable via `app.dependency_overrides`)."""
-    return cast(CredentialVerifier, request.app.state.credential_verifier)
-
-
-CredentialVerifierDep = Annotated[CredentialVerifier, Depends(get_credential_verifier)]
-
-
 async def get_auth_context(
     request: Request,
-    verifier: CredentialVerifierDep,
     session_factory: SessionFactoryDep,
 ) -> AuthenticationContext:
-    """Authenticate incoming credentials and resolve an active local user context."""
-    if _has_deletion_receipt_scheme(request.headers.getlist("authorization")):
+    """Authenticate a built-in Bearer Access Token and resolve an active local user context."""
+    authorization_headers = request.headers.getlist("authorization")
+    if _has_deletion_receipt_scheme(authorization_headers):
         raise UnauthorizedError(
             code="invalid_auth_scheme",
             message="deletion receipts can only query their deletion operation",
         )
 
-    bearer_token = auth_service.extract_bearer_token(request.headers.getlist("authorization"))
-    if bearer_token is not None and auth_service.is_builtin_access_token(bearer_token):
-        settings = cast(Settings, request.app.state.settings)
-        context = await auth_service.authenticate_builtin_access_token(
-            session_factory,
-            bearer_token=bearer_token,
-            jwt_secret=settings.auth_jwt_secret.get_secret_value().strip(),
-            leeway_seconds=settings.auth_jwt_leeway_seconds,
-        )
-        bind_log_context(user_id=str(context.user_id))
-        return context
-
-    client_host = request.client.host if request.client is not None else None
-    raw_headers = tuple(
-        (key.decode("latin-1"), value.decode("latin-1")) for key, value in request.headers.raw
-    )
-    auth_request = AuthRequest(headers=raw_headers, client_host=client_host)
-
-    # Layer 1: verify credential protocol and obtain a trusted external principal.
-    principal = await verifier.verify(auth_request)
-
-    # Layer 2: resolve stable local user mapping and enforce active user status.
-    user = await users_service.resolve_active_user(
+    bearer_token = auth_service.extract_bearer_token(authorization_headers)
+    settings = cast(Settings, request.app.state.settings)
+    context = await auth_service.authenticate_builtin_access_token(
         session_factory,
-        issuer=principal.issuer,
-        subject=principal.subject,
-    )
-
-    context = AuthenticationContext(
-        actor_id=principal.actor_id,
-        user_id=user.id,
-        auth_method=principal.auth_method,
-        permissions=principal.permissions,
+        bearer_token=bearer_token,
+        jwt_secret=settings.auth_jwt_secret.get_secret_value().strip(),
+        leeway_seconds=settings.auth_jwt_leeway_seconds,
     )
     bind_log_context(user_id=str(context.user_id))
     return context
@@ -118,19 +82,15 @@ async def get_auth_context(
 AuthContextDep = Annotated[AuthenticationContext, Depends(get_auth_context)]
 
 
-async def get_optional_auth_context(
+async def _resolve_auth_context(
     request: Request,
-    verifier: CredentialVerifierDep,
     session_factory: SessionFactoryDep,
-) -> AuthenticationContext | None:
-    """Resolve auth when an Authorization header is present; otherwise return None."""
-    if not request.headers.getlist("authorization"):
-        return None
+) -> AuthenticationContext:
+    """Invoke `get_auth_context` while respecting any FastAPI dependency override."""
     override = request.app.dependency_overrides.get(get_auth_context)
     if override is not None:
         available = {
             "request": request,
-            "verifier": verifier,
             "session_factory": session_factory,
         }
         params = inspect.signature(override).parameters
@@ -138,7 +98,17 @@ async def get_optional_auth_context(
         resolved = override(**kwargs) if len(kwargs) == len(params) else override()
         auth = await resolved if inspect.isawaitable(resolved) else resolved
         return cast(AuthenticationContext, auth)
-    return await get_auth_context(request, verifier, session_factory)
+    return await get_auth_context(request, session_factory)
+
+
+async def get_optional_auth_context(
+    request: Request,
+    session_factory: SessionFactoryDep,
+) -> AuthenticationContext | None:
+    """Resolve auth when an Authorization header is present; otherwise return None."""
+    if not request.headers.getlist("authorization"):
+        return None
+    return await _resolve_auth_context(request, session_factory)
 
 
 OptionalAuthContextDep = Annotated[
@@ -149,26 +119,13 @@ OptionalAuthContextDep = Annotated[
 
 async def get_operation_auth_context(
     request: Request,
-    verifier: CredentialVerifierDep,
     session_factory: SessionFactoryDep,
 ) -> OperationAuthContext:
     """Resolve either an operation-scoped deletion receipt or standard active-user auth."""
     receipt = parse_deletion_receipt_authorization(request)
     if receipt is not None:
         return DeletionReceiptAccess(receipt=receipt)
-    override = request.app.dependency_overrides.get(get_auth_context)
-    if override is not None:
-        available = {
-            "request": request,
-            "verifier": verifier,
-            "session_factory": session_factory,
-        }
-        params = inspect.signature(override).parameters
-        kwargs = {name: available[name] for name in params if name in available}
-        resolved = override(**kwargs) if len(kwargs) == len(params) else override()
-        auth = await resolved if inspect.isawaitable(resolved) else resolved
-        return UserOperationAccess(auth=cast(AuthenticationContext, auth))
-    auth = await get_auth_context(request, verifier, session_factory)
+    auth = await _resolve_auth_context(request, session_factory)
     return UserOperationAccess(auth=auth)
 
 

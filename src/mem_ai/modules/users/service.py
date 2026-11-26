@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from mem_ai.core.exceptions import ConflictError, ForbiddenError, NotFoundError
 from mem_ai.db.base import is_unique_violation
 from mem_ai.modules.users import repository
-from mem_ai.modules.users.models import USER_EMAIL_UNIQUE_INDEX, USER_IDENTITY_UNIQUE_CONSTRAINT
+from mem_ai.modules.users.models import USER_EMAIL_UNIQUE_INDEX
 from mem_ai.modules.users.schemas import UserCredentialRecord, UserRecord, UserStatus
 
 _UserT = TypeVar("_UserT", UserRecord, UserCredentialRecord)
@@ -63,70 +63,6 @@ async def ensure_user_not_deleting_in_session(
     if record.status == "deleting":
         raise ForbiddenError(code="user_deleting", message="user is being deleted")
     return record
-
-
-async def resolve_or_create_user(
-    session_factory: async_sessionmaker[AsyncSession],
-    *,
-    issuer: str,
-    subject: str,
-) -> UserRecord:
-    """Map a verified `(issuer, subject)` to a stable local user, safe under concurrent races."""
-    normalized_issuer = issuer.strip()
-    normalized_subject = subject.strip()
-    if not normalized_issuer or not normalized_subject:
-        raise ValueError("issuer and subject must be non-empty")
-
-    async with session_factory.begin() as session:
-        existing = await repository.get_user_by_identity(
-            session,
-            issuer=normalized_issuer,
-            subject=normalized_subject,
-        )
-        if existing is not None:
-            return UserRecord.model_validate(existing)
-
-        conflict_exc: IntegrityError | None = None
-        try:
-            async with session.begin_nested():
-                created = await repository.create_user_with_identity(
-                    session,
-                    issuer=normalized_issuer,
-                    subject=normalized_subject,
-                )
-            return UserRecord.model_validate(created)
-        except IntegrityError as exc:
-            if not is_unique_violation(exc, constraint_name=USER_IDENTITY_UNIQUE_CONSTRAINT):
-                raise
-            conflict_exc = exc
-
-        # Concurrent first-request winner committed the mapping; savepoint rolled back our insert.
-        winner = await repository.get_user_by_identity(
-            session,
-            issuer=normalized_issuer,
-            subject=normalized_subject,
-        )
-        if winner is None:
-            raise ConflictError(
-                code="user_identity_conflict",
-                message="concurrent user identity resolution conflict",
-            ) from conflict_exc
-        return UserRecord.model_validate(winner)
-
-
-async def resolve_active_user(
-    session_factory: async_sessionmaker[AsyncSession],
-    *,
-    issuer: str,
-    subject: str,
-) -> UserRecord:
-    """Resolve `(issuer, subject)` to a local user and reject disabled or deleting users."""
-    user = await resolve_or_create_user(
-        session_factory,
-        issuer=issuer,
-        subject=subject,
-    )
-    return assert_user_active(user)
 
 
 async def get_active_user(

@@ -54,7 +54,6 @@ async def upsert_model_config(
         "supports_streaming": seed.supports_streaming,
         "max_context_tokens": seed.max_context_tokens,
         "max_output_tokens": seed.max_output_tokens,
-        "required_permission": seed.required_permission,
         "credential_ref": seed.credential_ref,
         "capabilities_json": dict(seed.capabilities_json),
     }
@@ -71,7 +70,6 @@ async def upsert_model_config(
                 "supports_streaming": values["supports_streaming"],
                 "max_context_tokens": values["max_context_tokens"],
                 "max_output_tokens": values["max_output_tokens"],
-                "required_permission": values["required_permission"],
                 "credential_ref": values["credential_ref"],
                 "capabilities_json": values["capabilities_json"],
                 "updated_at": func.now(),

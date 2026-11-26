@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ipaddress
-from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import Field, SecretStr, model_validator
@@ -11,7 +10,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
 
 AppEnv = Literal["development", "test", "production"]
-AuthMode = Literal["development", "jwt_hs256", "trusted_gateway"]
 MemoryProviderMode = Literal["disabled", "memos"]
 ModelProviderMode = Literal["disabled", "openai_compatible"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
@@ -20,20 +18,6 @@ ProxyNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 _INSECURE_DEFAULT_PASSWORDS = frozenset({"", "change-this-local-password", "postgres", "password"})
 _MIN_PRODUCTION_SECRET_LENGTH = 32
 _DEFAULT_AUTH_JWT_SECRET = "change-this-jwt-secret-in-production"
-
-
-@dataclass(frozen=True, slots=True)
-class GatewayHeaders:
-    """Configured header names accepted only from verified trusted gateway proxies."""
-
-    secret: str = "X-Gateway-Auth"
-    issuer: str = "X-Auth-Issuer"
-    subject: str = "X-Auth-Subject"
-    actor: str = "X-Auth-Actor-Id"
-    permissions: str = "X-Auth-Permissions"
-
-    def all_names(self) -> tuple[str, ...]:
-        return (self.secret, self.issuer, self.subject, self.actor, self.permissions)
 
 
 def is_ip_in_networks(client_host: str | None, networks: tuple[ProxyNetwork, ...]) -> bool:
@@ -45,23 +29,6 @@ def is_ip_in_networks(client_host: str | None, networks: tuple[ProxyNetwork, ...
     except ValueError:
         return False
     return any(addr in net for net in networks)
-
-
-def _validate_required_secret(
-    secret_value: SecretStr | None,
-    *,
-    field_name: str,
-    mode_name: str,
-    is_production: bool,
-) -> None:
-    secret = secret_value.get_secret_value().strip() if secret_value is not None else ""
-    if not secret:
-        raise ValueError(f"{field_name} must be set when auth_mode={mode_name!r}")
-    if is_production and len(secret) < _MIN_PRODUCTION_SECRET_LENGTH:
-        raise ValueError(
-            f"{field_name} must be at least "
-            f"{_MIN_PRODUCTION_SECRET_LENGTH} characters in production"
-        )
 
 
 def _validate_http_provider_settings(
@@ -90,7 +57,6 @@ _ALLOWED_MODEL_REGISTRY_KEYS = frozenset(
         "supports_streaming",
         "max_context_tokens",
         "max_output_tokens",
-        "required_permission",
         "credential_ref",
         "capabilities_json",
     }
@@ -120,7 +86,6 @@ def _validate_model_registry_entries(entries: list[dict[str, Any]]) -> None:
             "provider_id",
             "upstream_model",
             "display_name",
-            "required_permission",
             "credential_ref",
         ):
             value = entry.get(optional_str)
@@ -208,28 +173,10 @@ class Settings(BaseSettings):
     metrics_allowed_networks: list[str] = Field(default_factory=lambda: ["127.0.0.1/32", "::1/128"])
     metrics_bearer_token: SecretStr | None = None
 
-    # Authentication
-    auth_mode: AuthMode = "development"
-    auth_dev_issuer: str = Field(default="https://dev.mem-ai.local", min_length=1)
-    auth_dev_subject: str = Field(default="dev-user", min_length=1)
-    auth_dev_actor_id: str | None = None
-    auth_dev_permissions: list[str] = Field(
-        default_factory=lambda: ["chat:use", "agents:manage", "memories:manage", "users:self"]
-    )
-    auth_trusted_issuers: list[str] = Field(default_factory=list)
-    auth_trusted_audience: str | None = None
-    auth_jwt_hs256_secret: SecretStr | None = None
-    auth_jwt_leeway_seconds: int = Field(default=30, ge=0, le=300)
+    # Built-in authentication and trusted reverse proxies
     auth_trusted_proxies: list[str] = Field(default_factory=list)
-    auth_gateway_shared_secret: SecretStr | None = None
-    auth_gateway_secret_header: str = Field(default="X-Gateway-Auth", min_length=1)
-    auth_gateway_issuer_header: str = Field(default="X-Auth-Issuer", min_length=1)
-    auth_gateway_subject_header: str = Field(default="X-Auth-Subject", min_length=1)
-    auth_gateway_actor_header: str = Field(default="X-Auth-Actor-Id", min_length=1)
-    auth_gateway_permissions_header: str = Field(default="X-Auth-Permissions", min_length=1)
-
-    # Built-in auth: email + password + JWT Access Token + persistent Refresh Token sessions
     auth_jwt_secret: SecretStr = Field(default=SecretStr(_DEFAULT_AUTH_JWT_SECRET))
+    auth_jwt_leeway_seconds: int = Field(default=30, ge=0, le=300)
     auth_access_token_expires_in: int = Field(default=3600, ge=60, le=86400)  # 1 hour
     auth_refresh_token_expires_in: int = Field(default=2592000, ge=3600, le=31536000)  # 30 days
     auth_allow_self_registration: bool = True  # 是否开放自助注册
@@ -333,7 +280,6 @@ class Settings(BaseSettings):
                 )
 
         # Validate CIDR / IP syntax for any configured trusted proxy entries.
-        parsed_proxies: list[ProxyNetwork] = []
         for raw_proxy in self.auth_trusted_proxies:
             try:
                 network = ipaddress.ip_network(raw_proxy.strip(), strict=False)
@@ -346,7 +292,6 @@ class Settings(BaseSettings):
                     f"auth_trusted_proxies must not contain wildcard CIDR {raw_proxy!r} "
                     "in production"
                 )
-            parsed_proxies.append(network)
 
         # Validate CIDR / IP syntax for any configured metrics network allowlist entries.
         parsed_metrics_nets: list[ProxyNetwork] = []
@@ -379,8 +324,6 @@ class Settings(BaseSettings):
             if not host or any(ch.isspace() for ch in host) or "/" in host:
                 raise ValueError(f"allowed_hosts contains invalid host entry: {host!r}")
 
-        trusted_issuers = [issuer.strip() for issuer in self.auth_trusted_issuers if issuer.strip()]
-
         if is_production:
             if password in _INSECURE_DEFAULT_PASSWORDS:
                 raise ValueError(
@@ -388,8 +331,6 @@ class Settings(BaseSettings):
                 )
             if any(origin.strip() == "*" for origin in self.cors_allowed_origins):
                 raise ValueError("cors_allowed_origins must not contain '*' in production")
-            if self.auth_mode == "development":
-                raise ValueError("auth_mode='development' is forbidden in production")
             if not normalized_hosts:
                 raise ValueError("allowed_hosts must not be empty in production")
             if any(host == "*" for host in normalized_hosts):
@@ -403,36 +344,6 @@ class Settings(BaseSettings):
                     "metrics_allowed_networks or metrics_bearer_token must be configured "
                     "when metrics_enabled=True in production"
                 )
-
-        if self.auth_mode == "jwt_hs256":
-            _validate_required_secret(
-                self.auth_jwt_hs256_secret,
-                field_name="auth_jwt_hs256_secret",
-                mode_name="jwt_hs256",
-                is_production=is_production,
-            )
-            if not trusted_issuers:
-                raise ValueError(
-                    "auth_trusted_issuers must not be empty when auth_mode='jwt_hs256'"
-                )
-            if not (self.auth_trusted_audience and self.auth_trusted_audience.strip()):
-                raise ValueError("auth_trusted_audience must be set when auth_mode='jwt_hs256'")
-
-        if self.auth_mode == "trusted_gateway":
-            if not parsed_proxies:
-                raise ValueError(
-                    "auth_trusted_proxies must not be empty when auth_mode='trusted_gateway'"
-                )
-            if not trusted_issuers:
-                raise ValueError(
-                    "auth_trusted_issuers must not be empty when auth_mode='trusted_gateway'"
-                )
-            _validate_required_secret(
-                self.auth_gateway_shared_secret,
-                field_name="auth_gateway_shared_secret",
-                mode_name="trusted_gateway",
-                is_production=is_production,
-            )
 
         if self.memory_provider_mode == "memos":
             _validate_http_provider_settings(
@@ -536,25 +447,10 @@ class Settings(BaseSettings):
         return self.app_env == "production"
 
     def deletion_receipt_signing_key(self) -> bytes:
-        """Use an independent key when configured, otherwise the active stable server secret."""
-        secret = self.deletion_receipt_secret
-        if secret is None and self.auth_mode == "jwt_hs256":
-            secret = self.auth_jwt_hs256_secret
-        if secret is None and self.auth_mode == "trusted_gateway":
-            secret = self.auth_gateway_shared_secret
-        if secret is None:
-            secret = self.postgres_password
-        return secret.get_secret_value().encode("utf-8")
-
-    def gateway_headers(self) -> GatewayHeaders:
-        """Return the configured trusted-gateway header bundle."""
-        return GatewayHeaders(
-            secret=self.auth_gateway_secret_header,
-            issuer=self.auth_gateway_issuer_header,
-            subject=self.auth_gateway_subject_header,
-            actor=self.auth_gateway_actor_header,
-            permissions=self.auth_gateway_permissions_header,
-        )
+        """Use an independent key when configured, otherwise the built-in JWT signing secret."""
+        if self.deletion_receipt_secret is not None:
+            return self.deletion_receipt_secret.get_secret_value().encode("utf-8")
+        return self.auth_jwt_secret.get_secret_value().strip().encode("utf-8")
 
     def database_url(self) -> URL:
         """Build the PostgreSQL URL using the psycopg 3 driver."""

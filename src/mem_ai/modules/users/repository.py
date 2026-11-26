@@ -1,4 +1,4 @@
-"""PostgreSQL repository for `users` and `user_identities`."""
+"""PostgreSQL repository for `users`."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from uuid import UUID
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from mem_ai.modules.users.models import User, UserIdentity
+from mem_ai.modules.users.models import User
 from mem_ai.modules.users.schemas import UserStatus
 
 
@@ -26,46 +26,6 @@ async def get_user_by_id(
     elif for_share:
         stmt = stmt.with_for_update(read=True)
     return await session.scalar(stmt)
-
-
-async def get_user_by_identity(
-    session: AsyncSession,
-    *,
-    issuer: str,
-    subject: str,
-) -> User | None:
-    """Fetch the local user bound to a verified `(issuer, subject)` identity."""
-    stmt = (
-        select(User)
-        .join(UserIdentity, UserIdentity.user_id == User.id)
-        .where(
-            UserIdentity.issuer == issuer,
-            UserIdentity.subject == subject,
-        )
-    )
-    return await session.scalar(stmt)
-
-
-async def create_user_with_identity(
-    session: AsyncSession,
-    *,
-    issuer: str,
-    subject: str,
-) -> User:
-    """Insert a new active local user and bind `(issuer, subject)` in the current session."""
-    user = User(status="active")
-    session.add(user)
-    await session.flush()
-
-    identity = UserIdentity(
-        issuer=issuer,
-        subject=subject,
-        user_id=user.id,
-    )
-    session.add(identity)
-    await session.flush()
-    await session.refresh(user)
-    return user
 
 
 async def update_user_status(
@@ -87,19 +47,13 @@ async def update_user_status(
     return user
 
 
-async def delete_user_and_identities(session: AsyncSession, *, user_id: UUID) -> None:
+async def delete_deleting_user(session: AsyncSession, *, user_id: UUID) -> None:
     """Remove the deleting root last, after resource owners have confirmed cleanup."""
-    await session.execute(delete(UserIdentity).where(UserIdentity.user_id == user_id))
     removed = await session.scalar(
         delete(User).where(User.id == user_id, User.status == "deleting").returning(User.id)
     )
     if removed is None:
         raise RuntimeError("user cleanup lost its deleting root")
-
-
-# ========================================
-# 基于邮箱的用户管理（内置认证）
-# ========================================
 
 
 async def get_user_by_email(
@@ -108,7 +62,7 @@ async def get_user_by_email(
     email: str,
     for_update: bool = False,
 ) -> User | None:
-    """根据邮箱查找用户"""
+    """根据邮箱查找用户。"""
     stmt = select(User).where(User.email == email)
     if for_update:
         stmt = stmt.with_for_update()
@@ -122,7 +76,7 @@ async def create_user_with_email(
     password_hash: str,
     status: UserStatus = "active",
 ) -> User:
-    """创建带邮箱密码的新用户"""
+    """创建带邮箱密码的新用户。"""
     user = User(
         status=status,
         email=email,
@@ -140,7 +94,7 @@ async def update_user_password(
     user_id: UUID,
     password_hash: str,
 ) -> User | None:
-    """更新用户密码"""
+    """更新用户密码哈希。"""
     user = await get_user_by_id(session, user_id=user_id, for_update=True)
     if user is None:
         return None
