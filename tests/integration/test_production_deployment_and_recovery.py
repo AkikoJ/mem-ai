@@ -1,4 +1,4 @@
-"""Integration drills for production deployment, Worker, audit replay, and V1 contract."""
+"""Integration drills for unified single-process deployment, audit replay, and contracts."""
 
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ from mem_ai.api.dependencies import ProviderRegistry
 from mem_ai.application import create_app
 from mem_ai.contracts.memory_provider import MemoryRecallQuery, MemoryWriteInput
 from mem_ai.core.config import Settings
-from mem_ai.core.telemetry import TelemetryRegistry
 from mem_ai.db.engine import create_async_engine_from_settings, create_session_factory
 from mem_ai.modules.jobs import service as jobs_service
 from mem_ai.modules.memories import service as memories_service
@@ -31,7 +30,7 @@ from mem_ai.ops import (
     replay_deletion_audit_archive,
     verify_providers,
 )
-from mem_ai.workers.main import build_worker_probe_app, build_worker_registry
+from mem_ai.workers.assembly import build_worker_registry
 from mem_ai.workers.runner import WorkerConfig, WorkerRunner
 from tests.conftest import (
     FakeMemoryProvider,
@@ -53,36 +52,43 @@ def _production_settings(
     *,
     archive_path: Path | None = None,
     heartbeat_file: Path | None = None,
+    worker_loop_enabled: bool = True,
+    worker_poll_interval_seconds: float | None = None,
+    worker_heartbeat_interval_seconds: float | None = None,
 ) -> Settings:
-    return base_settings.model_copy(
-        update={
-            "app_env": "production",
-            "auth_mode": "jwt_hs256",
-            "auth_trusted_issuers": [_PROD_ISSUER],
-            "auth_trusted_audience": _PROD_AUDIENCE,
-            "auth_jwt_hs256_secret": SecretStr(_PROD_JWT_SECRET),
-            "deletion_receipt_secret": SecretStr(_PROD_RECEIPT_SECRET),
-            "allowed_hosts": [_PROD_HOST],
-            "cors_allowed_origins": ["https://app.prod.mem-ai.example"],
-            "metrics_enabled": True,
-            "metrics_allowed_networks": ["127.0.0.1/32"],
-            "metrics_bearer_token": SecretStr(_PROD_METRICS_TOKEN),
-            "deletion_audit_archive_path": str(archive_path) if archive_path else None,
-            "worker_heartbeat_file": str(heartbeat_file) if heartbeat_file else None,
-            "model_sync_on_startup": True,
-            "model_registry_entries": [
-                {
-                    "model_id": "gpt-4o-mini",
-                    "provider_id": "openai_compatible",
-                    "upstream_model": "gpt-4o-mini",
-                    "display_name": "GPT-4o Mini",
-                    "enabled": True,
-                    "supports_streaming": True,
-                }
-            ],
-            "model_default_id": "gpt-4o-mini",
-        }
-    )
+    updates: dict[str, Any] = {
+        "app_env": "production",
+        "auth_mode": "jwt_hs256",
+        "auth_trusted_issuers": [_PROD_ISSUER],
+        "auth_trusted_audience": _PROD_AUDIENCE,
+        "auth_jwt_hs256_secret": SecretStr(_PROD_JWT_SECRET),
+        "deletion_receipt_secret": SecretStr(_PROD_RECEIPT_SECRET),
+        "allowed_hosts": [_PROD_HOST],
+        "cors_allowed_origins": ["https://app.prod.mem-ai.example"],
+        "metrics_enabled": True,
+        "metrics_allowed_networks": ["127.0.0.1/32"],
+        "metrics_bearer_token": SecretStr(_PROD_METRICS_TOKEN),
+        "deletion_audit_archive_path": str(archive_path) if archive_path else None,
+        "worker_loop_enabled": worker_loop_enabled,
+        "worker_heartbeat_file": str(heartbeat_file) if heartbeat_file else None,
+        "model_sync_on_startup": True,
+        "model_registry_entries": [
+            {
+                "model_id": "gpt-4o-mini",
+                "provider_id": "openai_compatible",
+                "upstream_model": "gpt-4o-mini",
+                "display_name": "GPT-4o Mini",
+                "enabled": True,
+                "supports_streaming": True,
+            }
+        ],
+        "model_default_id": "gpt-4o-mini",
+    }
+    if worker_poll_interval_seconds is not None:
+        updates["worker_poll_interval_seconds"] = worker_poll_interval_seconds
+    if worker_heartbeat_interval_seconds is not None:
+        updates["worker_heartbeat_interval_seconds"] = worker_heartbeat_interval_seconds
+    return base_settings.model_copy(update=updates)
 
 
 def _make_jwt(subject: str, *, permissions: list[str] | None = None) -> str:
@@ -107,27 +113,35 @@ def _auth_header(subject: str, *, permissions: list[str] | None = None) -> dict[
 
 @pytest.mark.integration
 @pytest.mark.anyio
-async def test_independent_api_and_worker_lifecycle_probes_recovery_and_budget(
+async def test_unified_single_process_lifecycle_probes_recovery_and_budget(
     migrated_pg_settings: Settings,
     tmp_path: Path,
 ) -> None:
-    """Verify API + standalone Worker run independently with probes, lease recovery, and drain."""
+    """Verify unified single-process app runs probes, embedded job recovery, drain, and budget."""
     hb_file = tmp_path / "worker-heartbeat.json"
-    prod_settings = _production_settings(migrated_pg_settings, heartbeat_file=hb_file)
+    prod_settings = _production_settings(
+        migrated_pg_settings,
+        heartbeat_file=hb_file,
+        worker_loop_enabled=True,
+        worker_poll_interval_seconds=0.05,
+        worker_heartbeat_interval_seconds=0.05,
+    )
 
     budget = compute_connection_budget(
         prod_settings,
-        api_replicas=2,
-        worker_replicas=1,
+        replicas=3,
         reserved_connections=10,
         postgres_max_connections=100,
     )
     assert budget.within_budget is True
-    assert budget.worker_pool_adequate is True
+    assert budget.pool_adequate is True
+    assert budget.total_replica_connections == 3 * (
+        prod_settings.db_pool_size + prod_settings.db_max_overflow
+    )
 
     memory_provider = FakeMemoryProvider()
     model_provider = FakeModelProvider(prefix="prod:")
-    api_app = create_app(
+    app = create_app(
         prod_settings,
         providers=ProviderRegistry(
             model_provider=model_provider,
@@ -135,137 +149,103 @@ async def test_independent_api_and_worker_lifecycle_probes_recovery_and_budget(
         ),
     )
 
-    worker_engine = create_async_engine_from_settings(prod_settings)
-    worker_sf = create_session_factory(worker_engine)
-    worker_telemetry = TelemetryRegistry()
-    worker_registry = build_worker_registry(worker_sf, memory_provider=memory_provider)
-    runner = WorkerRunner(
-        session_factory=worker_sf,
-        registry=worker_registry,
-        config=WorkerConfig(
-            worker_id="prod-worker-1",
-            concurrency=2,
-            poll_interval_seconds=0.05,
-            heartbeat_interval_seconds=0.05,
-            heartbeat_file=str(hb_file),
-            shutdown_grace_seconds=5.0,
-        ),
-        telemetry=worker_telemetry,
-    )
-    probe_app = build_worker_probe_app(
-        runner=runner,
-        session_factory=worker_sf,
-        settings=prod_settings,
-    )
+    async with app.router.lifespan_context(app):
+        sf = app.state.session_factory
+        transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 40001))
+        async with httpx.AsyncClient(
+            transport=transport, base_url=f"http://{_PROD_HOST}"
+        ) as client:
+            # Unified liveness, readiness, authenticated /metrics, and atomic heartbeat file
+            assert (await client.get("/health/live")).status_code == 200
+            ready_resp = await client.get("/health/ready")
+            assert ready_resp.status_code == 200
+            assert ready_resp.json()["data"]["migration_revision"] == "20261124_0012"
 
-    stop_event = asyncio.Event()
-    worker_task = asyncio.create_task(runner.run_forever(stop_event=stop_event))
-    try:
-        async with api_app.router.lifespan_context(api_app):
-            api_transport = httpx.ASGITransport(app=api_app, client=("127.0.0.1", 40001))
-            probe_transport = httpx.ASGITransport(app=probe_app, client=("127.0.0.1", 40002))
-            async with (
-                httpx.AsyncClient(
-                    transport=api_transport, base_url=f"http://{_PROD_HOST}"
-                ) as api_client,
-                httpx.AsyncClient(
-                    transport=probe_transport, base_url="http://127.0.0.1"
-                ) as probe_client,
-            ):
-                # API liveness, readiness, and authenticated /metrics
-                assert (await api_client.get("/health/live")).status_code == 200
-                ready_resp = await api_client.get("/health/ready")
-                assert ready_resp.status_code == 200
-                assert ready_resp.json()["data"]["migration_revision"] == "20261124_0012"
+            for _ in range(40):
+                if hb_file.exists():
+                    break
+                await asyncio.sleep(0.05)
+            assert hb_file.exists()
+            hb_payload = json.loads(hb_file.read_text(encoding="utf-8"))
+            assert hb_payload["worker_id"] == app.state.worker_runner.config.worker_id
+            assert hb_payload["shutting_down"] is False
 
-                metrics_resp = await api_client.get(
-                    "/metrics",
-                    headers={"Authorization": f"Bearer {_PROD_METRICS_TOKEN}"},
+            metrics_resp = await client.get(
+                "/metrics",
+                headers={"Authorization": f"Bearer {_PROD_METRICS_TOKEN}"},
+            )
+            assert metrics_resp.status_code == 200
+            assert "mem_ai_jobs_backlog" in metrics_resp.text
+            assert "mem_ai_worker_last_heartbeat_timestamp_seconds " in metrics_resp.text
+
+            # Enqueue an expired-lease job (simulating crashed replica) and confirm recovery
+            me = await client.get("/v1/users/me", headers=_auth_header("ops-recover-user"))
+            user_id = UUID(me.json()["data"]["userId"])
+            async with sf.begin() as session:
+                stale_job = await jobs_service.register_and_claim_sync_job_in_session(
+                    session,
+                    job_type="generation_lease_recovery",
+                    business_id="crash-recovery-probe",
+                    user_id=user_id,
+                    dedupe_key=f"crash-probe:{uuid4().hex}",
+                    metadata_json={},
+                    lease_duration_seconds=1,
+                    worker_id="crashed-replica",
+                    now=datetime.now(UTC) - timedelta(seconds=120),
                 )
-                assert metrics_resp.status_code == 200
-                assert "mem_ai_jobs_backlog" in metrics_resp.text
+            for _ in range(40):
+                refreshed = await jobs_service.get_job(sf, job_id=stale_job.id)
+                if refreshed is not None and refreshed.status == "succeeded":
+                    break
+                await asyncio.sleep(0.05)
+            final_job = await jobs_service.get_job(sf, job_id=stale_job.id)
+            assert final_job is not None and final_job.status == "succeeded"
 
-                # Worker independent liveness, readiness, /metrics, and atomic heartbeat file
-                assert (await probe_client.get("/health/live")).status_code == 200
-                assert (await probe_client.get("/health/ready")).status_code == 200
-                worker_metrics = await probe_client.get(
-                    "/metrics",
-                    headers={"Authorization": f"Bearer {_PROD_METRICS_TOKEN}"},
+            # Controlled requeue of exhausted failed job + operational health inspection
+            async with sf.begin() as session:
+                failed_job = await jobs_service.register_and_claim_sync_job_in_session(
+                    session,
+                    job_type="generation_lease_recovery",
+                    business_id="exhausted-job-probe",
+                    user_id=user_id,
+                    dedupe_key=f"exhausted:{uuid4().hex}",
+                    metadata_json={},
+                    max_attempts=1,
                 )
-                assert worker_metrics.status_code == 200
-                await asyncio.sleep(0.12)
-                assert hb_file.exists()
-                hb_payload = json.loads(hb_file.read_text(encoding="utf-8"))
-                assert hb_payload["worker_id"] == "prod-worker-1"
-
-                # Enqueue an expired-lease job (simulating crashed worker) and confirm recovery
-                me = await api_client.get("/v1/users/me", headers=_auth_header("ops-recover-user"))
-                user_id = UUID(me.json()["data"]["userId"])
-                async with worker_sf.begin() as session:
-                    stale_job = await jobs_service.register_and_claim_sync_job_in_session(
-                        session,
-                        job_type="generation_lease_recovery",
-                        business_id="crash-recovery-probe",
-                        user_id=user_id,
-                        dedupe_key=f"crash-probe:{uuid4().hex}",
-                        metadata_json={},
-                        lease_duration_seconds=1,
-                        worker_id="crashed-worker",
-                        now=datetime.now(UTC) - timedelta(seconds=120),
-                    )
-                for _ in range(40):
-                    refreshed = await jobs_service.get_job(worker_sf, job_id=stale_job.id)
-                    if refreshed is not None and refreshed.status == "succeeded":
-                        break
-                    await asyncio.sleep(0.05)
-                final_job = await jobs_service.get_job(worker_sf, job_id=stale_job.id)
-                assert final_job is not None and final_job.status == "succeeded"
-
-                # Controlled requeue of exhausted failed job + operational health inspection
-                async with worker_sf.begin() as session:
-                    failed_job = await jobs_service.register_and_claim_sync_job_in_session(
-                        session,
-                        job_type="generation_lease_recovery",
-                        business_id="exhausted-job-probe",
-                        user_id=user_id,
-                        dedupe_key=f"exhausted:{uuid4().hex}",
-                        metadata_json={},
-                        max_attempts=1,
-                    )
-                    assert failed_job.lease_token is not None
-                    await jobs_service.complete_job_in_session(
-                        session,
-                        job_id=failed_job.id,
-                        lease_token=failed_job.lease_token,
-                        status="failed",
-                        error_code="transient_upstream_failure",
-                        error_summary="exhausted attempts during outage",
-                    )
-                health_before = await inspect_operational_health(worker_sf, prod_settings)
-                assert "exhausted_failed_jobs" in health_before.alerts
-
-                requeued = await jobs_service.requeue_failed_job(
-                    worker_sf,
+                assert failed_job.lease_token is not None
+                await jobs_service.complete_job_in_session(
+                    session,
                     job_id=failed_job.id,
-                    extra_attempts=2,
-                    reason="upstream restored in drill",
+                    lease_token=failed_job.lease_token,
+                    status="failed",
+                    error_code="transient_upstream_failure",
+                    error_summary="exhausted attempts during outage",
                 )
-                assert requeued.status == "pending"
-                for _ in range(40):
-                    refreshed = await jobs_service.get_job(worker_sf, job_id=failed_job.id)
-                    if refreshed is not None and refreshed.status == "succeeded":
-                        break
-                    await asyncio.sleep(0.05)
-                final_requeued = await jobs_service.get_job(worker_sf, job_id=failed_job.id)
-                assert final_requeued is not None and final_requeued.status == "succeeded"
+            health_before = await inspect_operational_health(sf, prod_settings)
+            assert "exhausted_failed_jobs" in health_before.alerts
 
-                health_after = await inspect_operational_health(worker_sf, prod_settings)
-                assert health_after.jobs_failed == 0
-                assert "exhausted_failed_jobs" not in health_after.alerts
-    finally:
-        stop_event.set()
-        await asyncio.wait_for(worker_task, timeout=5.0)
-        await worker_engine.dispose()
+            requeued = await jobs_service.requeue_failed_job(
+                sf,
+                job_id=failed_job.id,
+                extra_attempts=2,
+                reason="upstream restored in drill",
+            )
+            assert requeued.status == "pending"
+            for _ in range(40):
+                refreshed = await jobs_service.get_job(sf, job_id=failed_job.id)
+                if refreshed is not None and refreshed.status == "succeeded":
+                    break
+                await asyncio.sleep(0.05)
+            final_requeued = await jobs_service.get_job(sf, job_id=failed_job.id)
+            assert final_requeued is not None and final_requeued.status == "succeeded"
+
+            health_after = await inspect_operational_health(sf, prod_settings)
+            assert health_after.jobs_failed == 0
+            assert "exhausted_failed_jobs" not in health_after.alerts
+
+    assert app.state.ready is False
+    final_hb = json.loads(hb_file.read_text(encoding="utf-8"))
+    assert final_hb["shutting_down"] is True
 
 
 @pytest.mark.integration
@@ -276,7 +256,11 @@ async def test_backup_restore_audit_replay_prevents_memory_resurrection_and_is_i
 ) -> None:
     """Drill Baseline A: restore DB to pre-deletion backup T0, replay audit archive, then resume."""
     archive_path = tmp_path / "independent-deletion-audit.jsonl"
-    prod_settings = _production_settings(migrated_pg_settings, archive_path=archive_path)
+    prod_settings = _production_settings(
+        migrated_pg_settings,
+        archive_path=archive_path,
+        worker_loop_enabled=False,
+    )
     memory_provider = FakeMemoryProvider()
     model_provider = FakeModelProvider(prefix="drill:")
     app = create_app(

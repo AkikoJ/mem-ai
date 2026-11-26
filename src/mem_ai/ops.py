@@ -53,11 +53,7 @@ from mem_ai.modules.users import service as users_service
 
 
 class ConnectionBudgetReport(BaseModel):
-    """
-    计算统一单进程后端副本的 PostgreSQL 连接池预算。
-
-    在统一单进程架构中，每个副本同时处理 HTTP 请求与内嵌后台任务。
-    """
+    """Computed PostgreSQL connection budget across unified backend replicas and reserved slots."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -143,11 +139,7 @@ def compute_connection_budget(
     reserved_connections: int = 10,
     postgres_max_connections: int = 100,
 ) -> ConnectionBudgetReport:
-    """
-    验证统一单进程后端的 PostgreSQL 连接总预算。
-
-    统一单进程架构下，每个副本同时承载 HTTP 请求与内嵌后台任务执行器。
-    """
+    """Validate total PostgreSQL connection budget across unified backend replicas and ops."""
     if replicas < 0 or reserved_connections < 0:
         raise ValueError("replica count and reserved connections must be non-negative")
     if postgres_max_connections < 1:
@@ -156,19 +148,7 @@ def compute_connection_budget(
     per_process = settings.db_pool_size + settings.db_max_overflow
     replica_conns = replicas * per_process
     total = replica_conns + reserved_connections
-
-    # 当内嵌后台任务执行器启用时，每个进程的连接池必须足以支持在线请求、生成和后台任务并发
-    worker_enabled = settings.worker_loop_enabled
-    if worker_enabled:
-        min_required = (
-            settings.max_concurrent_requests
-            + settings.max_concurrent_generations
-            + settings.worker_concurrency
-            + 1  # 至少预留 1 个连接给健康检查等其他操作
-        )
-        pool_adequate = per_process >= min_required
-    else:
-        pool_adequate = True
+    pool_adequate = replicas == 0 or per_process >= settings.min_process_pool_connections()
 
     return ConnectionBudgetReport(
         replicas=replicas,
@@ -180,7 +160,7 @@ def compute_connection_budget(
         max_concurrent_requests=settings.max_concurrent_requests,
         max_concurrent_generations=settings.max_concurrent_generations,
         worker_concurrency=settings.worker_concurrency,
-        worker_loop_enabled=worker_enabled,
+        worker_loop_enabled=settings.worker_loop_enabled,
         within_budget=total <= postgres_max_connections,
         pool_adequate=pool_adequate,
     )
@@ -567,7 +547,12 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     budget = sub.add_parser("check-budget", help="Validate PostgreSQL connection pool budget.")
-    budget.add_argument("--replicas", type=int, required=True, help="Number of unified backend service replicas.")
+    budget.add_argument(
+        "--replicas",
+        type=int,
+        required=True,
+        help="Number of unified backend service replicas.",
+    )
     budget.add_argument("--reserved-connections", type=int, default=10)
     budget.add_argument("--postgres-max-connections", type=int, default=100)
 

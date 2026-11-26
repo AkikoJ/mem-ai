@@ -121,7 +121,7 @@ def test_discover_alembic_head_falls_back_to_cwd_for_non_editable_container_inst
         health_service._discover_alembic_head.cache_clear()
 
 
-def test_compute_connection_budget_enforces_total_and_worker_pool_bounds() -> None:
+def test_compute_connection_budget_enforces_total_and_pool_bounds() -> None:
     settings = Settings(
         _env_file=None,
         app_env="test",
@@ -131,29 +131,29 @@ def test_compute_connection_budget_enforces_total_and_worker_pool_bounds() -> No
     )
     ok = compute_connection_budget(
         settings,
-        api_replicas=4,
-        worker_replicas=2,
+        replicas=6,
         reserved_connections=15,
         postgres_max_connections=100,
     )
+    assert ok.replicas == 6
     assert ok.per_process_max_connections == 10
-    assert ok.api_connections == 40
-    assert ok.worker_connections == 20
+    assert ok.total_replica_connections == 60
     assert ok.total_required_connections == 75
+    assert ok.worker_loop_enabled is True
     assert ok.within_budget is True
-    assert ok.worker_pool_adequate is True
+    assert ok.pool_adequate is True
 
     over = compute_connection_budget(
         settings,
-        api_replicas=8,
-        worker_replicas=3,
+        replicas=11,
         reserved_connections=10,
         postgres_max_connections=100,
     )
     assert over.total_required_connections == 120
     assert over.within_budget is False
+    assert over.pool_adequate is True
 
-    tight_worker = Settings(
+    online_only_tight = Settings(
         _env_file=None,
         app_env="test",
         worker_loop_enabled=False,
@@ -161,15 +161,35 @@ def test_compute_connection_budget_enforces_total_and_worker_pool_bounds() -> No
         db_max_overflow=1,
         worker_concurrency=4,
     )
+    online_only_report = compute_connection_budget(
+        online_only_tight,
+        replicas=2,
+        reserved_connections=5,
+        postgres_max_connections=50,
+    )
+    assert online_only_report.within_budget is True
+    assert online_only_report.worker_loop_enabled is False
+    assert online_only_report.pool_adequate is True
+
+    under_provisioned_settings = online_only_tight.model_copy(update={"worker_loop_enabled": True})
     under_provisioned = compute_connection_budget(
-        tight_worker,
-        api_replicas=1,
-        worker_replicas=1,
+        under_provisioned_settings,
+        replicas=2,
         reserved_connections=5,
         postgres_max_connections=50,
     )
     assert under_provisioned.within_budget is True
-    assert under_provisioned.worker_pool_adequate is False
+    assert under_provisioned.pool_adequate is False
+
+    zero_replicas = compute_connection_budget(
+        under_provisioned_settings,
+        replicas=0,
+        reserved_connections=5,
+        postgres_max_connections=50,
+    )
+    assert zero_replicas.total_replica_connections == 0
+    assert zero_replicas.within_budget is True
+    assert zero_replicas.pool_adequate is True
 
 
 def test_plan_deletion_audit_replay_applies_precedence_and_deduplication() -> None:

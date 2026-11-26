@@ -28,7 +28,7 @@ from mem_ai.modules.jobs.schemas import JobBackoffPolicy
 from mem_ai.modules.memories.jobs import JOB_TYPE_MEMORY_TURN_WRITE
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
-from mem_ai.workers.main import build_worker_registry
+from mem_ai.workers.assembly import build_worker_registry
 from mem_ai.workers.runner import WorkerConfig, WorkerRunner
 from tests.conftest import FakeMemoryProvider, FakeModelProvider
 

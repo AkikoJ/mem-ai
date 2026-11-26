@@ -52,7 +52,7 @@ from mem_ai.modules.retention.service import (
 )
 from mem_ai.modules.users import cleanup as users_cleanup
 from mem_ai.modules.users import service as users_service
-from mem_ai.workers.main import (
+from mem_ai.workers.assembly import (
     JOB_TYPE_GENERATION_LEASE_RECOVERY,
     build_worker_registry,
     default_periodic_jobs,

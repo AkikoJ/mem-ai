@@ -27,7 +27,7 @@ from mem_ai.modules.conversations.queries import list_recalled_memories_for_mess
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
 from mem_ai.modules.users import service as users_service
-from mem_ai.workers.main import build_worker_registry
+from mem_ai.workers.assembly import build_worker_registry
 from mem_ai.workers.runner import WorkerConfig, WorkerRunner
 from tests.conftest import FakeMemoryProvider, FakeModelProvider
 

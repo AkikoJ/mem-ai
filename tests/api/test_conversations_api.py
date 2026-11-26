@@ -24,7 +24,7 @@ from mem_ai.core.exceptions import BadGatewayError
 from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
-from mem_ai.workers.main import build_worker_registry
+from mem_ai.workers.assembly import build_worker_registry
 from mem_ai.workers.runner import WorkerConfig, WorkerRunner
 from tests.api.test_chat_idempotency_and_generations_api import _ControllableModelProvider
 from tests.conftest import FakeMemoryProvider

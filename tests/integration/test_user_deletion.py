@@ -33,7 +33,7 @@ from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
 from mem_ai.modules.operations.audit import DeletionAuditEvent
 from mem_ai.modules.users.cleanup import JOB_TYPE_USER_DELETE, UserCleanupJobHandler
-from mem_ai.workers.main import build_worker_registry
+from mem_ai.workers.assembly import build_worker_registry
 from mem_ai.workers.runner import JobHandlerRegistry, WorkerConfig, WorkerRunner
 from tests.api.test_chat_idempotency_and_generations_api import _ControllableModelProvider
 from tests.api.test_conversations_api import GatedMemoryProvider

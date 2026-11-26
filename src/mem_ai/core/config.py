@@ -469,7 +469,7 @@ class Settings(BaseSettings):
 
         if (
             self.worker_loop_enabled
-            and self.db_pool_size + self.db_max_overflow < self.worker_concurrency + 1
+            and self.db_pool_size + self.db_max_overflow < self.min_process_pool_connections()
         ):
             raise ValueError(
                 "db_pool_size + db_max_overflow must be at least "
@@ -486,6 +486,12 @@ class Settings(BaseSettings):
         _validate_model_registry_entries(self.model_registry_entries)
 
         return self
+
+    def min_process_pool_connections(self) -> int:
+        """Minimum per-process DB pool capacity required by active process concurrency."""
+        if self.worker_loop_enabled:
+            return self.worker_concurrency + 1
+        return 1
 
     def trusted_proxy_networks(self) -> tuple[ProxyNetwork, ...]:
         """Parse configured trusted proxy IPs and CIDRs."""

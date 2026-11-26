@@ -174,7 +174,7 @@ Service  ←──────────────────────�
 | `tests/api/test_user_deletion.py`、`tests/integration/test_user_deletion.py`、`tests/integration/test_user_deletion_provider_mapping.py` | 已落地 | 15 API 回执权限与普通身份隔离、Worker 分阶段清理、PostgreSQL 外键生存/租约竞态、远程部分失败和恢复及历史提供方映射保留 |
 | `tests/unit/test_retention_policy.py`、`tests/integration/test_retention_and_expiry.py` | 已落地 | 16 保留配置与游标摘要单元测试、24 小时/30 天边界、迟到终态、分批中断与租约恢复、多 Worker 同周期去重、活跃/待核验/远程映射保护及显式删除优先的 PostgreSQL 验证 |
 | `src/mem_ai/core/limits.py`、`src/mem_ai/core/telemetry.py`、`tests/unit/test_limits_and_telemetry.py`、`tests/api/test_limits_and_security_boundaries.py`、`tests/api/test_observability_and_metrics.py` | 已落地 | 17 可替换限流接缝（`RateLimiter`）、进程请求与生成并发预算（`ConcurrencyLimiter`）、请求体/输入长度/生成与流时长限制、Host/CORS/可信代理与请求 ID 白名单、低基数 Prometheus 指标注册表与受控 `/metrics`、OpenTelemetry 追踪接缝、JSON 日志脱敏关联与 Worker 心跳/探针及优雅退出验证 |
-| `Dockerfile`、`.dockerignore`、`src/mem_ai/ops.py`、`src/mem_ai/modules/memories/recovery.py`、`docs/operations/deployment-and-recovery.md`、`tests/unit/test_ops_recovery.py`、`tests/integration/test_production_deployment_and_recovery.py` | 已落地 | 18 多阶段非 root 容器镜像（支持 API/Worker/迁移/同步/运维入口）、连接预算/健康诊断/失败任务受控重入队/独立删除审计归档重放/有限权限提供方核验 CLI、历史升级与恢复演练测试及生产部署与恢复运行手册 |
+| `Dockerfile`、`.dockerignore`、`src/mem_ai/ops.py`、`src/mem_ai/modules/memories/recovery.py`、`docs/operations/deployment-and-recovery.md`、`tests/unit/test_ops_recovery.py`、`tests/integration/test_production_deployment_and_recovery.py` | 已落地 | 18/收敛 03 多阶段非 root 容器镜像（支持统一单进程服务、迁移、同步与运维入口）、单进程连接预算/健康诊断/失败任务受控重入队/独立删除审计归档重放/有限权限提供方核验 CLI、历史升级与恢复演练测试及生产部署与恢复运行手册 |
 
 ### 3.0.2 功能定位索引
 
@@ -209,7 +209,7 @@ mem-ai/                                    # 项目根目录，管理应用、�
 ├── alembic.ini                            # Alembic 入口配置和迁移日志设置
 ├── Makefile                               # 独立的数据库、迁移、API 启动与检查快捷命令
 ├── compose.yaml                           # 本地 PostgreSQL 依赖和健康检查
-├── Dockerfile                             # 应用容器定义，目标收敛为单一单进程服务入口（当前仍兼容 V1 过渡 Worker 命令）
+├── Dockerfile                             # 应用多阶段非 root 容器镜像，默认启动统一单进程后端服务入口
 ├── .dockerignore                          # 容器上下文过滤规则
 ├── README.md                              # 本地运行、检查和文档入口
 ├── AGENTS.md                              # 仓库工作规则和技能入口
@@ -329,20 +329,19 @@ mem-ai/                                    # 项目根目录，管理应用、�
 │       ├── integrations/                  # 外部调用共享基础设施
 │       │   └── http.py                    # HTTPX 生命周期、连接池和默认超时
 │       └── workers/                       # 后台任务执行框架（由主应用 lifespan 内嵌运行）
-│           ├── assembly.py                # 业务处理器注册与周期任务装配，供应用和过渡入口复用
+│           ├── assembly.py                # 业务处理器注册与周期任务装配，供主应用 lifespan 与测试复用
 │           ├── lease.py                   # 长任务处理期间续租并报告租约丢失
-│           ├── main.py                    # V1 过渡独立 Worker 入口，复用应用处理器装配
-│           ├── runner.py                  # 内嵌/共享异步任务执行器：轮询、并发、恢复、周期调度、心跳与指标记录
+│           ├── runner.py                  # 内嵌异步任务执行器：轮询、并发、恢复、周期调度、心跳与指标记录
 │           └── schemas.py                 # Worker 配置、周期任务规格、健康快照与处理器注册表
 ├── tests/                                 # 按公开行为验证的测试
 │   ├── conftest.py                        # 应用、PostgreSQL、身份和提供方 fixture
 │   ├── architecture/                      # 依赖方向、SDK 位置、重复路由及文档契约检查
 │   ├── unit/                              # 纯业务规则、摘要、游标和状态机测试
 │   │   ├── test_limits_and_telemetry.py   # 可替换限流、并发预算、低基数指标与追踪接缝验证
-│   │   ├── test_ops_recovery.py           # 连接预算、审计归档加载与重放计划、容器及 Alembic 头发现验证
+│   │   ├── test_ops_recovery.py           # 单进程连接预算、审计归档加载与重放计划、容器及 Alembic 头发现验证
 │   │   └── test_retention_policy.py       # 保留策略默认值、游标序列化与脱敏摘要验证
 │   ├── integration/                       # 事务、迁移、租约、Worker 和提供方契约
-│   │   ├── test_production_deployment_and_recovery.py # 独立 API/Worker、备份审计重放防复活、重入队、提供方核验与 V1 全契约验收
+│   │   ├── test_production_deployment_and_recovery.py # 统一单进程生命周期与探针、备份审计重放防复活、重入队、提供方核验与公开契约验收
 │   │   ├── test_retention_and_expiry.py   # 24 小时/30 天边界、迟到终态、分批中断恢复、周期去重与活跃保护验证
 │   │   ├── test_user_deletion.py           # 用户删除阶段、外键生存、竞态与远程失败恢复验证
 │   │   └── test_user_deletion_provider_mapping.py # 历史提供方不可用时保留身份与清理映射验证
@@ -455,7 +454,7 @@ modules/<module>/    # 某个业务模块，例如 agents 或 conversations
 
 模块导入保持轻量，网络连接和后台执行由显式 `lifespan` 管理。主应用已按 `WORKER_LOOP_ENABLED` 控制内嵌任务循环，并共享在线请求的 HTTP 客户端、数据库连接池、遥测和追踪器；单进程同时承载 HTTP/SSE 请求与内嵌后台任务执行器，通过配置控制进程内并发预算与连接池总预算隔离资源竞争。
 
-内嵌 Worker 支持关闭自动轮询后手动调用 `run_once`，因此无论是否启用轮询，`db_pool_size + db_max_overflow` 都至少为 `worker_concurrency + 1`，为在线请求保留一个数据库连接；连接池跨副本总量仍由 `ops check-budget` 按部署副本数核验。
+当启用内嵌任务循环（`WORKER_LOOP_ENABLED=true`）时，配置校验与 `ops check-budget` 共同通过 `Settings.min_process_pool_connections()` 要求 `db_pool_size + db_max_overflow >= worker_concurrency + 1`，为在线短事务与健康检查至少保留一个数据库连接；连接池跨副本总量由 `ops check-budget --replicas` 按同构副本数核验。
 
 数据库连接池采用以下初始值。
 
@@ -741,7 +740,7 @@ V1 增量事件仅当前连接发送，事件 ID用于连接内排序与诊断�
 
 用户删除 `202` 返回一次性高随机度回执，数据库仅保存将操作 ID 与回执共同绑定的 HMAC-SHA256 摘要，使用固定时间比较。请求通过 `Authorization: DeletionReceipt <receipt>` 查询 `/v1/operations/{operationId}`。只有该查询路由接收回执认证；普通业务认证入口显式拒绝此凭证。回执绑定单个删除操作和有效期，校验请求格式、操作类型、摘要、过期及撤销状态；跨操作、伪造、撤销与过期均返回统一认证错误。回执和 Authorization 在日志中脱敏，回执不进入 URL、游标或持久化任务载荷。
 
-`deletion_receipt_secret` 可配置独立保护密钥，生产推荐独立设置且至少 32 字符；未设置时选择当前认证模式的稳定服务端密钥（JWT HS256 或可信网关共享密钥），开发模式回退到数据库密码。`deletion_receipt_ttl_seconds` 控制有效期，默认 30 天，范围 60 秒至 365 天。API 与 Worker 共享稳定配置，密钥须覆盖回执有效期；轮换保护密钥会使未到期的既有回执失效，撤销时间则支持单个回执独立失效。
+`deletion_receipt_secret` 可配置独立保护密钥，生产推荐独立设置且至少 32 字符；未设置时选择当前认证模式的稳定服务端密钥（JWT HS256 或可信网关共享密钥），开发模式回退到数据库密码。`deletion_receipt_ttl_seconds` 控制有效期，默认 30 天，范围 60 秒至 365 天。统一单进程服务的在线请求与内嵌后台任务共享稳定配置，密钥须覆盖回执有效期；轮换保护密钥会使未到期的既有回执失效，撤销时间则支持单个回执独立失效。
 
 已停用用户的普通凭证阻止业务访问，删除回执继续读取最小状态结果。完成状态区分本地数据清理、远程记忆清理和最终结果，操作终态及回执摘要按可配置保留期最小化保存。
 

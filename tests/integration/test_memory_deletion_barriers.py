@@ -55,7 +55,7 @@ from mem_ai.modules.models.schemas import ModelConfigSeed
 from mem_ai.modules.operations import service as operations_service
 from mem_ai.modules.operations.audit import JsonlDeletionAuditArchiver
 from mem_ai.modules.users import service as users_service
-from mem_ai.workers.main import build_worker_registry
+from mem_ai.workers.assembly import build_worker_registry
 from mem_ai.workers.runner import JobHandlerRegistry, WorkerConfig, WorkerRunner
 from tests.conftest import FakeModelProvider
 

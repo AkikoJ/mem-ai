@@ -20,10 +20,9 @@
 make db-up          # 启动本地 PostgreSQL 容器并等待健康检查通过
 make db-down        # 停止本地 PostgreSQL 容器（保留数据卷）
 make migrate        # 执行 Alembic 升级到 head
-make api            # 使用 .env 的 APP_HOST/APP_PORT 启动带 --reload 的本地 FastAPI 开发服务
-make worker         # （V1 过渡入口，目标收敛为内嵌进主进程 lifespan）启动后台任务执行器
+make api            # 使用 .env 的 APP_HOST/APP_PORT 启动带 --reload 的统一单进程 FastAPI 开发服务（含内嵌后台任务执行器）
 make ops-health     # 检查数据库就绪、任务积压、过期租约与记忆删除屏障
-make ops-budget     # 校验服务副本的 PostgreSQL 连接总预算
+make ops-budget     # 校验服务副本的 PostgreSQL 连接总预算（默认 REPLICAS=2）
 make test           # 运行 pytest 测试集
 make check          # 执行 Ruff lint/format、mypy 与架构检查
 ```

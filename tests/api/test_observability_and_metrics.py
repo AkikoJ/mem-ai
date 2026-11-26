@@ -23,13 +23,11 @@ from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import BadGatewayError
 from mem_ai.core.logging import JsonLogFormatter
 from mem_ai.core.telemetry import InMemoryTracer, TelemetryRegistry
-from mem_ai.db.engine import create_async_engine_from_settings, create_session_factory
 from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
 from mem_ai.modules.conversations import generation as conversations_generation
 from mem_ai.modules.conversations.models import Generation
 from mem_ai.modules.jobs import service as jobs_service
 from mem_ai.modules.jobs.schemas import JobExecutionContext, JobHandlerOutcome
-from mem_ai.workers.main import build_worker_probe_app
 from mem_ai.workers.runner import JobHandlerRegistry, WorkerConfig, WorkerRunner
 from tests.conftest import FakeMemoryProvider, FakeModelProvider, parse_sse_text
 
@@ -363,15 +361,20 @@ async def test_readiness_checks_startup_lifecycle_and_compatible_migration_revis
 
 @pytest.mark.integration
 @pytest.mark.anyio
-async def test_worker_heartbeat_probe_app_metrics_and_graceful_shutdown(
+async def test_worker_heartbeat_shared_metrics_and_graceful_shutdown(
     migrated_pg_settings: Settings,
     tmp_path: Path,
 ) -> None:
     heartbeat_path = tmp_path / "worker-heartbeat.json"
-    engine = create_async_engine_from_settings(migrated_pg_settings)
-    session_factory = create_session_factory(engine)
+    obs_settings = migrated_pg_settings.model_copy(
+        update={
+            "metrics_enabled": True,
+            "worker_loop_enabled": False,
+        }
+    )
     tracer = InMemoryTracer()
     telemetry = TelemetryRegistry()
+    app = create_app(obs_settings, telemetry=telemetry, tracer=tracer)
 
     done_event = asyncio.Event()
     slow_started = asyncio.Event()
@@ -393,24 +396,25 @@ async def test_worker_heartbeat_probe_app_metrics_and_graceful_shutdown(
     registry.register("obs_fast", _FastHandler())
     registry.register("obs_slow", _SlowStragglerHandler())
 
-    runner = WorkerRunner(
-        session_factory=session_factory,
-        registry=registry,
-        config=WorkerConfig(
-            worker_id="worker-obs-test",
-            concurrency=2,
-            poll_interval_seconds=0.05,
-            lease_ttl_seconds=10.0,
-            lease_renew_interval_seconds=5.0,
-            shutdown_grace_seconds=0.15,
-            heartbeat_interval_seconds=0.05,
-            heartbeat_file=str(heartbeat_path),
-        ),
-        telemetry=telemetry,
-        tracer=tracer,
-    )
+    async with app.router.lifespan_context(app):
+        session_factory = app.state.session_factory
+        runner = WorkerRunner(
+            session_factory=session_factory,
+            registry=registry,
+            config=WorkerConfig(
+                worker_id="worker-obs-test",
+                concurrency=2,
+                poll_interval_seconds=0.05,
+                lease_ttl_seconds=10.0,
+                lease_renew_interval_seconds=5.0,
+                shutdown_grace_seconds=0.15,
+                heartbeat_interval_seconds=0.05,
+                heartbeat_file=str(heartbeat_path),
+            ),
+            telemetry=telemetry,
+            tracer=tracer,
+        )
 
-    try:
         async with session_factory.begin() as session:
             fast_job, _ = await jobs_service.enqueue_job_in_session(
                 session,
@@ -446,19 +450,12 @@ async def test_worker_heartbeat_probe_app_metrics_and_graceful_shutdown(
         assert hb_payload["last_claim_at"] is not None
         assert hb_payload["shutting_down"] is False
 
-        # Verify Worker probe ASGI app exposes /health/live, /health/ready, and controlled /metrics
-        probe_app = build_worker_probe_app(
-            runner=runner,
-            session_factory=session_factory,
-            settings=migrated_pg_settings,
-        )
-        transport = httpx.ASGITransport(app=probe_app)
+        # Verify unified application exposes /health/live, /health/ready, and shared /metrics
+        transport = httpx.ASGITransport(app=_with_client_ip(app, "127.0.0.1"))
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             live = await client.get("/health/live")
             assert live.status_code == 200
             assert live.json()["request_id"].startswith("req_")
-            assert live.json()["data"]["worker_id"] == "worker-obs-test"
-            assert live.json()["data"]["succeeded_count"] >= 1
 
             ready = await client.get("/health/ready")
             assert ready.status_code == 200
@@ -485,5 +482,3 @@ async def test_worker_heartbeat_probe_app_metrics_and_graceful_shutdown(
         assert fast_row is not None and fast_row.status == "succeeded"
         assert slow_row is not None and slow_row.status == "running"
         assert any(s.name == "worker.job" for s in tracer.spans)
-    finally:
-        await engine.dispose()
