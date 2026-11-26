@@ -29,7 +29,7 @@ from mem_ai.core.exceptions import (
 from mem_ai.core.logging import JsonLogFormatter
 from mem_ai.db.engine import create_async_engine_from_settings, create_session_factory
 from mem_ai.modules.memories.adapters.memos import MemOSMemoryProvider
-from mem_ai.modules.users import service as users_service
+from tests.conftest import create_builtin_user
 
 _SECRET_API_KEY = "memos-secret-key-do-not-leak-999"
 _BASE_URL = "https://memos.test.local/api/openmem/v1"
@@ -302,16 +302,8 @@ async def test_memos_list_memories_paginates_via_pg_snapshot_with_stable_sort_ex
     http_calls: list[dict[str, Any]] = []
 
     try:
-        alice = await users_service.resolve_active_user(
-            session_factory,
-            issuer="https://test.mem-ai.local",
-            subject="alice-memos-list",
-        )
-        bob = await users_service.resolve_active_user(
-            session_factory,
-            issuer="https://test.mem-ai.local",
-            subject="bob-memos-list",
-        )
+        alice = await create_builtin_user(session_factory, email="alice-memos-list@example.com")
+        bob = await create_builtin_user(session_factory, email="bob-memos-list@example.com")
         conv_1 = uuid4()
 
         ts_same_ms = int(datetime(2026, 11, 21, 11, 0, 0, tzinfo=UTC).timestamp() * 1000)

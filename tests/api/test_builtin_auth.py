@@ -89,7 +89,7 @@ async def test_register_login_and_builtin_token_accesses_protected_endpoints(
             assert profile["userId"] == registered["userId"]
             assert profile["email"] == "alice@example.com"
             assert profile["status"] == "active"
-            assert {"actorId", "authMethod", "permissions", "createdAt"} <= profile.keys()
+            assert {"authMethod", "createdAt"} <= profile.keys()
 
     tampered = {"Authorization": f"Bearer {login['tokens']['accessToken']}x"}
     assert (await client.get("/v1/users/me", headers=tampered)).status_code == 401

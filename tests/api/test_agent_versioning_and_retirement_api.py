@@ -17,10 +17,9 @@ from mem_ai.contracts.model_provider import (
     ModelUsage,
 )
 from mem_ai.core.config import Settings
-from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
-from tests.conftest import FakeMemoryProvider
+from tests.conftest import BuiltinUsers, FakeMemoryProvider
 
 
 class _RecordingModelProvider:
@@ -60,7 +59,7 @@ def _chat_headers(token: str, *, key: str | None = None) -> dict[str, str]:
 @pytest.mark.anyio
 async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retirement_across_restart(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
+    builtin_users: BuiltinUsers,
     fake_memory_provider: FakeMemoryProvider,
 ) -> None:
     model_provider_1 = _RecordingModelProvider()
@@ -70,7 +69,6 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             model_provider=model_provider_1,
             memory_provider=fake_memory_provider,
         ),
-        credential_verifier=test_auth_adapter,
     )
 
     async with app1.router.lifespan_context(app1):
@@ -103,7 +101,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             # 1. Create Agent and publish v1.
             create_resp = await client.post(
                 "/v1/agents",
-                headers=_auth_headers("token-alice"),
+                headers=_auth_headers(builtin_users.alice.access_token),
                 json={
                     "name": "Versioned Coach",
                     "systemPrompt": "PERSONA_V1_INSTRUCTIONS",
@@ -119,7 +117,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
 
             pub_v1 = await client.post(
                 f"/v1/agents/{agent_id}/publish",
-                headers=_auth_headers("token-alice"),
+                headers=_auth_headers(builtin_users.alice.access_token),
             )
             assert pub_v1.status_code == 200
             v1_id = pub_v1.json()["data"]["currentPublishedVersionId"]
@@ -128,7 +126,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             conv1_first_key = f"conv1-turn1-{uuid4().hex}"
             conv1_t1 = await client.post(
                 "/v1/chat",
-                headers=_chat_headers("token-alice", key=conv1_first_key),
+                headers=_chat_headers(builtin_users.alice.access_token, key=conv1_first_key),
                 json={"agentId": agent_id, "message": "Hello from conv1"},
             )
             assert conv1_t1.status_code == 200
@@ -147,7 +145,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             # 3. Edit draft AND create unpublished v2 snapshot: published v1 must stay active!
             patch_resp = await client.patch(
                 f"/v1/agents/{agent_id}",
-                headers=_auth_headers("token-alice"),
+                headers=_auth_headers(builtin_users.alice.access_token),
                 json={
                     "systemPrompt": "PERSONA_V2_INSTRUCTIONS",
                     "behaviorRules": ["RULE_V2_PLAYFUL"],
@@ -162,7 +160,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
 
             ver_v2_resp = await client.post(
                 f"/v1/agents/{agent_id}/versions",
-                headers=_auth_headers("token-alice"),
+                headers=_auth_headers(builtin_users.alice.access_token),
             )
             assert ver_v2_resp.status_code == 201
             v2_id = ver_v2_resp.json()["data"]["versionId"]
@@ -172,7 +170,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             # New conversation before publishing v2 MUST still receive v1 prompt & model-v1.
             conv_before_pub = await client.post(
                 "/v1/chat",
-                headers=_chat_headers("token-alice"),
+                headers=_chat_headers(builtin_users.alice.access_token),
                 json={"agentId": agent_id, "message": "Before v2 publish"},
             )
             assert conv_before_pub.status_code == 200
@@ -184,7 +182,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             # 4. Publish explicit v2 snapshot.
             pub_v2 = await client.post(
                 f"/v1/agents/{agent_id}/publish",
-                headers=_auth_headers("token-alice"),
+                headers=_auth_headers(builtin_users.alice.access_token),
                 json={"versionId": v2_id},
             )
             assert pub_v2.status_code == 200
@@ -194,7 +192,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             # New Conversation 2 MUST use v2 prompt & model-v2.
             conv2_t1 = await client.post(
                 "/v1/chat",
-                headers=_chat_headers("token-alice"),
+                headers=_chat_headers(builtin_users.alice.access_token),
                 json={"agentId": agent_id, "message": "Hello from conv2"},
             )
             assert conv2_t1.status_code == 200
@@ -211,7 +209,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             # Continuing Conversation 1 MUST stay pinned to v1 prompt & model-v1.
             conv1_t2 = await client.post(
                 "/v1/chat",
-                headers=_chat_headers("token-alice"),
+                headers=_chat_headers(builtin_users.alice.access_token),
                 json={
                     "agentId": agent_id,
                     "conversationId": conv1_id,
@@ -229,7 +227,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             # 5. Update draft again and publish v3 directly from draft (empty body).
             patch_v3 = await client.patch(
                 f"/v1/agents/{agent_id}",
-                headers=_auth_headers("token-alice"),
+                headers=_auth_headers(builtin_users.alice.access_token),
                 json={
                     "systemPrompt": "PERSONA_V3_INSTRUCTIONS",
                     "defaultModelId": "model-v3",
@@ -238,7 +236,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             assert patch_v3.status_code == 200
             pub_v3 = await client.post(
                 f"/v1/agents/{agent_id}/publish",
-                headers=_auth_headers("token-alice"),
+                headers=_auth_headers(builtin_users.alice.access_token),
             )
             assert pub_v3.status_code == 200
             v3_id = pub_v3.json()["data"]["currentPublishedVersionId"]
@@ -247,7 +245,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             # 6. Retire Agent (and repeat idempotently).
             retire_1 = await client.delete(
                 f"/v1/agents/{agent_id}",
-                headers=_auth_headers("token-alice"),
+                headers=_auth_headers(builtin_users.alice.access_token),
             )
             assert retire_1.status_code == 200
             retired_at = retire_1.json()["data"]["retiredAt"]
@@ -256,7 +254,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
 
             retire_2 = await client.delete(
                 f"/v1/agents/{agent_id}",
-                headers=_auth_headers("token-alice"),
+                headers=_auth_headers(builtin_users.alice.access_token),
             )
             assert retire_2.status_code == 200
             assert retire_2.json()["data"]["retiredAt"] == retired_at
@@ -265,7 +263,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             calls_before_blocked = len(model_provider_1.requests)
             blocked_new_chat = await client.post(
                 "/v1/chat",
-                headers=_chat_headers("token-alice"),
+                headers=_chat_headers(builtin_users.alice.access_token),
                 json={"agentId": agent_id, "message": "Should be blocked"},
             )
             assert blocked_new_chat.status_code == 404
@@ -275,7 +273,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             # Existing Conversation 1 (v1) and Conversation 2 (v2) MUST continue normally!
             conv1_t3 = await client.post(
                 "/v1/chat",
-                headers=_chat_headers("token-alice"),
+                headers=_chat_headers(builtin_users.alice.access_token),
                 json={
                     "agentId": agent_id,
                     "conversationId": conv1_id,
@@ -288,7 +286,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
 
             conv2_t2 = await client.post(
                 "/v1/chat",
-                headers=_chat_headers("token-alice"),
+                headers=_chat_headers(builtin_users.alice.access_token),
                 json={
                     "agentId": agent_id,
                     "conversationId": conv2_id,
@@ -302,7 +300,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             # Replaying original Idempotency-Key from before v2/v3/retire returns original result.
             replay_conv1_t1 = await client.post(
                 "/v1/chat",
-                headers=_chat_headers("token-alice", key=conv1_first_key),
+                headers=_chat_headers(builtin_users.alice.access_token, key=conv1_first_key),
                 json={"agentId": agent_id, "message": "Hello from conv1"},
             )
             assert replay_conv1_t1.status_code == 200
@@ -317,7 +315,6 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             model_provider=model_provider_2,
             memory_provider=fake_memory_provider,
         ),
-        credential_verifier=test_auth_adapter,
     )
     async with app2.router.lifespan_context(app2):
         transport2 = httpx.ASGITransport(app=app2)
@@ -325,7 +322,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             # Retired Agent and its last published persona snapshot (v3) remain readable.
             detail_after_restart = await client.get(
                 f"/v1/agents/{agent_id}",
-                headers=_auth_headers("token-alice"),
+                headers=_auth_headers(builtin_users.alice.access_token),
             )
             assert detail_after_restart.status_code == 200
             detail_data = detail_after_restart.json()["data"]
@@ -337,7 +334,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             # New conversation remains blocked after restart.
             blocked_after_restart = await client.post(
                 "/v1/chat",
-                headers=_chat_headers("token-alice"),
+                headers=_chat_headers(builtin_users.alice.access_token),
                 json={"agentId": agent_id, "message": "Blocked after restart"},
             )
             assert blocked_after_restart.status_code == 404
@@ -347,7 +344,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             # Existing Conversation 1 continues after restart with pinned v1 & prior history.
             conv1_t4 = await client.post(
                 "/v1/chat",
-                headers=_chat_headers("token-alice"),
+                headers=_chat_headers(builtin_users.alice.access_token),
                 json={
                     "agentId": agent_id,
                     "conversationId": conv1_id,
@@ -367,7 +364,7 @@ async def test_chat_prompts_respect_draft_isolation_publish_rollout_and_retireme
             # Prior generation record remains readable after restart.
             gen_resp = await client.get(
                 f"/v1/conversations/{conv1_id}/generations/{conv1_gen1_id}",
-                headers=_auth_headers("token-alice"),
+                headers=_auth_headers(builtin_users.alice.access_token),
             )
             assert gen_resp.status_code == 200
             assert gen_resp.json()["data"]["status"] == "succeeded"

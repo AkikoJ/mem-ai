@@ -27,11 +27,10 @@ from mem_ai.contracts.memory_provider import (
 from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import NotFoundError
 from mem_ai.core.logging import JsonLogFormatter
-from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
 from mem_ai.modules.memories.adapters.memos import MemOSMemoryProvider
 from mem_ai.modules.memories.router import get_conversation_access_checker
 from mem_ai.modules.users import service as users_service
-from tests.conftest import FakeMemoryProvider
+from tests.conftest import BuiltinUsers, FakeMemoryProvider
 
 
 class _InMemoryConversationAccessChecker:
@@ -99,16 +98,15 @@ class _ScriptedMemoryProvider:
 @pytest.mark.anyio
 async def test_memories_crud_pagination_scope_ownership_and_user_isolation(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
+    builtin_users: BuiltinUsers,
     fake_memory_provider: FakeMemoryProvider,
 ) -> None:
     app = create_app(
         migrated_pg_settings,
         providers=ProviderRegistry(memory_provider=fake_memory_provider),
-        credential_verifier=test_auth_adapter,
     )
-    alice_headers = {"Authorization": "Bearer token-alice"}
-    bob_headers = {"Authorization": "Bearer token-bob"}
+    alice_headers = builtin_users.alice.headers
+    bob_headers = builtin_users.bob.headers
 
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
@@ -262,7 +260,7 @@ async def test_memories_crud_pagination_scope_ownership_and_user_isolation(
 @pytest.mark.anyio
 async def test_explicit_create_202_operations_reconciling_and_error_mapping(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     mode = {"kind": "accepted"}
 
@@ -292,10 +290,9 @@ async def test_explicit_create_202_operations_reconciling_and_error_mapping(
     app = create_app(
         migrated_pg_settings,
         providers=ProviderRegistry(memory_provider=_ScriptedMemoryProvider(result_factory)),
-        credential_verifier=test_auth_adapter,
     )
-    alice_headers = {"Authorization": "Bearer token-alice"}
-    bob_headers = {"Authorization": "Bearer token-bob"}
+    alice_headers = builtin_users.alice.headers
+    bob_headers = builtin_users.bob.headers
 
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
@@ -362,7 +359,7 @@ async def test_explicit_create_202_operations_reconciling_and_error_mapping(
 @pytest.mark.anyio
 async def test_end_to_end_api_with_memos_adapter_redacts_secrets_and_content(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     secret_key = "memos-live-secret-never-log-xyz"
     secret_content = "USER_PRIVATE_MEDICAL_NOTE_98765"
@@ -412,7 +409,7 @@ async def test_end_to_end_api_with_memos_adapter_redacts_secrets_and_content(
             )
         return httpx.Response(404)
 
-    app = create_app(migrated_pg_settings, credential_verifier=test_auth_adapter)
+    app = create_app(migrated_pg_settings)
     mock_http = httpx.AsyncClient(transport=httpx.MockTransport(memos_handler))
 
     log_buffer = StringIO()
@@ -436,7 +433,7 @@ async def test_end_to_end_api_with_memos_adapter_redacts_secrets_and_content(
 
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-                headers = {"Authorization": "Bearer token-alice"}
+                headers = builtin_users.alice.headers
                 created = await client.post(
                     "/v1/memories",
                     headers=headers,

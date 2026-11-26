@@ -51,26 +51,21 @@ from mem_ai.modules.retention.service import (
     run_retention_sweep,
 )
 from mem_ai.modules.users import cleanup as users_cleanup
-from mem_ai.modules.users import service as users_service
 from mem_ai.workers.assembly import (
     JOB_TYPE_GENERATION_LEASE_RECOVERY,
     build_worker_registry,
     default_periodic_jobs,
 )
 from mem_ai.workers.runner import WorkerConfig, WorkerRunner
-from tests.conftest import FakeMemoryProvider, FakeModelProvider
+from tests.conftest import FakeMemoryProvider, FakeModelProvider, create_builtin_user
 
 
 async def _seed_user_model_and_agent(
     session_factory: async_sessionmaker[AsyncSession],
     *,
-    subject: str,
+    email: str,
 ) -> tuple[UUID, UUID]:
-    user = await users_service.resolve_or_create_user(
-        session_factory,
-        issuer="https://idp.retention.test",
-        subject=subject,
-    )
+    user = await create_builtin_user(session_factory, email=email)
     await models_service.sync_model_configs(
         session_factory,
         seeds=[
@@ -88,7 +83,7 @@ async def _seed_user_model_and_agent(
         session_factory,
         owner_id=user.id,
         data=AgentCreateRequest(
-            name=f"Agent {subject}",
+            name=f"Agent {email}",
             systemPrompt="Stay concise.",
             defaultModelId="retention-model",
         ),
@@ -116,7 +111,7 @@ async def test_idempotency_24h_boundary_late_terminal_running_and_key_reuse(
     try:
         user_id, agent_id = await _seed_user_model_and_agent(
             session_factory,
-            subject="idem-retention-user",
+            email="idem-retention-user@example.com",
         )
         model_provider = FakeModelProvider(prefix="reply:")
         t0 = datetime(2026, 11, 1, 12, 0, 0, tzinfo=UTC)
@@ -383,7 +378,7 @@ async def test_job_attempts_30d_boundary_late_finish_active_and_provider_dedupe_
     try:
         user_id, _ = await _seed_user_model_and_agent(
             session_factory,
-            subject="jobs-retention-user",
+            email="jobs-retention-user@example.com",
         )
         t0 = datetime(2026, 10, 1, 0, 0, 0, tzinfo=UTC)
 
@@ -595,11 +590,11 @@ async def test_snapshots_receipts_and_operation_summaries_respect_barriers_and_t
     try:
         user_id, _ = await _seed_user_model_and_agent(
             session_factory,
-            subject="ops-snap-retention-user",
+            email="ops-snap-retention-user@example.com",
         )
         user_deleted_id, _ = await _seed_user_model_and_agent(
             session_factory,
-            subject="ops-receipt-deleted-user",
+            email="ops-receipt-deleted-user@example.com",
         )
         t0 = datetime(2026, 10, 1, 10, 0, 0, tzinfo=UTC)
 
@@ -836,7 +831,7 @@ async def test_worker_periodic_dedupe_batch_interruption_resume_idempotency_and_
     try:
         user_id, agent_id = await _seed_user_model_and_agent(
             session_factory,
-            subject="worker-retention-user",
+            email="worker-retention-user@example.com",
         )
         persona = await agents_service.get_latest_published_version_for_owner(
             session_factory, owner_id=user_id, agent_id=agent_id
@@ -1026,7 +1021,7 @@ async def test_explicit_conversation_and_user_deletion_take_precedence_over_long
     try:
         user_id, agent_id = await _seed_user_model_and_agent(
             session_factory,
-            subject="explicit-precedence-user",
+            email="explicit-precedence-user@example.com",
         )
         model_provider = FakeModelProvider(prefix="answer:")
         memory_provider = FakeMemoryProvider()
@@ -1144,7 +1139,7 @@ async def test_retention_lease_loss_fences_stale_worker_and_reclaim_resumes_from
     try:
         user_id, _ = await _seed_user_model_and_agent(
             session_factory,
-            subject="lease-fence-retention-user",
+            email="lease-fence-retention-user@example.com",
         )
         t0 = datetime(2026, 11, 1, 0, 0, 0, tzinfo=UTC)
         store = MemorySnapshotStore(session_factory=session_factory, ttl_seconds=60)
@@ -1267,7 +1262,7 @@ async def test_budget_capped_worker_retention_yields_reconciling_and_completes_l
     try:
         user_id, agent_id = await _seed_user_model_and_agent(
             session_factory,
-            subject="budget-cap-retention-user",
+            email="budget-cap-retention-user@example.com",
         )
         persona = await agents_service.get_latest_published_version_for_owner(
             session_factory, owner_id=user_id, agent_id=agent_id

@@ -24,12 +24,11 @@ from mem_ai.contracts.model_provider import (
 )
 from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import BadGatewayError
-from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
 from mem_ai.modules.jobs.models import Job
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.adapters.openai_compatible import OpenAICompatibleModelProvider
 from mem_ai.modules.models.schemas import ModelConfigSeed
-from tests.conftest import FakeMemoryProvider, parse_sse_text
+from tests.conftest import BuiltinUsers, FakeMemoryProvider, parse_sse_text
 
 
 def _with_idem(headers: dict[str, str], key: str | None = None) -> dict[str, str]:
@@ -194,7 +193,7 @@ async def _run_live_asgi_post(
 @pytest.mark.anyio
 async def test_sse_chat_happy_path_headers_heartbeats_memory_and_idempotent_replay(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     provider = _ControllableStreamModelProvider()
     provider.pre_first_delay = 0.08
@@ -213,9 +212,8 @@ async def test_sse_chat_happy_path_headers_heartbeats_memory_and_idempotent_repl
             model_provider=provider,
             memory_provider=memory_provider,
         ),
-        credential_verifier=test_auth_adapter,
     )
-    alice_headers = {"Authorization": "Bearer token-alice"}
+    alice_headers = builtin_users.alice.headers
 
     async with app.router.lifespan_context(app):
         await models_service.sync_model_configs(
@@ -350,16 +348,15 @@ async def test_sse_chat_happy_path_headers_heartbeats_memory_and_idempotent_repl
 @pytest.mark.anyio
 async def test_sse_chat_pre_stream_errors_running_202_and_retired_agent_rules(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     provider = _ControllableStreamModelProvider()
     app = create_app(
         migrated_pg_settings,
         providers=ProviderRegistry(model_provider=provider),
-        credential_verifier=test_auth_adapter,
     )
-    alice_headers = {"Authorization": "Bearer token-alice"}
-    bob_headers = {"Authorization": "Bearer token-bob"}
+    alice_headers = builtin_users.alice.headers
+    bob_headers = builtin_users.bob.headers
 
     async with app.router.lifespan_context(app):
         await models_service.sync_model_configs(
@@ -552,7 +549,7 @@ async def test_sse_chat_pre_stream_errors_running_202_and_retired_agent_rules(
 @pytest.mark.anyio
 async def test_sse_chat_partial_failure_and_timeout_emit_failed_event_and_filter_history(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     provider = _ControllableStreamModelProvider()
     memory_provider = FakeMemoryProvider()
@@ -568,9 +565,8 @@ async def test_sse_chat_partial_failure_and_timeout_emit_failed_event_and_filter
             model_provider=provider,
             memory_provider=memory_provider,
         ),
-        credential_verifier=test_auth_adapter,
     )
-    alice_headers = {"Authorization": "Bearer token-alice"}
+    alice_headers = builtin_users.alice.headers
 
     async with app.router.lifespan_context(app):
         await models_service.sync_model_configs(
@@ -724,7 +720,7 @@ async def test_sse_chat_partial_failure_and_timeout_emit_failed_event_and_filter
 @pytest.mark.anyio
 async def test_sse_disconnect_cancels_upstream_and_generation_unlike_sync_disconnect(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     provider = _ControllableStreamModelProvider()
     memory_provider = FakeMemoryProvider()
@@ -734,9 +730,8 @@ async def test_sse_disconnect_cancels_upstream_and_generation_unlike_sync_discon
             model_provider=provider,
             memory_provider=memory_provider,
         ),
-        credential_verifier=test_auth_adapter,
     )
-    alice_headers = {"Authorization": "Bearer token-alice"}
+    alice_headers = builtin_users.alice.headers
 
     async with app.router.lifespan_context(app):
         await models_service.sync_model_configs(
@@ -878,7 +873,7 @@ async def test_sse_disconnect_cancels_upstream_and_generation_unlike_sync_discon
 @pytest.mark.anyio
 async def test_sse_chat_end_to_end_with_openai_compatible_adapter(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     upstream_sse = b"".join(
         [
@@ -907,9 +902,8 @@ async def test_sse_chat_end_to_end_with_openai_compatible_adapter(
         app = create_app(
             migrated_pg_settings,
             providers=ProviderRegistry(model_provider=adapter),
-            credential_verifier=test_auth_adapter,
         )
-        alice_headers = {"Authorization": "Bearer token-alice"}
+        alice_headers = builtin_users.alice.headers
 
         async with app.router.lifespan_context(app):
             await models_service.sync_model_configs(

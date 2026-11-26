@@ -45,7 +45,7 @@ from mem_ai.modules.conversations.service import ChatOptions
 from mem_ai.modules.memories.models import MemoryScopeState
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
-from mem_ai.modules.users import service as users_service
+from tests.conftest import create_builtin_user
 
 
 class _CapturingModelProvider:
@@ -117,15 +117,11 @@ class _ScriptedRecallProvider:
 async def _seed_user_model_and_agent(
     session_factory: Any,
     *,
-    subject: str,
+    email: str,
     recall_limit: int = 5,
     memory_enabled: bool = True,
 ) -> tuple[UUID, UUID]:
-    user = await users_service.resolve_or_create_user(
-        session_factory,
-        issuer="https://test.mem-ai.local",
-        subject=subject,
-    )
+    user = await create_builtin_user(session_factory, email=email)
     await models_service.sync_model_configs(
         session_factory,
         seeds=[
@@ -197,13 +193,9 @@ async def test_recalled_memory_table_stores_metadata_only_and_enforces_uniquenes
 
         alice_id, agent_id = await _seed_user_model_and_agent(
             session_factory,
-            subject="alice-recall-schema",
+            email="alice-recall-schema@example.com",
         )
-        bob = await users_service.resolve_or_create_user(
-            session_factory,
-            issuer="https://test.mem-ai.local",
-            subject="bob-recall-schema",
-        )
+        bob = await create_builtin_user(session_factory, email="bob-recall-schema@example.com")
 
         # Seed `memory_scopes` at epoch=3 to verify `prepare_generation` captures current epoch.
         async with session_factory.begin() as session:
@@ -288,7 +280,7 @@ async def test_prepare_context_persists_only_injected_refs_and_handles_degraded_
     try:
         alice_id, agent_id = await _seed_user_model_and_agent(
             session_factory,
-            subject="alice-recall-persist",
+            email="alice-recall-persist@example.com",
             recall_limit=2,
         )
         model_provider = _CapturingModelProvider()
@@ -436,7 +428,7 @@ async def test_persist_recalled_memories_enforces_lease_midflight_barrier_and_to
     try:
         alice_id, agent_id = await _seed_user_model_and_agent(
             session_factory,
-            subject="alice-recall-guards",
+            email="alice-recall-guards@example.com",
         )
         async with session_factory.begin() as session:
             session.add(

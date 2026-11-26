@@ -17,7 +17,9 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi import FastAPI
+from pydantic import SecretStr
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mem_ai.api.dependencies import ProviderRegistry
 from mem_ai.api.pagination import CursorPayload, decode_cursor, encode_cursor, hash_filters
@@ -41,8 +43,13 @@ from mem_ai.contracts.model_provider import (
 )
 from mem_ai.core.config import Settings
 from mem_ai.db.engine import create_sync_engine_from_settings
-from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
-from mem_ai.modules.auth.context import VerifiedPrincipal
+from mem_ai.modules.auth import service as auth_service
+from mem_ai.modules.auth.schemas import AuthTokenSettings
+from mem_ai.modules.users import service as users_service
+from mem_ai.modules.users.schemas import UserRecord
+
+TEST_PASSWORD = "correct-horse-1"
+TEST_AUTH_SECRET = "builtin-auth-test-signing-secret-at-least-32-chars"
 
 
 @dataclass(frozen=True)
@@ -264,6 +271,14 @@ def empty_pg_settings() -> Iterator[Settings]:
             postgres_password=base_settings.postgres_password,
             postgres_db=test_db,
             worker_loop_enabled=False,
+            auth_jwt_secret=SecretStr(TEST_AUTH_SECRET),
+            auth_jwt_leeway_seconds=0,
+            # Until ticket 07 removes legacy dispatch, reject unauthenticated fallback.
+            # Every valid test credential is issued by the built-in auth endpoints.
+            auth_mode="jwt_hs256",
+            auth_jwt_hs256_secret=SecretStr(TEST_AUTH_SECRET),
+            auth_trusted_issuers=["mem-ai-test-unused-external-issuer"],
+            auth_trusted_audience="mem-ai-test-unused-external-audience",
         )
     finally:
         with admin_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
@@ -297,38 +312,91 @@ def sign_hs256_jwt(
     return f"{header_seg}.{payload_seg}.{_b64url(sig)}"
 
 
-def make_test_principal(
-    subject: str = "test-user",
-    *,
-    issuer: str = "https://test.mem-ai.local",
-    actor_id: str | None = None,
-    auth_method: str = "test_token",
-    permissions: tuple[str, ...] = (
-        "chat:use",
-        "agents:manage",
-        "memories:manage",
-        "users:self",
-    ),
-) -> VerifiedPrincipal:
-    """Build a deterministic verified principal for API and integration tests."""
-    return VerifiedPrincipal(
-        issuer=issuer,
-        subject=subject,
-        actor_id=actor_id if actor_id is not None else f"{issuer}:{subject}",
-        auth_method=auth_method,
-        permissions=frozenset(permissions),
+@dataclass(frozen=True, slots=True)
+class BuiltinUser:
+    """Registered local user and a real persisted login session's credentials."""
+
+    user_id: UUID
+    email: str
+    access_token: str
+    refresh_token: str
+
+    @property
+    def headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.access_token}"}
+
+
+@dataclass(frozen=True, slots=True)
+class BuiltinUsers:
+    """Independent users for owner isolation and concurrent request tests."""
+
+    alice: BuiltinUser
+    bob: BuiltinUser
+
+
+def _builtin_user_from_response(response: httpx.Response, *, expected_status: int) -> BuiltinUser:
+    assert response.status_code == expected_status, response.text
+    data = response.json()["data"]
+    return BuiltinUser(
+        user_id=UUID(data["userId"]),
+        email=data["email"],
+        access_token=data["tokens"]["accessToken"],
+        refresh_token=data["tokens"]["refreshToken"],
     )
+
+
+async def register_builtin_user(
+    client: httpx.AsyncClient,
+    *,
+    email: str,
+    password: str = TEST_PASSWORD,
+) -> BuiltinUser:
+    """Register through HTTP without overriding the authentication dependency."""
+    response = await client.post("/v1/auth/register", json={"email": email, "password": password})
+    return _builtin_user_from_response(response, expected_status=201)
+
+
+async def login_builtin_user(
+    client: httpx.AsyncClient,
+    *,
+    email: str,
+    password: str = TEST_PASSWORD,
+) -> BuiltinUser:
+    """Log in through HTTP, preserving password verification and session persistence."""
+    response = await client.post("/v1/auth/login", json={"email": email, "password": password})
+    return _builtin_user_from_response(response, expected_status=200)
+
+
+async def create_builtin_user(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    email: str,
+    token_settings: AuthTokenSettings | None = None,
+) -> UserRecord:
+    """Seed service integration tests via the public built-in registration use case."""
+    if token_settings is None:
+        token_settings = AuthTokenSettings.from_settings(
+            Settings(_env_file=None, app_env="test", auth_jwt_secret=SecretStr(TEST_AUTH_SECRET))
+        )
+    registered = await auth_service.register_user(
+        session_factory,
+        email=email,
+        password=TEST_PASSWORD,
+        token_settings=token_settings,
+    )
+    return await users_service.get_active_user(session_factory, user_id=registered.user_id)
 
 
 @pytest.fixture
-def test_auth_adapter() -> StaticTokenAuthAdapter:
-    """Provide a two-subject Bearer token adapter (`token-alice`, `token-bob`) for tests."""
-    return StaticTokenAuthAdapter(
-        {
-            "token-alice": make_test_principal("alice"),
-            "token-bob": make_test_principal("bob"),
-        }
-    )
+async def builtin_users(migrated_pg_settings: Settings) -> BuiltinUsers:
+    """Register two users; their sessions survive setup-app shutdown and app restarts."""
+    auth_app = create_app(migrated_pg_settings)
+    async with auth_app.router.lifespan_context(auth_app):
+        transport = httpx.ASGITransport(app=auth_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            alice = await register_builtin_user(client, email="alice@example.com")
+            bob = await register_builtin_user(client, email="bob@example.com")
+    return BuiltinUsers(alice=alice, bob=bob)
 
 
 @pytest.fixture

@@ -24,9 +24,9 @@ from mem_ai.contracts.model_provider import (
 )
 from mem_ai.core.config import Settings
 from mem_ai.core.limits import FixedWindowRateLimiter
-from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
 from mem_ai.modules.conversations.models import Generation
 from tests.conftest import (
+    BuiltinUsers,
     FakeMemoryProvider,
     FakeModelProvider,
     parse_sse_text,
@@ -178,7 +178,7 @@ async def test_process_request_concurrency_and_body_size_limits() -> None:
 @pytest.mark.anyio
 async def test_generation_concurrency_limit_blocks_new_turn_but_allows_idempotent_retry(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     started = asyncio.Event()
     release = asyncio.Event()
@@ -210,9 +210,8 @@ async def test_generation_concurrency_limit_blocks_new_turn_but_allows_idempoten
             model_provider=_BlockingModelProvider(),
             memory_provider=FakeMemoryProvider(),
         ),
-        credential_verifier=test_auth_adapter,
     )
-    alice_headers = {"Authorization": "Bearer token-alice"}
+    alice_headers = builtin_users.alice.headers
 
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
@@ -264,7 +263,7 @@ async def test_generation_concurrency_limit_blocks_new_turn_but_allows_idempoten
 @pytest.mark.anyio
 async def test_input_length_and_generation_and_stream_timeouts_converge_via_state_machine(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     class _SlowTimeoutModelProvider:
         async def generate(self, request: ModelRequest) -> ModelResponse:
@@ -301,9 +300,8 @@ async def test_input_length_and_generation_and_stream_timeouts_converge_via_stat
             model_provider=_SlowTimeoutModelProvider(),
             memory_provider=FakeMemoryProvider(),
         ),
-        credential_verifier=test_auth_adapter,
     )
-    headers = {"Authorization": "Bearer token-alice"}
+    headers = builtin_users.alice.headers
 
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
@@ -374,10 +372,11 @@ async def test_allowed_hosts_cors_trusted_proxy_request_id_and_forged_headers() 
         postgres_password=SecretStr("strong-prod-password-123"),
         allowed_hosts=["api.example.com", "*.internal.example.com"],
         cors_allowed_origins=["https://app.example.com"],
-        auth_mode="trusted_gateway",
+        auth_mode="jwt_hs256",
         auth_trusted_proxies=["10.0.0.0/8"],
-        auth_trusted_issuers=["https://gw.example.com"],
-        auth_gateway_shared_secret=SecretStr("gateway-shared-secret-value-at-least-32-chars"),
+        auth_trusted_issuers=["https://unused.example.com"],
+        auth_trusted_audience="unused-test-audience",
+        auth_jwt_hs256_secret=SecretStr("unused-external-signing-key-at-least-32-chars"),
         auth_jwt_secret=SecretStr("super-secret-jwt-signing-key-at-least-32-chars"),
     )
     app = create_app(
@@ -393,7 +392,6 @@ async def test_allowed_hosts_cors_trusted_proxy_request_id_and_forged_headers() 
         return {
             "forwarded_for": request.headers.get("x-forwarded-for"),
             "user_id": request.headers.get("x-user-id"),
-            "gateway_auth": request.headers.get("x-gateway-auth"),
         }
 
     # 1. Untrusted external peer (203.0.113.9): Host reject, CORS, forged Request-ID & headers
@@ -447,14 +445,12 @@ async def test_allowed_hosts_cors_trusted_proxy_request_id_and_forged_headers() 
             headers={
                 "X-Forwarded-For": "10.0.0.5",
                 "X-User-Id": "spoofed-user",
-                "X-Gateway-Auth": "gateway-shared-secret-value-at-least-32-chars",
             },
         )
         assert sanitized.status_code == 200
         assert sanitized.json() == {
             "forwarded_for": None,
             "user_id": None,
-            "gateway_auth": None,
         }
 
     # 2. Trusted proxy peer (10.0.0.42): safe X-Request-Id preserved, unsafe X-Request-Id replaced

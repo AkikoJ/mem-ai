@@ -21,16 +21,12 @@ from mem_ai.contracts.memory_provider import (
 )
 from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import BadGatewayError
-from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
 from mem_ai.workers.assembly import build_worker_registry
 from mem_ai.workers.runner import WorkerConfig, WorkerRunner
 from tests.api.test_chat_idempotency_and_generations_api import _ControllableModelProvider
-from tests.conftest import FakeMemoryProvider
-
-ALICE = {"Authorization": "Bearer token-alice"}
-BOB = {"Authorization": "Bearer token-bob"}
+from tests.conftest import BuiltinUsers, FakeMemoryProvider
 
 
 class GatedMemoryProvider(FakeMemoryProvider):
@@ -68,7 +64,6 @@ class GatedMemoryProvider(FakeMemoryProvider):
 @pytest.fixture
 async def conversation_app(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
 ) -> AsyncIterator[
     tuple[FastAPI, httpx.AsyncClient, _ControllableModelProvider, FakeMemoryProvider]
 ]:
@@ -77,7 +72,6 @@ async def conversation_app(
     app = create_app(
         migrated_pg_settings,
         providers=ProviderRegistry(model_provider=model, memory_provider=memory),
-        credential_verifier=test_auth_adapter,
     )
     async with app.router.lifespan_context(app):
         await models_service.sync_model_configs(
@@ -98,7 +92,7 @@ async def conversation_app(
             yield app, client, model, memory
 
 
-async def create_agent(client: httpx.AsyncClient, headers: dict[str, str] = ALICE) -> str:
+async def create_agent(client: httpx.AsyncClient, headers: dict[str, str]) -> str:
     response = await client.post(
         "/v1/agents",
         headers=headers,
@@ -119,7 +113,8 @@ async def chat(
     agent_id: str,
     key: str,
     conversation_id: str | None = None,
-    headers: dict[str, str] = ALICE,
+    *,
+    headers: dict[str, str],
 ) -> httpx.Response:
     return await client.post(
         "/v1/chat",
@@ -134,26 +129,34 @@ async def chat(
 
 @pytest.mark.integration
 @pytest.mark.anyio
-async def test_owned_history_pages_keep_failed_turns_and_bind_cursors(conversation_app) -> None:
+async def test_owned_history_pages_keep_failed_turns_and_bind_cursors(
+    builtin_users: BuiltinUsers, conversation_app
+) -> None:
     _, client, model, _ = conversation_app
-    agent_id = await create_agent(client)
-    first = await chat(client, agent_id, "first")
+    agent_id = await create_agent(client, headers=builtin_users.alice.headers)
+    first = await chat(client, agent_id, "first", headers=builtin_users.alice.headers)
     assert first.status_code == 200
     cid = first.json()["data"]["conversationId"]
     model.errors["failed"] = BadGatewayError(code="model_unavailable", message="upstream failed")
-    assert (await chat(client, agent_id, "failed", cid)).status_code == 502
-    assert (await chat(client, agent_id, "last", cid)).status_code == 200
-    second = await chat(client, agent_id, "another-conversation")
+    assert (
+        await chat(client, agent_id, "failed", cid, headers=builtin_users.alice.headers)
+    ).status_code == 502
+    assert (
+        await chat(client, agent_id, "last", cid, headers=builtin_users.alice.headers)
+    ).status_code == 200
+    second = await chat(
+        client, agent_id, "another-conversation", headers=builtin_users.alice.headers
+    )
     other_cid = second.json()["data"]["conversationId"]
 
-    page = await client.get("/v1/conversations?limit=1", headers=ALICE)
+    page = await client.get("/v1/conversations?limit=1", headers=builtin_users.alice.headers)
     assert page.status_code == 200
     data = page.json()["data"]
     assert data["has_more"] is True
     next_page = (
         await client.get(
             "/v1/conversations",
-            headers=ALICE,
+            headers=builtin_users.alice.headers,
             params={
                 "limit": 1,
                 "cursor": data["next_cursor"],
@@ -168,13 +171,15 @@ async def test_owned_history_pages_keep_failed_turns_and_bind_cursors(conversati
     assert (
         await client.get(
             "/v1/conversations",
-            headers=BOB,
+            headers=builtin_users.bob.headers,
             params={
                 "cursor": data["next_cursor"],
             },
         )
     ).status_code == 422
-    detail = (await client.get(f"/v1/conversations/{cid}", headers=ALICE)).json()["data"]
+    detail = (
+        await client.get(f"/v1/conversations/{cid}", headers=builtin_users.alice.headers)
+    ).json()["data"]
     assert detail["conversationId"] == cid
     assert detail["generation"]["status"] == "succeeded"
 
@@ -186,7 +191,7 @@ async def test_owned_history_pages_keep_failed_turns_and_bind_cursors(conversati
         if cursor:
             params["cursor"] = cursor
         response = await client.get(
-            f"/v1/conversations/{cid}/messages", headers=ALICE, params=params
+            f"/v1/conversations/{cid}/messages", headers=builtin_users.alice.headers, params=params
         )
         assert response.status_code == 200
         data = response.json()["data"]
@@ -214,11 +219,11 @@ async def test_owned_history_pages_keep_failed_turns_and_bind_cursors(conversati
     assert items[2]["error"]["code"] == "model_unavailable"
     assert "leaseToken" not in str(items)
     for path in (f"/v1/conversations/{cid}", f"/v1/conversations/{cid}/messages"):
-        assert (await client.get(path, headers=BOB)).status_code == 404
+        assert (await client.get(path, headers=builtin_users.bob.headers)).status_code == 404
     assert (
         await client.get(
             f"/v1/conversations/{other_cid}/messages",
-            headers=ALICE,
+            headers=builtin_users.alice.headers,
             params={
                 "cursor": first_cursor,
             },
@@ -229,17 +234,20 @@ async def test_owned_history_pages_keep_failed_turns_and_bind_cursors(conversati
 @pytest.mark.integration
 @pytest.mark.anyio
 async def test_delete_hides_immediately_reuses_operation_and_resumes_bounded_cleanup(
+    builtin_users: BuiltinUsers,
     conversation_app,
 ) -> None:
     app, client, _, memory = conversation_app
-    agent = await create_agent(client)
-    reply = (await chat(client, agent, "delete-me")).json()["data"]
+    agent = await create_agent(client, headers=builtin_users.alice.headers)
+    reply = (await chat(client, agent, "delete-me", headers=builtin_users.alice.headers)).json()[
+        "data"
+    ]
     cid = reply["conversationId"]
     for scope, conversation in (("user", None), ("conversation", cid)):
         for index in range(3):
             response = await client.post(
                 "/v1/memories",
-                headers=ALICE,
+                headers=builtin_users.alice.headers,
                 json={
                     "content": f"{scope}-{index}",
                     "scope": scope,
@@ -247,29 +255,42 @@ async def test_delete_hides_immediately_reuses_operation_and_resumes_bounded_cle
                 },
             )
             assert response.status_code == 201
-    other = (await chat(client, agent, "keep-me")).json()["data"]["conversationId"]
-    assert (await client.delete(f"/v1/conversations/{cid}", headers=BOB)).status_code == 404
+    other = (await chat(client, agent, "keep-me", headers=builtin_users.alice.headers)).json()[
+        "data"
+    ]["conversationId"]
+    assert (
+        await client.delete(f"/v1/conversations/{cid}", headers=builtin_users.bob.headers)
+    ).status_code == 404
     responses = await asyncio.gather(
-        *[client.delete(f"/v1/conversations/{cid}", headers=ALICE) for _ in range(2)]
+        *[
+            client.delete(f"/v1/conversations/{cid}", headers=builtin_users.alice.headers)
+            for _ in range(2)
+        ]
     )
     assert [response.status_code for response in responses] == [202, 202]
     accepted = responses[0].json()["data"]
     assert responses[1].json()["data"]["operationId"] == accepted["operationId"]
     url = accepted["statusUrl"]
     assert responses[0].headers["Location"] == url
-    assert (await client.get(url, headers=BOB)).status_code == 404
+    assert (await client.get(url, headers=builtin_users.bob.headers)).status_code == 404
     assert [
         item["conversationId"]
-        for item in (await client.get("/v1/conversations", headers=ALICE)).json()["data"]["items"]
+        for item in (
+            await client.get("/v1/conversations", headers=builtin_users.alice.headers)
+        ).json()["data"]["items"]
     ] == [other]
     for suffix in ("", "/messages", f"/generations/{reply['generationId']}"):
         assert (
-            await client.get(f"/v1/conversations/{cid}{suffix}", headers=ALICE)
+            await client.get(
+                f"/v1/conversations/{cid}{suffix}", headers=builtin_users.alice.headers
+            )
         ).status_code == 404
-    blocked = await chat(client, agent, "blocked", cid)
+    blocked = await chat(client, agent, "blocked", cid, headers=builtin_users.alice.headers)
     assert blocked.status_code == 409
     assert blocked.json()["code"] == "conversation_deleting"
-    visible = (await client.get("/v1/memories", headers=ALICE)).json()["data"]["items"]
+    visible = (await client.get("/v1/memories", headers=builtin_users.alice.headers)).json()[
+        "data"
+    ]["items"]
     assert all(item["scope"] == "user" for item in visible)
 
     now = datetime.now(UTC)
@@ -284,7 +305,7 @@ async def test_delete_hides_immediately_reuses_operation_and_resumes_bounded_cle
             periodic_jobs=(),
         )
         await runner.run_once(now=now + timedelta(seconds=60 * (step + 1)))
-        operation = (await client.get(url, headers=ALICE)).json()["data"]
+        operation = (await client.get(url, headers=builtin_users.alice.headers)).json()["data"]
         if operation["status"] == "succeeded":
             break
     assert operation["status"] == "succeeded", operation
@@ -292,8 +313,10 @@ async def test_delete_hides_immediately_reuses_operation_and_resumes_bounded_cle
     assert {f"user-{index}" for index in range(3)} <= {
         record.content for record in memory.records.values()
     }
-    assert (await client.get(f"/v1/conversations/{other}", headers=ALICE)).status_code == 200
-    repeated = await client.delete(f"/v1/conversations/{cid}", headers=ALICE)
+    assert (
+        await client.get(f"/v1/conversations/{other}", headers=builtin_users.alice.headers)
+    ).status_code == 200
+    repeated = await client.delete(f"/v1/conversations/{cid}", headers=builtin_users.alice.headers)
     assert repeated.status_code == 202
     assert repeated.json()["data"]["operationId"] == accepted["operationId"]
 
@@ -301,20 +324,23 @@ async def test_delete_hides_immediately_reuses_operation_and_resumes_bounded_cle
 @pytest.mark.integration
 @pytest.mark.anyio
 async def test_delete_waits_for_dispatched_explicit_write_and_removes_late_memory(
+    builtin_users: BuiltinUsers,
     conversation_app,
 ) -> None:
     app, client, _, memory = conversation_app
-    agent = await create_agent(client)
-    cid = (await chat(client, agent, "inflight-memory")).json()["data"]["conversationId"]
+    agent = await create_agent(client, headers=builtin_users.alice.headers)
+    cid = (
+        await chat(client, agent, "inflight-memory", headers=builtin_users.alice.headers)
+    ).json()["data"]["conversationId"]
     pending = asyncio.create_task(
         client.post(
             "/v1/memories",
-            headers=ALICE,
+            headers=builtin_users.alice.headers,
             json={"content": "gated", "scope": "conversation", "conversationId": cid},
         )
     )
     await asyncio.wait_for(memory.started.wait(), timeout=5)
-    deleted = await client.delete(f"/v1/conversations/{cid}", headers=ALICE)
+    deleted = await client.delete(f"/v1/conversations/{cid}", headers=builtin_users.alice.headers)
     url = deleted.json()["data"]["statusUrl"]
     runner = WorkerRunner(
         session_factory=app.state.session_factory,
@@ -324,7 +350,9 @@ async def test_delete_waits_for_dispatched_explicit_write_and_removes_late_memor
     )
     try:
         await runner.run_once()
-        assert (await client.get(url, headers=ALICE)).json()["data"]["status"] != "succeeded"
+        assert (await client.get(url, headers=builtin_users.alice.headers)).json()["data"][
+            "status"
+        ] != "succeeded"
     finally:
         memory.release.set()
     response = await asyncio.wait_for(pending, timeout=5)
@@ -333,7 +361,7 @@ async def test_delete_waits_for_dispatched_explicit_write_and_removes_late_memor
     now = datetime.now(UTC)
     for step in range(12):
         await runner.run_once(now=now + timedelta(seconds=60 * (step + 1)))
-        operation = (await client.get(url, headers=ALICE)).json()["data"]
+        operation = (await client.get(url, headers=builtin_users.alice.headers)).json()["data"]
         if operation["status"] == "succeeded":
             break
     assert operation["status"] == "succeeded", operation
@@ -342,14 +370,20 @@ async def test_delete_waits_for_dispatched_explicit_write_and_removes_late_memor
 
 @pytest.mark.integration
 @pytest.mark.anyio
-async def test_delete_waits_for_running_generation(conversation_app) -> None:
+async def test_delete_waits_for_running_generation(
+    builtin_users: BuiltinUsers, conversation_app
+) -> None:
     app, client, model, memory = conversation_app
-    agent = await create_agent(client)
-    cid = (await chat(client, agent, "before-delete")).json()["data"]["conversationId"]
+    agent = await create_agent(client, headers=builtin_users.alice.headers)
+    cid = (await chat(client, agent, "before-delete", headers=builtin_users.alice.headers)).json()[
+        "data"
+    ]["conversationId"]
     started, release, _ = model.gate("during-delete")
-    pending = asyncio.create_task(chat(client, agent, "during-delete", cid))
+    pending = asyncio.create_task(
+        chat(client, agent, "during-delete", cid, headers=builtin_users.alice.headers)
+    )
     await asyncio.wait_for(started.wait(), timeout=5)
-    deleted = await client.delete(f"/v1/conversations/{cid}", headers=ALICE)
+    deleted = await client.delete(f"/v1/conversations/{cid}", headers=builtin_users.alice.headers)
     url = deleted.json()["data"]["statusUrl"]
     runner = WorkerRunner(
         session_factory=app.state.session_factory,
@@ -359,7 +393,9 @@ async def test_delete_waits_for_running_generation(conversation_app) -> None:
     )
     try:
         await runner.run_once()
-        assert (await client.get(url, headers=ALICE)).json()["data"]["status"] != "succeeded"
+        assert (await client.get(url, headers=builtin_users.alice.headers)).json()["data"][
+            "status"
+        ] != "succeeded"
     finally:
         release.set()
     response = await asyncio.wait_for(pending, timeout=5)
@@ -367,7 +403,7 @@ async def test_delete_waits_for_running_generation(conversation_app) -> None:
     now = datetime.now(UTC)
     for step in range(20):
         await runner.run_once(now=now + timedelta(seconds=60 * (step + 1)))
-        operation = (await client.get(url, headers=ALICE)).json()["data"]
+        operation = (await client.get(url, headers=builtin_users.alice.headers)).json()["data"]
         if operation["status"] == "succeeded":
             break
     assert operation["status"] == "succeeded", operation
@@ -375,18 +411,22 @@ async def test_delete_waits_for_running_generation(conversation_app) -> None:
 
 @pytest.mark.integration
 @pytest.mark.anyio
-async def test_delete_waits_for_unknown_remote_result_to_be_verified(conversation_app) -> None:
+async def test_delete_waits_for_unknown_remote_result_to_be_verified(
+    builtin_users: BuiltinUsers, conversation_app
+) -> None:
     app, client, _, memory = conversation_app
-    agent = await create_agent(client)
-    cid = (await chat(client, agent, "remote-uncertain")).json()["data"]["conversationId"]
+    agent = await create_agent(client, headers=builtin_users.alice.headers)
+    cid = (
+        await chat(client, agent, "remote-uncertain", headers=builtin_users.alice.headers)
+    ).json()["data"]["conversationId"]
     created = await client.post(
         "/v1/memories",
-        headers=ALICE,
+        headers=builtin_users.alice.headers,
         json={"content": "uncertain", "scope": "conversation", "conversationId": cid},
     )
     assert created.status_code == 201
     memory.defer_delete = True
-    deleted = await client.delete(f"/v1/conversations/{cid}", headers=ALICE)
+    deleted = await client.delete(f"/v1/conversations/{cid}", headers=builtin_users.alice.headers)
     url = deleted.json()["data"]["statusUrl"]
     runner = WorkerRunner(
         session_factory=app.state.session_factory,
@@ -402,11 +442,13 @@ async def test_delete_waits_for_unknown_remote_result_to_be_verified(conversatio
     assert memory.pending_deletes
     for step in range(8, 12):
         await runner.run_once(now=now + timedelta(seconds=60 * (step + 1)))
-    assert (await client.get(url, headers=ALICE)).json()["data"]["status"] != "succeeded"
+    assert (await client.get(url, headers=builtin_users.alice.headers)).json()["data"][
+        "status"
+    ] != "succeeded"
     memory.allow_verification = True
     for step in range(12, 35):
         await runner.run_once(now=now + timedelta(seconds=60 * (step + 1)))
-        operation = (await client.get(url, headers=ALICE)).json()["data"]
+        operation = (await client.get(url, headers=builtin_users.alice.headers)).json()["data"]
         if operation["status"] == "succeeded":
             break
     assert operation["status"] == "succeeded", operation

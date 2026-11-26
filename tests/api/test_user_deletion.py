@@ -18,23 +18,21 @@ from sqlalchemy import func, select, text, update
 from mem_ai.application import create_app
 from mem_ai.core.config import Settings
 from mem_ai.core.logging import REDACTED_VALUE, JsonLogFormatter
-from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
+from mem_ai.modules.auth.models import AuthSession
 from mem_ai.modules.jobs.models import Job
 from mem_ai.modules.operations import service as operations_service
 from mem_ai.modules.operations.models import Operation
-from mem_ai.modules.users.models import User, UserIdentity
+from mem_ai.modules.users.models import User
+from tests.conftest import BuiltinUsers
 
 pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 
-_ALICE_HEADERS = {"Authorization": "Bearer token-alice"}
-_BOB_HEADERS = {"Authorization": "Bearer token-bob"}
 _RECEIPT_TTL_SECONDS = 3600
 
 
 @pytest.fixture
 def deletion_app(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
 ) -> FastAPI:
     settings = migrated_pg_settings.model_copy(
         update={
@@ -42,7 +40,7 @@ def deletion_app(
             "deletion_receipt_ttl_seconds": _RECEIPT_TTL_SECONDS,
         }
     )
-    return create_app(settings, credential_verifier=test_auth_adapter)
+    return create_app(settings)
 
 
 @pytest.fixture
@@ -57,10 +55,11 @@ async def deletion_client(deletion_app: FastAPI) -> AsyncIterator[httpx.AsyncCli
 
 
 async def test_delete_returns_202_with_one_time_receipt_location_and_expiry(
+    builtin_users: BuiltinUsers,
     deletion_client: httpx.AsyncClient,
 ) -> None:
     before = datetime.now(UTC)
-    response = await deletion_client.delete("/v1/users/me", headers=_ALICE_HEADERS)
+    response = await deletion_client.delete("/v1/users/me", headers=builtin_users.alice.headers)
     after = datetime.now(UTC)
 
     assert response.status_code == 202
@@ -81,14 +80,15 @@ async def test_delete_returns_202_with_one_time_receipt_location_and_expiry(
     assert before + ttl <= expires_at <= after + ttl
 
 
-async def test_deleting_user_credentials_remain_blocked_without_recreating_identity(
+async def test_deleting_user_credentials_remain_blocked_while_email_stays_reserved(
+    builtin_users: BuiltinUsers,
     deletion_app: FastAPI,
     deletion_client: httpx.AsyncClient,
 ) -> None:
-    profile = await deletion_client.get("/v1/users/me", headers=_ALICE_HEADERS)
+    profile = await deletion_client.get("/v1/users/me", headers=builtin_users.alice.headers)
     assert profile.status_code == 200
     user_id = UUID(profile.json()["data"]["userId"])
-    accepted = await deletion_client.delete("/v1/users/me", headers=_ALICE_HEADERS)
+    accepted = await deletion_client.delete("/v1/users/me", headers=builtin_users.alice.headers)
     assert accepted.status_code == 202
 
     for method, url in (
@@ -99,28 +99,31 @@ async def test_deleting_user_credentials_remain_blocked_without_recreating_ident
         ("GET", "/v1/conversations"),
         ("GET", "/v1/memories"),
     ):
-        blocked = await deletion_client.request(method, url, headers=_ALICE_HEADERS)
+        blocked = await deletion_client.request(method, url, headers=builtin_users.alice.headers)
         assert blocked.status_code == 403
         assert blocked.json()["code"] == "user_deleting"
 
     async with deletion_app.state.session_factory() as session:
         identity = (
             await session.execute(
-                select(UserIdentity.user_id, User.status)
-                .join(User, User.id == UserIdentity.user_id)
-                .where(UserIdentity.subject == "alice")
+                select(User.id, User.status).where(User.email == builtin_users.alice.email)
             )
         ).one()
         assert identity == (user_id, "deleting")
-        assert await session.scalar(select(func.count()).select_from(User)) == 1
+        assert await session.scalar(select(func.count()).select_from(User)) == 2
+        sessions = (
+            await session.scalars(select(AuthSession).where(AuthSession.user_id == user_id))
+        ).all()
+        assert sessions and all(login.revoked_at is not None for login in sessions)
         assert await session.scalar(select(func.count()).select_from(Operation)) == 1
         assert await session.scalar(select(func.count()).select_from(Job)) == 1
 
 
 async def test_receipt_queries_its_deletion_operation_after_business_access_is_blocked(
+    builtin_users: BuiltinUsers,
     deletion_client: httpx.AsyncClient,
 ) -> None:
-    accepted = await deletion_client.delete("/v1/users/me", headers=_ALICE_HEADERS)
+    accepted = await deletion_client.delete("/v1/users/me", headers=builtin_users.alice.headers)
     assert accepted.status_code == 202
     data = accepted.json()["data"]
 
@@ -140,16 +143,17 @@ async def test_receipt_queries_its_deletion_operation_after_business_access_is_b
     assert "deletionReceipt" not in operation
     assert "deletion_receipt_digest" not in operation
 
-    other_user = await deletion_client.get(data["statusUrl"], headers=_BOB_HEADERS)
+    other_user = await deletion_client.get(data["statusUrl"], headers=builtin_users.bob.headers)
     assert other_user.status_code == 404
     assert other_user.json()["code"] == "operation_not_found"
 
 
 async def test_receipt_rejects_another_users_deletion_operation_and_missing_operations(
+    builtin_users: BuiltinUsers,
     deletion_client: httpx.AsyncClient,
 ) -> None:
-    alice = await deletion_client.delete("/v1/users/me", headers=_ALICE_HEADERS)
-    bob = await deletion_client.delete("/v1/users/me", headers=_BOB_HEADERS)
+    alice = await deletion_client.delete("/v1/users/me", headers=builtin_users.alice.headers)
+    bob = await deletion_client.delete("/v1/users/me", headers=builtin_users.bob.headers)
     assert alice.status_code == bob.status_code == 202
     alice_data = alice.json()["data"]
     bob_data = bob.json()["data"]
@@ -175,10 +179,11 @@ async def test_receipt_rejects_another_users_deletion_operation_and_missing_oper
     ids=["malformed-token", "forged-token", "missing-token", "extra-token"],
 )
 async def test_forged_or_malformed_receipts_return_uniform_authentication_error(
+    builtin_users: BuiltinUsers,
     deletion_client: httpx.AsyncClient,
     authorization: str,
 ) -> None:
-    accepted = await deletion_client.delete("/v1/users/me", headers=_ALICE_HEADERS)
+    accepted = await deletion_client.delete("/v1/users/me", headers=builtin_users.alice.headers)
     assert accepted.status_code == 202
 
     rejected = await deletion_client.get(
@@ -193,11 +198,12 @@ async def test_forged_or_malformed_receipts_return_uniform_authentication_error(
 
 @pytest.mark.parametrize("invalidation", ["expired", "revoked"])
 async def test_expired_or_revoked_receipt_cannot_poll_its_operation(
+    builtin_users: BuiltinUsers,
     deletion_app: FastAPI,
     deletion_client: httpx.AsyncClient,
     invalidation: str,
 ) -> None:
-    accepted = await deletion_client.delete("/v1/users/me", headers=_ALICE_HEADERS)
+    accepted = await deletion_client.delete("/v1/users/me", headers=builtin_users.alice.headers)
     assert accepted.status_code == 202
     data = accepted.json()["data"]
     operation_id = UUID(data["operationId"])
@@ -222,15 +228,16 @@ async def test_expired_or_revoked_receipt_cannot_poll_its_operation(
     assert rejected.json()["code"] == "invalid_deletion_receipt"
     assert rejected.json()["message"] == "invalid deletion receipt"
     assert rejected.json()["data"] is None
-    still_blocked = await deletion_client.get("/v1/users/me", headers=_ALICE_HEADERS)
+    still_blocked = await deletion_client.get("/v1/users/me", headers=builtin_users.alice.headers)
     assert still_blocked.status_code == 403
     assert still_blocked.json()["code"] == "user_deleting"
 
 
 async def test_receipt_cannot_authenticate_other_business_apis(
+    builtin_users: BuiltinUsers,
     deletion_client: httpx.AsyncClient,
 ) -> None:
-    accepted = await deletion_client.delete("/v1/users/me", headers=_ALICE_HEADERS)
+    accepted = await deletion_client.delete("/v1/users/me", headers=builtin_users.alice.headers)
     assert accepted.status_code == 202
     receipt = accepted.json()["data"]["deletionReceipt"]
 
@@ -249,19 +256,19 @@ async def test_receipt_cannot_authenticate_other_business_apis(
         assert rejected.json()["code"] == "invalid_auth_scheme"
 
 
-async def test_development_auth_cannot_bypass_receipt_scope_or_duplicate_header_rejection(
+async def test_builtin_auth_cannot_bypass_receipt_scope_or_duplicate_header_rejection(
+    builtin_users: BuiltinUsers,
     migrated_pg_settings: Settings,
 ) -> None:
-    settings = migrated_pg_settings.model_copy(update={"auth_mode": "development"})
-    app = create_app(settings)
+    app = create_app(migrated_pg_settings)
     async with (
         app.router.lifespan_context(app),
         httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
     ):
-        profile = await client.get("/v1/users/me")
+        profile = await client.get("/v1/users/me", headers=builtin_users.alice.headers)
         assert profile.status_code == 200
-        assert profile.json()["data"]["authMethod"] == "development"
-        accepted = await client.delete("/v1/users/me")
+        assert profile.json()["data"]["authMethod"] == "builtin_jwt"
+        accepted = await client.delete("/v1/users/me", headers=builtin_users.alice.headers)
         assert accepted.status_code == 202
         data = accepted.json()["data"]
         authorization = f"DeletionReceipt {data['deletionReceipt']}"
@@ -278,8 +285,8 @@ async def test_development_auth_cannot_bypass_receipt_scope_or_duplicate_header_
         assert forged.json()["code"] == "invalid_deletion_receipt"
 
         for first, second in (
-            ("Bearer ignored-by-dev", authorization),
-            (authorization, "Bearer ignored-by-dev"),
+            (builtin_users.bob.headers["Authorization"], authorization),
+            (authorization, builtin_users.bob.headers["Authorization"]),
             (authorization, authorization),
         ):
             headers = [("Authorization", first), ("Authorization", second)]
@@ -290,16 +297,17 @@ async def test_development_auth_cannot_bypass_receipt_scope_or_duplicate_header_
             assert business.status_code == 401
             assert business.json()["code"] == "invalid_auth_scheme"
 
-        ordinary = await client.get("/v1/users/me")
+        ordinary = await client.get("/v1/users/me", headers=builtin_users.alice.headers)
         assert ordinary.status_code == 403
         assert ordinary.json()["code"] == "user_deleting"
 
 
 async def test_receipt_is_persisted_only_as_a_digest_and_never_in_job_payloads(
+    builtin_users: BuiltinUsers,
     deletion_app: FastAPI,
     deletion_client: httpx.AsyncClient,
 ) -> None:
-    accepted = await deletion_client.delete("/v1/users/me", headers=_ALICE_HEADERS)
+    accepted = await deletion_client.delete("/v1/users/me", headers=builtin_users.alice.headers)
     assert accepted.status_code == 202
     data = accepted.json()["data"]
     receipt = data["deletionReceipt"]
@@ -328,10 +336,11 @@ async def test_receipt_is_persisted_only_as_a_digest_and_never_in_job_payloads(
 
 
 async def test_receipt_survives_app_restart_and_requires_the_configured_protection_key(
+    builtin_users: BuiltinUsers,
     deletion_app: FastAPI,
     deletion_client: httpx.AsyncClient,
 ) -> None:
-    accepted = await deletion_client.delete("/v1/users/me", headers=_ALICE_HEADERS)
+    accepted = await deletion_client.delete("/v1/users/me", headers=builtin_users.alice.headers)
     assert accepted.status_code == 202
     data = accepted.json()["data"]
     settings = deletion_app.state.settings
@@ -340,9 +349,7 @@ async def test_receipt_survives_app_restart_and_requires_the_configured_protecti
     )
 
     for restart_settings, expected_status in ((settings, 200), (rotated_settings, 401)):
-        restarted = create_app(
-            restart_settings, credential_verifier=deletion_app.state.credential_verifier
-        )
+        restarted = create_app(restart_settings)
         async with (
             restarted.router.lifespan_context(restarted),
             httpx.AsyncClient(
@@ -361,6 +368,7 @@ async def test_receipt_survives_app_restart_and_requires_the_configured_protecti
 
 
 async def test_receipt_and_authorization_are_redacted_from_structured_logs(
+    builtin_users: BuiltinUsers,
     deletion_client: httpx.AsyncClient,
 ) -> None:
     buffer = StringIO()
@@ -373,7 +381,7 @@ async def test_receipt_and_authorization_are_redacted_from_structured_logs(
     try:
         accepted = await deletion_client.delete(
             "/v1/users/me",
-            headers={**_ALICE_HEADERS, "X-Request-Id": "req_delete_receipt_privacy"},
+            headers={**builtin_users.alice.headers, "X-Request-Id": "req_delete_receipt_privacy"},
         )
         assert accepted.status_code == 202
         data = accepted.json()["data"]
@@ -396,7 +404,7 @@ async def test_receipt_and_authorization_are_redacted_from_structured_logs(
 
     raw_logs = buffer.getvalue()
     assert data["deletionReceipt"] not in raw_logs
-    assert "Bearer token-alice" not in raw_logs
+    assert builtin_users.alice.access_token not in raw_logs
     entries = [json.loads(line) for line in raw_logs.splitlines()]
     assert any(
         entry.get("request_id") == "req_delete_receipt_privacy" and entry.get("status_code") == 202
@@ -412,45 +420,27 @@ async def test_receipt_and_authorization_are_redacted_from_structured_logs(
     assert probe["response"]["operationId"] == data["operationId"]
 
 
-async def test_operations_route_honors_get_auth_context_dependency_override(
+async def test_operations_route_requires_builtin_login_and_owner(
+    builtin_users: BuiltinUsers,
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
 ) -> None:
-    from mem_ai.modules.auth.context import AuthenticationContext
-    from mem_ai.modules.auth.dependencies import get_auth_context
-
-    app = create_app(
-        migrated_pg_settings,
-        credential_verifier=test_auth_adapter,
-    )
+    app = create_app(migrated_pg_settings)
     async with (
         app.router.lifespan_context(app),
-        httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app),
-            base_url="http://test",
-        ) as client,
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
     ):
-        me = await client.get("/v1/users/me", headers=_ALICE_HEADERS)
-        assert me.status_code == 200
-        alice_id = UUID(me.json()["data"]["userId"])
         async with app.state.session_factory.begin() as session:
             op = await operations_service.create_operation_in_session(
                 session,
-                owner_id=alice_id,
+                owner_id=builtin_users.alice.user_id,
                 operation_type="memory_delete",
                 status="running",
                 target_type="memory",
-                target_id="mem-override",
+                target_id="mem-owned",
             )
-        app.dependency_overrides[get_auth_context] = lambda: AuthenticationContext(
-            actor_id="override-actor",
-            user_id=alice_id,
-            auth_method="override",
-            permissions=frozenset(),
-        )
-        try:
-            response = await client.get(f"/v1/operations/{op.id}")
-        finally:
-            app.dependency_overrides.clear()
+        url = f"/v1/operations/{op.id}"
+        response = await client.get(url, headers=builtin_users.alice.headers)
         assert response.status_code == 200, response.text
         assert response.json()["data"]["operationId"] == str(op.id)
+        assert (await client.get(url)).status_code == 401
+        assert (await client.get(url, headers=builtin_users.bob.headers)).status_code == 404

@@ -71,90 +71,11 @@ def test_production_accepts_hardened_configuration() -> None:
 
     assert settings.app_env == "production"
     assert settings.database_url().host == "postgres"
-    assert settings.auth_mode == "jwt_hs256"
 
 
-def test_production_rejects_development_auth_mode() -> None:
-    with pytest.raises(ValidationError, match="auth_mode"):
-        Settings(
-            _env_file=None,
-            app_env="production",
-            postgres_password="strong-prod-password-123",
-            auth_jwt_secret="strong-secret-key-at-least-32-chars",
-            auth_mode="development",
-        )
-
-
-def test_jwt_hs256_mode_requires_secret_issuer_and_audience() -> None:
-    with pytest.raises(ValidationError, match="auth_jwt_hs256_secret"):
-        Settings(
-            _env_file=None,
-            app_env="test",
-            auth_mode="jwt_hs256",
-            auth_trusted_issuers=["https://idp.example.com"],
-            auth_trusted_audience="mem-ai-api",
-        )
-
-    with pytest.raises(ValidationError, match="auth_trusted_issuers"):
-        Settings(
-            _env_file=None,
-            app_env="test",
-            auth_mode="jwt_hs256",
-            auth_jwt_hs256_secret="test-secret",
-            auth_trusted_audience="mem-ai-api",
-        )
-
-    with pytest.raises(ValidationError, match="auth_trusted_audience"):
-        Settings(
-            _env_file=None,
-            app_env="test",
-            auth_mode="jwt_hs256",
-            auth_jwt_hs256_secret="test-secret",
-            auth_trusted_issuers=["https://idp.example.com"],
-        )
-
-    with pytest.raises(ValidationError, match="auth_jwt_hs256_secret"):
-        Settings(
-            _env_file=None,
-            app_env="production",
-            postgres_password="strong-prod-password-123",
-            allowed_hosts=["api.example.com"],
-            auth_mode="jwt_hs256",
-            auth_jwt_hs256_secret="too-short",
-            auth_jwt_secret="strong-secret-key-at-least-32-chars",
-            auth_trusted_issuers=["https://idp.example.com"],
-            auth_trusted_audience="mem-ai-api",
-        )
-
-
-def test_trusted_gateway_mode_requires_explicit_proxies_issuers_and_secret() -> None:
+def test_trusted_proxy_networks_reject_invalid_and_production_wildcard_entries() -> None:
     with pytest.raises(ValidationError, match="auth_trusted_proxies"):
-        Settings(
-            _env_file=None,
-            app_env="test",
-            auth_mode="trusted_gateway",
-            auth_trusted_issuers=["https://gateway.example.com"],
-            auth_gateway_shared_secret="gateway-secret",
-        )
-
-    with pytest.raises(ValidationError, match="auth_trusted_proxies"):
-        Settings(
-            _env_file=None,
-            app_env="test",
-            auth_mode="trusted_gateway",
-            auth_trusted_proxies=["not-a-valid-ip"],
-            auth_trusted_issuers=["https://gateway.example.com"],
-            auth_gateway_shared_secret="gateway-secret",
-        )
-
-    with pytest.raises(ValidationError, match="auth_gateway_shared_secret"):
-        Settings(
-            _env_file=None,
-            app_env="test",
-            auth_mode="trusted_gateway",
-            auth_trusted_proxies=["10.0.0.0/8"],
-            auth_trusted_issuers=["https://gateway.example.com"],
-        )
+        Settings(_env_file=None, app_env="test", auth_trusted_proxies=["not-an-ip"])
 
     for wildcard in ("0.0.0.0/0", "::/0"):
         with pytest.raises(ValidationError, match="wildcard CIDR"):
@@ -162,25 +83,17 @@ def test_trusted_gateway_mode_requires_explicit_proxies_issuers_and_secret() -> 
                 _env_file=None,
                 app_env="production",
                 postgres_password="strong-prod-password-123",
-                auth_mode="trusted_gateway",
-                auth_trusted_proxies=[wildcard],
-                auth_trusted_issuers=["https://gateway.example.com"],
-                auth_gateway_shared_secret="gateway-shared-secret-value-at-least-32-chars",
                 auth_jwt_secret="strong-secret-key-at-least-32-chars",
+                auth_trusted_proxies=[wildcard],
             )
 
     settings = Settings(
-        _env_file=None,
-        app_env="production",
-        postgres_password="strong-prod-password-123",
-        allowed_hosts=["api.example.com"],
-        auth_mode="trusted_gateway",
-        auth_trusted_proxies=["10.0.0.0/8", "127.0.0.1"],
-        auth_trusted_issuers=["https://gateway.example.com"],
-        auth_gateway_shared_secret="gateway-shared-secret-value-at-least-32-chars",
-        auth_jwt_secret="strong-secret-key-at-least-32-chars",
+        _env_file=None, app_env="test", auth_trusted_proxies=["10.0.0.0/8", "127.0.0.1"]
     )
-    assert settings.auth_mode == "trusted_gateway"
+    assert [str(network) for network in settings.trusted_proxy_networks()] == [
+        "10.0.0.0/8",
+        "127.0.0.1/32",
+    ]
 
 
 def test_memos_memory_provider_mode_requires_api_key_and_valid_base_url() -> None:
@@ -284,7 +197,6 @@ def test_model_routing_policy_and_registry_entry_validation() -> None:
                 "supports_streaming": True,
                 "max_context_tokens": 128000,
                 "max_output_tokens": 4096,
-                "required_permission": "models:standard",
                 "credential_ref": "OPENAI_COMPAT_API_KEY",
                 "capabilities_json": {"json_mode": True},
             }

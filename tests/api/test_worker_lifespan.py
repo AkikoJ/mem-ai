@@ -24,7 +24,7 @@ from mem_ai.modules.jobs.models import Job
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
 from mem_ai.workers.runner import WorkerRunner
-from tests.conftest import FakeMemoryProvider, FakeModelProvider
+from tests.conftest import BuiltinUsers, FakeMemoryProvider, FakeModelProvider
 
 
 async def _wait_until(predicate: Callable[[], bool], *, attempts: int = 500) -> None:
@@ -152,7 +152,7 @@ async def _wait_for_successful_operation(
 @pytest.mark.anyio
 async def test_application_worker_persists_turn_memory_after_chat(
     migrated_pg_settings,
-    test_auth_adapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     settings = migrated_pg_settings.model_copy(
         update={
@@ -168,7 +168,6 @@ async def test_application_worker_persists_turn_memory_after_chat(
             model_provider=FakeModelProvider(prefix="assistant:"),
             memory_provider=memory_provider,
         ),
-        credential_verifier=test_auth_adapter,
     )
 
     async with app.router.lifespan_context(app):
@@ -187,7 +186,7 @@ async def test_application_worker_persists_turn_memory_after_chat(
         )
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            headers = {"Authorization": "Bearer token-alice"}
+            headers = builtin_users.alice.headers
             agent_response = await client.post(
                 "/v1/agents",
                 headers=headers,
@@ -325,7 +324,7 @@ async def test_enabled_worker_loop_starts_and_stops_with_application_lifespan(
 @pytest.mark.anyio
 async def test_two_application_lifespans_share_periodic_job_deduplication(
     migrated_pg_settings,
-    test_auth_adapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     settings = migrated_pg_settings.model_copy(
         update={
@@ -337,8 +336,8 @@ async def test_two_application_lifespans_share_periodic_job_deduplication(
     memory_provider = _CountingReconcileMemoryProvider()
     providers = ProviderRegistry(memory_provider=memory_provider)
     apps = (
-        create_app(settings, providers=providers, credential_verifier=test_auth_adapter),
-        create_app(settings, providers=providers, credential_verifier=test_auth_adapter),
+        create_app(settings, providers=providers),
+        create_app(settings, providers=providers),
     )
 
     async with (
@@ -359,7 +358,7 @@ async def test_two_application_lifespans_share_periodic_job_deduplication(
 
         transport = httpx.ASGITransport(app=apps[0])
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            headers = {"Authorization": "Bearer token-alice"}
+            headers = builtin_users.alice.headers
             created = await client.post(
                 "/v1/memories",
                 headers=headers,
@@ -392,7 +391,7 @@ async def test_two_application_lifespans_share_periodic_job_deduplication(
 @pytest.mark.anyio
 async def test_application_worker_clears_memory_and_completes_conversation_and_user_deletion(
     migrated_pg_settings,
-    test_auth_adapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     settings = migrated_pg_settings.model_copy(
         update={
@@ -409,7 +408,6 @@ async def test_application_worker_clears_memory_and_completes_conversation_and_u
             model_provider=FakeModelProvider(prefix="assistant:"),
             memory_provider=memory_provider,
         ),
-        credential_verifier=test_auth_adapter,
     )
 
     async with app.router.lifespan_context(app):
@@ -428,8 +426,8 @@ async def test_application_worker_clears_memory_and_completes_conversation_and_u
         )
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            alice = {"Authorization": "Bearer token-alice"}
-            bob = {"Authorization": "Bearer token-bob"}
+            alice = builtin_users.alice.headers
+            bob = builtin_users.bob.headers
 
             alice_memory = await client.post(
                 "/v1/memories", headers=alice, json={"content": "Clear this memory"}
@@ -522,14 +520,13 @@ async def test_application_worker_clears_memory_and_completes_conversation_and_u
 @pytest.mark.anyio
 async def test_application_runner_recovers_expired_generation_and_runs_retention_periodic_job(
     migrated_pg_settings,
-    test_auth_adapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     settings = migrated_pg_settings.model_copy(update={"worker_loop_enabled": False})
     model_provider = _BlockingGenerationModelProvider()
     app = create_app(
         settings,
         providers=ProviderRegistry(model_provider=model_provider),
-        credential_verifier=test_auth_adapter,
     )
 
     async with app.router.lifespan_context(app):
@@ -548,7 +545,7 @@ async def test_application_runner_recovers_expired_generation_and_runs_retention
         )
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            headers = {"Authorization": "Bearer token-alice"}
+            headers = builtin_users.alice.headers
             agent = await client.post(
                 "/v1/agents",
                 headers=headers,
@@ -649,7 +646,7 @@ async def test_application_runner_recovers_expired_generation_and_runs_retention
 @pytest.mark.anyio
 async def test_lifespan_shutdown_drains_manual_worker_step_before_closing_resources(
     migrated_pg_settings,
-    test_auth_adapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     settings = migrated_pg_settings.model_copy(
         update={
@@ -661,7 +658,6 @@ async def test_lifespan_shutdown_drains_manual_worker_step_before_closing_resour
     app = create_app(
         settings,
         providers=ProviderRegistry(memory_provider=memory_provider),
-        credential_verifier=test_auth_adapter,
     )
     lifespan_started = asyncio.Event()
     finish_lifespan = asyncio.Event()
@@ -677,7 +673,7 @@ async def test_lifespan_shutdown_drains_manual_worker_step_before_closing_resour
         await asyncio.wait_for(lifespan_started.wait(), timeout=3.0)
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            headers = {"Authorization": "Bearer token-alice"}
+            headers = builtin_users.alice.headers
             created = await client.post(
                 "/v1/memories",
                 headers=headers,
@@ -779,7 +775,7 @@ async def test_lifespan_shutdown_cancels_worker_poll_before_closing_resources(
 @pytest.mark.anyio
 async def test_saturated_worker_concurrency_does_not_starve_online_requests_or_overclaim(
     migrated_pg_settings,
-    test_auth_adapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     settings = migrated_pg_settings.model_copy(
         update={
@@ -799,7 +795,6 @@ async def test_saturated_worker_concurrency_does_not_starve_online_requests_or_o
             model_provider=FakeModelProvider(prefix="assistant:"),
             memory_provider=memory_provider,
         ),
-        credential_verifier=test_auth_adapter,
     )
 
     try:
@@ -819,7 +814,7 @@ async def test_saturated_worker_concurrency_does_not_starve_online_requests_or_o
             )
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-                headers = {"Authorization": "Bearer token-alice"}
+                headers = builtin_users.alice.headers
                 agent = await client.post(
                     "/v1/agents",
                     headers=headers,
@@ -874,7 +869,7 @@ async def test_saturated_worker_concurrency_does_not_starve_online_requests_or_o
 @pytest.mark.anyio
 async def test_lifespan_shutdown_drains_sync_generation_and_worker_loop_in_parallel(
     migrated_pg_settings,
-    test_auth_adapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     settings = migrated_pg_settings.model_copy(
         update={
@@ -892,7 +887,6 @@ async def test_lifespan_shutdown_drains_sync_generation_and_worker_loop_in_paral
             model_provider=model_provider,
             memory_provider=memory_provider,
         ),
-        credential_verifier=test_auth_adapter,
     )
     lifespan_started = asyncio.Event()
     finish_lifespan = asyncio.Event()
@@ -921,7 +915,7 @@ async def test_lifespan_shutdown_drains_sync_generation_and_worker_loop_in_paral
         )
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            headers = {"Authorization": "Bearer token-alice"}
+            headers = builtin_users.alice.headers
             agent = await client.post(
                 "/v1/agents",
                 headers=headers,
@@ -1004,7 +998,7 @@ async def test_lifespan_shutdown_drains_sync_generation_and_worker_loop_in_paral
 @pytest.mark.anyio
 async def test_lifespan_shutdown_timeout_keeps_running_job_lease_recoverable_and_stops_heartbeat(
     migrated_pg_settings,
-    test_auth_adapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     settings = migrated_pg_settings.model_copy(
         update={
@@ -1020,7 +1014,6 @@ async def test_lifespan_shutdown_timeout_keeps_running_job_lease_recoverable_and
     app = create_app(
         settings,
         providers=ProviderRegistry(memory_provider=memory_provider),
-        credential_verifier=test_auth_adapter,
     )
     lifespan_started = asyncio.Event()
     finish_lifespan = asyncio.Event()
@@ -1035,7 +1028,7 @@ async def test_lifespan_shutdown_timeout_keeps_running_job_lease_recoverable_and
         await asyncio.wait_for(lifespan_started.wait(), timeout=3.0)
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            headers = {"Authorization": "Bearer token-alice"}
+            headers = builtin_users.alice.headers
             created = await client.post(
                 "/v1/memories",
                 headers=headers,

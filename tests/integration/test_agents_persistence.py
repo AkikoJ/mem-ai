@@ -28,6 +28,7 @@ from mem_ai.modules.agents.schemas import (
     PersonaSnapshot,
 )
 from mem_ai.modules.users import service as users_service
+from tests.conftest import create_builtin_user
 
 
 @pytest.mark.integration
@@ -38,11 +39,7 @@ async def test_agent_draft_and_first_publish_persist_across_restart_with_unique_
     engine1 = create_async_engine_from_settings(migrated_pg_settings)
     sf1 = create_session_factory(engine1)
     try:
-        alice = await users_service.resolve_or_create_user(
-            sf1,
-            issuer="https://issuer.test",
-            subject="alice-persist",
-        )
+        alice = await create_builtin_user(sf1, email="alice-persist@example.com")
         created = await agents_service.create_agent(
             sf1,
             owner_id=alice.id,
@@ -189,11 +186,7 @@ async def test_draft_edit_and_version_snapshot_do_not_mutate_or_switch_published
     engine = create_async_engine_from_settings(migrated_pg_settings)
     sf = create_session_factory(engine)
     try:
-        alice = await users_service.resolve_or_create_user(
-            sf,
-            issuer="https://issuer.test",
-            subject="alice-versions",
-        )
+        alice = await create_builtin_user(sf, email="alice-versions@example.com")
         created = await agents_service.create_agent(
             sf,
             owner_id=alice.id,
@@ -298,11 +291,7 @@ async def test_concurrent_publish_deterministically_triggers_unique_and_conditio
     engine = create_async_engine_from_settings(migrated_pg_settings)
     sf = create_session_factory(engine)
     try:
-        alice = await users_service.resolve_or_create_user(
-            sf,
-            issuer="https://issuer.test",
-            subject="alice-race",
-        )
+        alice = await create_builtin_user(sf, email="alice-race@example.com")
         agent_draft_race = await agents_service.create_agent(
             sf,
             owner_id=alice.id,
@@ -420,16 +409,8 @@ async def test_list_agents_cursor_pagination_is_stable_with_identical_timestamps
     engine = create_async_engine_from_settings(migrated_pg_settings)
     sf = create_session_factory(engine)
     try:
-        alice = await users_service.resolve_or_create_user(
-            sf,
-            issuer="https://issuer.test",
-            subject="alice-page",
-        )
-        bob = await users_service.resolve_or_create_user(
-            sf,
-            issuer="https://issuer.test",
-            subject="bob-page",
-        )
+        alice = await create_builtin_user(sf, email="alice-page@example.com")
+        bob = await create_builtin_user(sf, email="bob-page@example.com")
 
         alice_ids: list[UUID] = []
         for idx in range(5):
@@ -487,16 +468,8 @@ async def test_retire_agent_persists_across_restart_is_idempotent_and_blocks_mut
     engine1 = create_async_engine_from_settings(migrated_pg_settings)
     sf1 = create_session_factory(engine1)
     try:
-        alice = await users_service.resolve_or_create_user(
-            sf1,
-            issuer="https://issuer.test",
-            subject="alice-retire-persist",
-        )
-        bob = await users_service.resolve_or_create_user(
-            sf1,
-            issuer="https://issuer.test",
-            subject="bob-retire-persist",
-        )
+        alice = await create_builtin_user(sf1, email="alice-retire-persist@example.com")
+        bob = await create_builtin_user(sf1, email="bob-retire-persist@example.com")
         created = await agents_service.create_agent(
             sf1,
             owner_id=alice.id,
@@ -711,11 +684,7 @@ async def test_concurrent_edit_version_publish_and_retire_guards_enforce_409_and
     engine = create_async_engine_from_settings(migrated_pg_settings)
     sf = create_session_factory(engine)
     try:
-        alice = await users_service.resolve_or_create_user(
-            sf,
-            issuer="https://issuer.test",
-            subject="alice-concurrency-full",
-        )
+        alice = await create_builtin_user(sf, email="alice-concurrency-full@example.com")
 
         # 1. Concurrent PATCH vs PATCH -> 1 succeeds, 1 raises 409 agent_revision_conflict.
         agent_patch = await agents_service.create_agent(

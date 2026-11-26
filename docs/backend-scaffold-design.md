@@ -123,7 +123,7 @@ Service  ←──────────────────────�
 - Conversation Core 通过生成阶段入口访问应用持久化，通过 `agents` 公开接口读取人设快照，通过外部适配协议访问外部模型与外部记忆引擎。SQLAlchemy 和供应商 HTTP 封装在对应实现中。
 - Prompt 编译是纯数据转换，SSE 编码负责传输表达，生成状态转换通过共享生成入口执行。
 - `jobs` 依赖通用任务数据和处理器协议，业务处理器依赖资源服务。处理器注册集中在应用/后台任务装配处，通用任务模块保持单向依赖。
-- 数据库模型注册、迁移元数据导入、应用装配（`application.py`/`main.py`/`api/router.py`）、任务装配（`application.py` 调用 `workers/assembly.py`）和运维恢复装配（`ops.py`）属于显式基础设施入口，架构检查按具体文件列出例外。为新增依赖补充这里的用途与方向。
+- 数据库模型注册、迁移元数据导入、应用装配（`application.py`/`main.py`/`api/router.py`）、任务装配（`application.py` 调用 `workers/assembly.py`）和运维恢复装配（`ops.py`，包括复用 `auth.tokens.verify_access_token` 与 `users.service.get_active_user` 核验内置凭据和用户状态）属于显式基础设施入口，架构检查按具体文件列出例外。为新增依赖补充这里的用途与方向。
 
 实现时在模块首次提供公共行为时确定公开符号，并在对应 ticket 记录路径和调用方式。公共接口和允许依赖随实际实现更新，现有调用方一并迁移。
 
@@ -164,13 +164,13 @@ Service  ←──────────────────────�
 | `compose.yaml`、`.env.example`、`Makefile`、`pyproject.toml`、`uv.lock`、`.python-version`、`alembic.ini` | 已落地 | 本地依赖（支持 `POSTGRES_DATA_DIR` 自定义数据卷路径）、配置模板、快捷命令、锁定依赖与迁移配置 |
 | `migrations/`、`.github/workflows/checks.yml` | 已落地 | Alembic 同步迁移基线与最小 CI 检查流水线 |
 | `src/mem_ai/main.py`、`src/mem_ai/application.py`、`src/mem_ai/core/config.py`、`src/mem_ai/core/logging.py`、`src/mem_ai/core/exceptions.py`、`src/mem_ai/core/exception_handlers.py`、`src/mem_ai/core/tasks.py`、`src/mem_ai/api/`、`src/mem_ai/db/`、`src/mem_ai/contracts/`、`src/mem_ai/integrations/`、`src/mem_ai/modules/health/` | 已落地 | 01/收敛 02 基础脚手架、应用装配、内嵌任务执行器生命周期与有界任务排空、提供方协议、公共分页、错误处理与健康检查 |
-| `src/mem_ai/modules/auth/`、`src/mem_ai/modules/users/models.py`、`src/mem_ai/modules/users/schemas.py`、`src/mem_ai/modules/users/repository.py`、`src/mem_ai/modules/users/service.py`、`src/mem_ai/modules/users/router.py`、`migrations/versions/20261126_0013_add_builtin_auth_credentials.py` | 已落地（待按 ADR-0007 收敛） | 02 认证上下文与 `GET /v1/users/me`；收敛 04 已交付内置 `email` + 密码、Access/Refresh Token、`auth_sessions` 与 `/v1/auth/*`，内置令牌已接入业务认证依赖，过期/吊销会话由 `retention` 分批清理；收敛 05 已交付当前用户邮箱响应与删除会话吊销；V1 过渡的外部验证适配、`user_identities` 与 `permissions` 待收敛 06–07 迁移测试后移除 |
+| `src/mem_ai/modules/auth/`、`src/mem_ai/modules/users/models.py`、`src/mem_ai/modules/users/schemas.py`、`src/mem_ai/modules/users/repository.py`、`src/mem_ai/modules/users/service.py`、`src/mem_ai/modules/users/router.py`、`migrations/versions/20261126_0013_add_builtin_auth_credentials.py` | 已落地（待按 ADR-0007 收敛） | 02 认证上下文与 `GET /v1/users/me`；收敛 04 已交付内置 `email` + 密码、Access/Refresh Token、`auth_sessions` 与 `/v1/auth/*`，内置令牌已接入业务认证依赖，过期/吊销会话由 `retention` 分批清理；收敛 05 已交付当前用户邮箱响应与删除会话吊销；收敛 06 已将业务测试迁至真实内置认证；V1 过渡的外部验证适配、`user_identities` 与 `permissions` 待收敛 07 移除 |
 | `src/mem_ai/modules/agents/` | 已落地 | 03/11/收敛 01 私有 Agent、不可变人设版本快照（`agents`/`persona_versions`）、草稿编辑、原子发布、幂等停用、对话使用的只读快照解析 |
 | `src/mem_ai/modules/jobs/`、`src/mem_ai/modules/operations/`、`src/mem_ai/modules/operations/audit.py`、`src/mem_ai/modules/memories/models.py`、`src/mem_ai/modules/memories/schemas.py`、`src/mem_ai/modules/memories/repository.py`、`src/mem_ai/modules/memories/snapshots.py`、`src/mem_ai/modules/memories/recall.py`、`src/mem_ai/modules/memories/barrier.py`、`src/mem_ai/modules/memories/deletions.py`、`src/mem_ai/modules/memories/clearing.py`、`src/mem_ai/modules/memories/clear_jobs.py`、`src/mem_ai/modules/memories/conversation_cleanup.py`、`src/mem_ai/modules/memories/jobs.py`、`src/mem_ai/modules/memories/service.py`、`src/mem_ai/modules/memories/router.py`、`src/mem_ai/modules/memories/adapters/memos.py`、`src/mem_ai/workers/` | 已落地 | 04/08/09/13/14/收敛 02 统一任务表（`jobs`）、执行摘要表（`job_attempts` 独立保留期）、只读视图（`memory_jobs`）、SKIP LOCKED 领取/租约/退避抖动/令牌条件提交与提交后钩子及任务框架（`workers/runner.py`）、长任务租约续期心跳（`workers/lease.py`）、集中处理器和周期任务装配（`workers/assembly.py`）、主应用 lifespan 循环（`application.py`）、异步操作追踪与 §11.3.1 显式状态机（`operations` 与 `GET /v1/operations/{operationId}`）及可选独立删除审计归档接缝（`operations/audit.py`）、记忆范围/分页快照/删除标记（`memory_scopes`/`memory_list_snapshots`/`memory_tombstones`）、`GET/POST/DELETE /v1/memories` 与 `DELETE /v1/memories/{memoryId}`、统一范围召回筛选/去重/冲突/预算/屏障降级与 tombstone 过滤、单条删除与 `confirm=true` 代次屏障清空编排（`barrier.py`/`deletions.py`/`clearing.py`/`clear_jobs.py`）、普通回合异步写入/显式核验/删除与清空处理器及可替换 MemOS 适配器 |
 | `src/mem_ai/modules/models/models.py`、`src/mem_ai/modules/models/schemas.py`、`src/mem_ai/modules/models/repository.py`、`src/mem_ai/modules/models/service.py`、`src/mem_ai/modules/models/router.py`、`src/mem_ai/modules/models/sync.py`、`src/mem_ai/modules/models/adapters/openai_compatible.py`、`src/mem_ai/modules/conversations/models.py`、`src/mem_ai/modules/conversations/schemas.py`、`src/mem_ai/modules/conversations/repository.py`、`src/mem_ai/modules/conversations/prompt.py`、`src/mem_ai/modules/conversations/idempotency.py`、`src/mem_ai/modules/conversations/queries.py`、`src/mem_ai/modules/conversations/history_repository.py`、`src/mem_ai/modules/conversations/cleanup.py`、`src/mem_ai/modules/conversations/cleanup_repository.py`、`src/mem_ai/modules/conversations/generation.py`、`src/mem_ai/modules/conversations/execution.py`、`src/mem_ai/modules/conversations/service.py`、`src/mem_ai/modules/conversations/stream.py`、`src/mem_ai/modules/conversations/router.py` | 已落地 | 05–10/12–14 模型注册启动与显式 CLI 幂等同步（`model_configs`）、`GET /v1/models` 发现、服务端强制/覆盖/启用/能力路由策略（收敛 05 已移除权限过滤）、OpenAI 兼容同步与流式 `ModelProvider` 适配器、共享生成生命周期与持久化阶段（`conversations`/`generations`/`messages`/`message_recalled_memories`/`idempotency_records`）、同会话单活跃生成租约与续期心跳、令牌/有效期/状态条件校验、过期租约内联接管与 Worker 兜底恢复、纯 Prompt 编译与上下文预算、范围记忆召回/降级与元数据引用落库（含删除标记）、Tx 2 原子普通记忆任务入队与旧代次抑制、必填 `Idempotency-Key` 业务摘要与 24 小时终态保留/原结果回放（`idempotency.py`）、共享会话归属策略与只读生成/消息查询及引用删除标记适配（`queries.py`，含 `DatabaseConversationAccessChecker`/`DatabaseTurnContentLoader`/`DatabaseRecalledMemoryReferenceMarker`）、同步与流式统一执行引擎（`execution.py`）、客户端断连隔离同步对话、SSE 流式编排与断连取消传输（`stream.py`、`conversation.started`/`message.delta`/`conversation.completed`/`conversation.failed`/`heartbeat`）、`POST /v1/chat`、会话列表/详情/消息游标查询、`GET /v1/conversations/{conversationId}/generations/{generationId}` 与会话删除及分批清理 |
 | `src/mem_ai/modules/users/cleanup.py`、`src/mem_ai/modules/memories/user_cleanup.py`、`src/mem_ai/modules/memories/clear_state.py`、`src/mem_ai/modules/jobs/cleanup.py`、`src/mem_ai/modules/operations/`、`migrations/versions/20261123_0011_add_user_deletion_receipts.py` | 已落地 | 15 用户删除受理与分阶段 Worker、各资源拥有者的用户清理入口、全提供方最终记忆屏障、HMAC 删除回执及撤销/期限持久化，收敛 05 将删除受理及审计重放与登录会话吊销统一到同一事务，保留唯一邮箱至最终清理；验证记录见 ticket 15 与收敛 05 |
 | `src/mem_ai/modules/retention/schemas.py`、`src/mem_ai/modules/retention/service.py`、`src/mem_ai/modules/jobs/cleanup_repository.py`、`migrations/versions/20261124_0012_add_operations_retention_indexes.py` | 已落地 | 16 数据保留策略、可恢复游标状态、周期清理处理器（`retention_cleanup`）与多资源拥有者有限批次到期清理入口、`jobs` 保留清理仓储及 `operations` 保留扫描部分索引 |
-| `tests/conftest.py`、`tests/unit/`、`tests/api/`、`tests/integration/`、`tests/architecture/` | 已落地（持续扩展） | 01–17 测试 fixture、单元、API、PostgreSQL/迁移、Worker 恢复、保留到期、资源限制与运行观测、提供方契约与架构测试 |
+| `tests/conftest.py`、`tests/unit/`、`tests/api/`、`tests/integration/`、`tests/architecture/` | 已落地（持续扩展） | 01–17/收敛 06 测试 fixture、单元、API、PostgreSQL/迁移、Worker 恢复、保留到期、资源限制与运行观测、提供方契约与架构测试；`builtin_users` 经内置注册建立双用户真实会话，业务测试不再构造外部主体或权限夹具 |
 | `tests/api/test_user_deletion.py`、`tests/integration/test_user_deletion.py`、`tests/integration/test_user_deletion_provider_mapping.py` | 已落地 | 15/收敛 05 API 回执权限与普通身份隔离、内置用户邮箱占位与最终会话级联删除、Worker 分阶段清理、PostgreSQL 外键生存/租约竞态、远程部分失败和恢复及历史提供方映射保留 |
 | `tests/unit/test_retention_policy.py`、`tests/integration/test_retention_and_expiry.py` | 已落地 | 16 保留配置与游标摘要单元测试、24 小时/30 天边界、迟到终态、分批中断与租约恢复、多 Worker 同周期去重、活跃/待核验/远程映射保护及显式删除优先的 PostgreSQL 验证 |
 | `src/mem_ai/core/limits.py`、`src/mem_ai/core/telemetry.py`、`tests/unit/test_limits_and_telemetry.py`、`tests/api/test_limits_and_security_boundaries.py`、`tests/api/test_observability_and_metrics.py` | 已落地 | 17 可替换限流接缝（`RateLimiter`）、进程请求与生成并发预算（`ConcurrencyLimiter`）、请求体/输入长度/生成与流时长限制、Host/CORS/可信代理与请求 ID 白名单、低基数 Prometheus 指标注册表与受控 `/metrics`、OpenTelemetry 追踪接缝、JSON 日志脱敏关联与 Worker 心跳/探针及优雅退出验证 |
@@ -183,7 +183,7 @@ Service  ←──────────────────────�
 | 业务能力 | 主负责人 | 协作路径 | 首要查找路径 | 相关验证位置 | 相关 ticket |
 | --- | --- | --- | --- | --- | --- |
 | 应用装配、配置、错误和健康检查 | `application` | `core/`、`modules/health/`、`workers/assembly.py`、`workers/runner.py` | `src/mem_ai/application.py`、`src/mem_ai/core/`、`src/mem_ai/modules/health/service.py`、`src/mem_ai/modules/health/router.py` | `tests/architecture/`、`tests/api/`、`tests/api/test_worker_lifespan.py` | 01、17、18、收敛 02 |
-| 认证上下文和用户状态 | `auth` | `users/` | `src/mem_ai/modules/auth/`、`src/mem_ai/modules/users/` | `tests/unit/test_builtin_auth.py`、`tests/api/test_builtin_auth.py`、`tests/integration/test_auth_session_deletion_races.py`、`tests/unit/`、`tests/api/`、`tests/integration/` | 02、15、收敛 04–05 |
+| 认证上下文和用户状态 | `auth` | `users/` | `src/mem_ai/modules/auth/`、`src/mem_ai/modules/users/` | `tests/unit/test_builtin_auth.py`、`tests/api/test_builtin_auth.py`、`tests/integration/test_auth_session_deletion_races.py`、`tests/unit/`、`tests/api/`、`tests/integration/` | 02、15、收敛 04–06 |
 | Agent 与人设版本生命周期及只读快照解析 | `agents` | `users/cleanup.py`、`conversations/service.py` | `src/mem_ai/modules/agents/service.py`、`src/mem_ai/modules/agents/schemas.py` | `tests/api/`、`tests/integration/` | 03、11、收敛 01、15 |
 | 同步与流式生成编排 | `conversations` | `models/`、`memories/`、`jobs/` | `src/mem_ai/modules/conversations/service.py`、`execution.py`、`generation.py`、`idempotency.py`、`queries.py`、`stream.py` | `tests/api/`、`tests/integration/` | 05、07、08、10、12 |
 | 模型注册、选择和提供方调用 | `models` | `contracts/model_provider.py`、`models/adapters/` | `src/mem_ai/modules/models/`、`src/mem_ai/contracts/model_provider.py` | `tests/unit/`、`tests/api/`、`tests/integration/` | 05、06、12、收敛 05 |
@@ -257,7 +257,7 @@ mem-ai/                                    # 项目根目录，管理应用、�
 │       ├── __init__.py                    # 包标识及必要导出
 │       ├── main.py                        # API 的 ASGI 应用入口
 │       ├── application.py                 # 应用工厂、lifespan 和提供方装配
-│       ├── ops.py                         # 生产运维与恢复 CLI（连接预算、健康诊断、审计重放、任务重入队与提供方核验）
+│       ├── ops.py                         # 生产运维与恢复 CLI（连接预算、健康诊断、审计重放、任务重入队、内置认证与提供方核验）
 │       ├── core/                          # 配置、错误、日志和运行预算
 │       │   ├── config.py                  # 强类型配置、生产安全校验及删除回执密钥/期限
 │       │   ├── logging.py                 # JSON 日志、关联字段及脱敏
@@ -341,7 +341,7 @@ mem-ai/                                    # 项目根目录，管理应用、�
 │           ├── runner.py                  # 内嵌异步任务执行器：轮询、并发、恢复、周期调度、心跳与指标记录
 │           └── schemas.py                 # Worker 配置、周期任务规格、健康快照与处理器注册表
 ├── tests/                                 # 按公开行为验证的测试
-│   ├── conftest.py                        # 应用、PostgreSQL、身份和提供方 fixture
+│   ├── conftest.py                        # 应用、隔离 PostgreSQL、内置注册/登录与双用户会话、提供方 fixture
 │   ├── architecture/                      # 依赖方向、SDK 位置、重复路由及文档契约检查
 │   ├── unit/                              # 纯业务规则、摘要、游标和状态机测试
 │   │   ├── test_builtin_auth.py           # 密码策略/哈希、内置 JWT 验签、JWT 密钥生产校验与保留策略映射验证
@@ -353,8 +353,8 @@ mem-ai/                                    # 项目根目录，管理应用、�
 │   │   ├── test_production_deployment_and_recovery.py # 统一单进程生命周期与探针、备份审计重放防复活、重入队、提供方核验与公开契约验收
 │   │   ├── test_retention_and_expiry.py   # 24 小时/30 天边界、迟到终态、分批中断恢复、周期去重与活跃保护验证
 │   │   ├── test_user_deletion.py           # 用户删除阶段、邮箱占位至远程确认、最终用户/会话移除、竞态与失败恢复验证
-│   │   └── test_user_deletion_provider_mapping.py # 历史提供方不可用时保留身份与清理映射验证
-│   └── api/                               # HTTP、SSE、权限、限流、观测和删除回执测试
+│   │   └── test_user_deletion_provider_mapping.py # 历史提供方不可用时保留用户邮箱与清理映射验证
+│   └── api/                               # 内置认证 HTTP/SSE、资源归属、限流、观测和删除回执测试
 │       ├── test_builtin_auth.py           # 内置注册/登录/刷新轮换与重放吊销/注销/改密、当前用户邮箱、删除会话吊销/邮箱冲突/回执隔离及会话保留清理验证
 │       ├── test_limits_and_security_boundaries.py # 限流/并发/请求体/输入/超时、Host/CORS/可信代理与伪造头验证
 │       ├── test_observability_and_metrics.py # 受控 /metrics、日志脱敏关联、追踪接缝、就绪隔离与 Worker 心跳退出验证
@@ -395,7 +395,7 @@ modules/<module>/    # 某个业务模块，例如 agents 或 conversations
 | --- | --- |
 | `main.py` | 暴露 ASGI 应用 |
 | `application.py` | 应用工厂、lifespan（含 `ready` 就绪开关、内嵌后台任务执行器装配/自动启停与同步生成/后台任务有界并行停机排空）、路由、异常处理、提供方、可替换限流与共享遥测/追踪装配 |
-| `ops.py` | 生产运维与恢复 CLI（`python -m mem_ai.ops`）：连接池总预算校验（`check-budget`）、健康与积压诊断（`inspect-health`）、独立删除审计归档干跑/幂等重放（`replay-audit`）、失败耗尽任务受控重入队（`requeue-job`）及有限权限生产提供方核验（`verify-providers`） |
+| `ops.py` | 生产运维与恢复 CLI（`python -m mem_ai.ops`）：连接池总预算校验（`check-budget`）、健康与积压诊断（`inspect-health`）、独立删除审计归档干跑/幂等重放（`replay-audit`）、失败耗尽任务受控重入队（`requeue-job`）及内置认证/有限权限生产提供方核验（`verify-providers`，内置令牌验签后检查本地用户状态） |
 | `core/config.py` | 定义并校验配置，包含 Host/CORS/可信代理/请求 ID 白名单、请求体/并发/输入/超时与代理心跳协调、受控 `/metrics`、删除回执密钥/有效期、保留期限及 Worker 启停、独立并发和心跳配置 |
 | `core/logging.py` | 结构化 JSON 日志、请求/会话/生成/提供方/任务关联字段与键级/内联敏感凭据和正文脱敏 |
 | `core/exceptions.py`、`core/exception_handlers.py` | 稳定小写下划线错误码（含 `413 payload_too_large` 与带 `Retry-After` 的 `429 RateLimitError`）及统一 JSON 错误信封映射 |
@@ -891,7 +891,11 @@ JSON 日志关联 `request_id`、`user_id`、`conversation_id`、`generation_id`
 
 ### 13.1 分层与公共行为
 
-单元测试验证 Prompt、路由、摘要、游标和状态规则。API 测试经过 FastAPI 路由及生命周期。集成测试使用 PostgreSQL 验证唯一性、锁、事务、迁移、租约及 Worker 恢复。提供方通过统一接口与受控上游响应验证，生产接入前再执行有限权限的实际连通和能力核验。
+单元测试验证 Prompt、路由、摘要、游标和状态规则。API 测试经过 FastAPI 路由及生命周期。
+
+共享 `tests/conftest.py` 的 `register_builtin_user`、`login_builtin_user` 和 `builtin_users` 通过真实注册/登录接口获取内置令牌及持久登录会话，`create_builtin_user` 为服务层集成测试复用公开注册用例；调用方显式传递用户令牌，不覆盖认证依赖。收敛 07 移除旧认证配置前，测试配置仅保留拒绝匿名回退所需的严格 JWT 配置，所有有效业务请求均使用内置令牌；旧 `user_identities` 数据仅保留在历史迁移兼容测试中。
+
+集成测试使用 PostgreSQL 验证唯一性、锁、事务、迁移、租约及 Worker 恢复。提供方通过统一接口与受控上游响应验证，生产接入前再执行有限权限的实际连通和能力核验。
 
 ### 13.2 CI 顺序
 

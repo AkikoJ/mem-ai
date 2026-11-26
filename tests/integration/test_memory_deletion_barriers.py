@@ -54,10 +54,9 @@ from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
 from mem_ai.modules.operations import service as operations_service
 from mem_ai.modules.operations.audit import JsonlDeletionAuditArchiver
-from mem_ai.modules.users import service as users_service
 from mem_ai.workers.assembly import build_worker_registry
 from mem_ai.workers.runner import JobHandlerRegistry, WorkerConfig, WorkerRunner
-from tests.conftest import FakeModelProvider
+from tests.conftest import FakeModelProvider, create_builtin_user
 
 
 class _ControlledMemoryProvider:
@@ -223,13 +222,9 @@ class _ControlledMemoryProvider:
 async def _seed_user_model_and_agent(
     session_factory: Any,
     *,
-    subject: str,
+    email: str,
 ) -> tuple[UUID, UUID]:
-    user = await users_service.resolve_active_user(
-        session_factory,
-        issuer="https://test.mem-ai.local",
-        subject=subject,
-    )
+    user = await create_builtin_user(session_factory, email=email)
     await models_service.sync_model_configs(
         session_factory,
         seeds=[
@@ -248,7 +243,7 @@ async def _seed_user_model_and_agent(
         owner_id=user.id,
         data=AgentCreateRequest.model_validate(
             {
-                "name": f"Agent-{subject}",
+                "name": f"Agent-{email}",
                 "systemPrompt": "You are helpful.",
                 "defaultModelId": "test-model",
                 "memoryPolicy": {
@@ -320,9 +315,11 @@ async def test_single_delete_tombstone_filters_recall_marks_refs_and_reconciles(
     marker = DatabaseRecalledMemoryReferenceMarker()
     try:
         alice_id, agent_id = await _seed_user_model_and_agent(
-            session_factory, subject="alice-single-del"
+            session_factory, email="alice-single-del@example.com"
         )
-        bob_id, _ = await _seed_user_model_and_agent(session_factory, subject="bob-single-del")
+        bob_id, _ = await _seed_user_model_and_agent(
+            session_factory, email="bob-single-del@example.com"
+        )
 
         provider = _ControlledMemoryProvider()
         provider.seed(user_id=alice_id, memory_id="mem_keep", content="Alice loves green tea")
@@ -481,7 +478,7 @@ async def test_clear_barrier_cancels_queued_suppresses_old_generation_and_conver
     marker = DatabaseRecalledMemoryReferenceMarker()
     try:
         user_id, agent_id = await _seed_user_model_and_agent(
-            session_factory, subject="alice-clear-race"
+            session_factory, email="alice-clear-race@example.com"
         )
         model_provider = FakeModelProvider(prefix="reply:")
         provider = _ControlledMemoryProvider()
@@ -720,7 +717,9 @@ async def test_clear_verifies_lost_response_write_and_handles_no_verify_settle_t
     try:
         # Scenario A: Provider WITH per-write status verification waits for lost-response write
         # to stabilize via `verify_operation`, then executes final clear and releases barrier.
-        user_a, _ = await _seed_user_model_and_agent(session_factory, subject="alice-verifiable")
+        user_a, _ = await _seed_user_model_and_agent(
+            session_factory, email="alice-verifiable@example.com"
+        )
         provider_a = _ControlledMemoryProvider(
             supports_write_status_verification=True,
             write_outcomes=[
@@ -783,7 +782,9 @@ async def test_clear_verifies_lost_response_write_and_handles_no_verify_settle_t
         # Scenario B: Provider WITHOUT per-write status verification reaches
         # `memory_inflight_settle_timeout`, logs reconciling alert, runs first clear + delayed
         # secondary compensation clear, releases barrier, and preserves reconciling write job!
-        user_b, _ = await _seed_user_model_and_agent(session_factory, subject="bob-no-verify")
+        user_b, _ = await _seed_user_model_and_agent(
+            session_factory, email="bob-no-verify@example.com"
+        )
         provider_b = _ControlledMemoryProvider(
             supports_write_status_verification=False,
             write_outcomes=[
@@ -886,7 +887,7 @@ async def test_unknown_final_clear_holds_barrier_reconciling_and_recovers_after_
     root_logger.setLevel(logging.INFO)
     try:
         user_id, _ = await _seed_user_model_and_agent(
-            session_factory, subject="carol-clear-crash-recovery"
+            session_factory, email="carol-clear-crash-recovery@example.com"
         )
         provider = _ControlledMemoryProvider(
             clear_outcomes=[

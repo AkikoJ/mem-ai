@@ -30,7 +30,7 @@ from mem_ai.modules.conversations import service as conversations_service
 from mem_ai.modules.conversations.schemas import GenerationRecord, MessageRecord
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
-from mem_ai.modules.users import service as users_service
+from tests.conftest import create_builtin_user
 
 
 class _InspectingModelProvider:
@@ -59,11 +59,7 @@ async def test_sync_chat_commits_user_message_before_model_and_filters_failed_tu
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
     try:
-        alice = await users_service.resolve_or_create_user(
-            session_factory,
-            issuer="https://test.mem-ai.local",
-            subject="alice-chat-persist",
-        )
+        alice = await create_builtin_user(session_factory, email="alice-chat-persist@example.com")
         await models_service.sync_model_configs(
             session_factory,
             seeds=[
@@ -273,11 +269,7 @@ async def test_commit_failure_rolls_back_assistant_reply_atomically_and_converge
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
     try:
-        alice = await users_service.resolve_or_create_user(
-            session_factory,
-            issuer="https://test.mem-ai.local",
-            subject="alice-atomic-commit",
-        )
+        alice = await create_builtin_user(session_factory, email="alice-atomic-commit@example.com")
         await models_service.sync_model_configs(
             session_factory,
             seeds=[
@@ -357,11 +349,7 @@ async def test_commit_failure_rolls_back_assistant_reply_atomically_and_converge
         assert gen.error_code == "generation_commit_failed"
 
         # Already-failed or succeeded check: conversation ownership check enforces isolation.
-        bob = await users_service.resolve_or_create_user(
-            session_factory,
-            issuer="https://test.mem-ai.local",
-            subject="bob-atomic-commit",
-        )
+        bob = await create_builtin_user(session_factory, email="bob-atomic-commit@example.com")
         await generation_store.ensure_conversation_accessible(
             session_factory,
             owner_id=alice.id,
@@ -386,11 +374,7 @@ async def test_unavailable_default_model_and_upstream_error_paths(
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
     try:
-        alice = await users_service.resolve_or_create_user(
-            session_factory,
-            issuer="https://test.mem-ai.local",
-            subject="alice-model-err",
-        )
+        alice = await create_builtin_user(session_factory, email="alice-model-err@example.com")
         await models_service.sync_model_configs(
             session_factory,
             seeds=[

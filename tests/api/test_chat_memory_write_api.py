@@ -21,8 +21,6 @@ from mem_ai.contracts.memory_provider import (
     MemoryWriteResult,
 )
 from mem_ai.core.config import Settings
-from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
-from mem_ai.modules.auth.context import VerifiedPrincipal
 from mem_ai.modules.jobs import service as jobs_service
 from mem_ai.modules.jobs.schemas import JobBackoffPolicy
 from mem_ai.modules.memories.jobs import JOB_TYPE_MEMORY_TURN_WRITE
@@ -30,7 +28,7 @@ from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
 from mem_ai.workers.assembly import build_worker_registry
 from mem_ai.workers.runner import WorkerConfig, WorkerRunner
-from tests.conftest import FakeMemoryProvider, FakeModelProvider
+from tests.conftest import BuiltinUsers, FakeMemoryProvider, FakeModelProvider
 
 
 class _FlakyThenWorkingMemoryProvider(FakeMemoryProvider):
@@ -77,23 +75,11 @@ class _FlakyThenWorkingMemoryProvider(FakeMemoryProvider):
 @pytest.mark.integration
 @pytest.mark.anyio
 async def test_post_chat_enqueues_turn_memory_and_worker_recovers_after_outage(
+    builtin_users: BuiltinUsers,
     migrated_pg_settings: Settings,
 ) -> None:
     memory_provider = _FlakyThenWorkingMemoryProvider(fail_writes=1)
     model_provider = FakeModelProvider(prefix="assistant:")
-    verifier = StaticTokenAuthAdapter(
-        {
-            "tok-alice": VerifiedPrincipal(
-                issuer="https://test.mem-ai.local",
-                subject="alice-chat-jobs",
-                actor_id="actor-alice",
-                auth_method="static_token",
-                permissions=frozenset(
-                    {"chat:use", "agents:manage", "memories:manage", "users:self"}
-                ),
-            )
-        }
-    )
 
     app = create_app(
         migrated_pg_settings,
@@ -101,9 +87,8 @@ async def test_post_chat_enqueues_turn_memory_and_worker_recovers_after_outage(
             model_provider=model_provider,
             memory_provider=memory_provider,
         ),
-        credential_verifier=verifier,
     )
-    headers = {"Authorization": "Bearer tok-alice"}
+    headers = builtin_users.alice.headers
 
     async with app.router.lifespan_context(app):
         session_factory = app.state.session_factory

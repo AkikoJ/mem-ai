@@ -61,7 +61,6 @@ from mem_ai.modules.memories.schemas import AcceptedMemoryOutcome
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
 from mem_ai.modules.operations import service as operations_service
-from mem_ai.modules.users import service as users_service
 from mem_ai.workers.assembly import (
     JOB_TYPE_GENERATION_LEASE_RECOVERY,
     GenerationLeaseRecoveryJobHandler,
@@ -73,7 +72,7 @@ from mem_ai.workers.runner import (
     WorkerConfig,
     WorkerRunner,
 )
-from tests.conftest import FakeModelProvider
+from tests.conftest import FakeModelProvider, create_builtin_user
 
 
 class _ScriptedMemoryProvider:
@@ -163,17 +162,12 @@ class _FailingModelProvider:
         yield ModelStreamChunk(sequence=1, text="", is_final=True)
 
 
-async def _seed_user_model_and_agent(
+async def _seed_model_and_agent(
     session_factory: Any,
     *,
-    subject: str,
+    user_id: UUID,
     memory_policy: MemoryPolicy | None = None,
-) -> tuple[UUID, UUID]:
-    user = await users_service.resolve_active_user(
-        session_factory,
-        issuer="https://test.mem-ai.local",
-        subject=subject,
-    )
+) -> UUID:
     await models_service.sync_model_configs(
         session_factory,
         seeds=[
@@ -190,10 +184,10 @@ async def _seed_user_model_and_agent(
     policy = memory_policy if memory_policy is not None else MemoryPolicy()
     agent = await agents_service.create_agent(
         session_factory,
-        owner_id=user.id,
+        owner_id=user_id,
         data=AgentCreateRequest.model_validate(
             {
-                "name": f"Agent-{subject}",
+                "name": f"Agent-{user_id}",
                 "systemPrompt": "You are a helpful assistant.",
                 "defaultModelId": "test-model",
                 "memoryPolicy": {
@@ -207,10 +201,10 @@ async def _seed_user_model_and_agent(
     )
     await agents_service.publish_agent(
         session_factory,
-        owner_id=user.id,
+        owner_id=user_id,
         agent_id=agent.agent_id,
     )
-    return user.id, agent.agent_id
+    return agent.agent_id
 
 
 @pytest.mark.integration
@@ -225,9 +219,11 @@ async def test_atomic_tx2_commit_write_scopes_disabled_policy_and_rollback(
         memory_provider = _ScriptedMemoryProvider()
 
         # 1. Default writeScope='user' commits reply, generation, and turn job atomically.
-        user_id, user_scope_agent_id = await _seed_user_model_and_agent(
+        user = await create_builtin_user(session_factory, email="tx2-user-scope@example.com")
+        user_id = user.id
+        user_scope_agent_id = await _seed_model_and_agent(
             session_factory,
-            subject="tx2-user-scope",
+            user_id=user_id,
             memory_policy=MemoryPolicy(enabled=True, write_enabled=True, write_scope="user"),
         )
         res_user = await conversations_service.run_sync_chat(
@@ -255,9 +251,9 @@ async def test_atomic_tx2_commit_write_scopes_disabled_policy_and_rollback(
         assert "tok_super_secret" not in json.dumps(job.metadata_json)
 
         # 2. writeScope='conversation' propagates through jobs and memory_jobs view.
-        _, conv_scope_agent_id = await _seed_user_model_and_agent(
+        conv_scope_agent_id = await _seed_model_and_agent(
             session_factory,
-            subject="tx2-user-scope",
+            user_id=user_id,
             memory_policy=MemoryPolicy(
                 enabled=True, write_enabled=True, write_scope="conversation"
             ),
@@ -281,9 +277,9 @@ async def test_atomic_tx2_commit_write_scopes_disabled_policy_and_rollback(
         assert view_rows[0].generation_id == str(res_conv.generation_id)
 
         # 3. Disabled memory write commits reply and generation WITHOUT creating a job.
-        _, disabled_agent_id = await _seed_user_model_and_agent(
+        disabled_agent_id = await _seed_model_and_agent(
             session_factory,
-            subject="tx2-user-scope",
+            user_id=user_id,
             memory_policy=MemoryPolicy(enabled=True, write_enabled=False, write_scope="user"),
         )
         res_disabled = await conversations_service.run_sync_chat(
@@ -404,11 +400,7 @@ async def test_memory_jobs_view_is_read_only_and_filters_non_memory_jobs(
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
     try:
-        user = await users_service.resolve_active_user(
-            session_factory,
-            issuer="https://test.mem-ai.local",
-            subject="view-ro-user",
-        )
+        user = await create_builtin_user(session_factory, email="view-ro-user@example.com")
         async with session_factory.begin() as session:
             mem_job, created_first = await jobs_service.enqueue_job_in_session(
                 session,
@@ -476,9 +468,11 @@ async def test_worker_retries_exhaustion_reconciling_verification_and_log_redact
     mem_ai_logger.setLevel(logging.INFO)
     try:
         model_provider = FakeModelProvider(prefix="answer:")
-        user_id, agent_id = await _seed_user_model_and_agent(
+        user = await create_builtin_user(session_factory, email="worker-retry-user@example.com")
+        user_id = user.id
+        agent_id = await _seed_model_and_agent(
             session_factory,
-            subject="worker-retry-user",
+            user_id=user_id,
             memory_policy=MemoryPolicy(enabled=True, write_enabled=True, write_scope="user"),
         )
 
@@ -681,10 +675,8 @@ async def test_skip_locked_lease_reclaim_stale_executor_isolation_and_graceful_s
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
     try:
-        user = await users_service.resolve_active_user(
-            session_factory,
-            issuer="https://test.mem-ai.local",
-            subject="concurrency-worker-user",
+        user = await create_builtin_user(
+            session_factory, email="concurrency-worker-user@example.com"
         )
 
         # 1. SKIP LOCKED: Two concurrent workers claiming 6 jobs never double-claim any job.
@@ -852,10 +844,8 @@ async def test_worker_reconciles_explicit_memory_operation_and_runs_periodic_rec
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
     try:
-        user = await users_service.resolve_active_user(
-            session_factory,
-            issuer="https://test.mem-ai.local",
-            subject="explicit-and-periodic-user",
+        user = await create_builtin_user(
+            session_factory, email="explicit-and-periodic-user@example.com"
         )
         provider = _ScriptedMemoryProvider(
             write_outcomes=[
@@ -955,9 +945,13 @@ async def test_worker_crash_mid_dispatch_verifies_instead_of_re_sending_and_barr
     session_factory = create_session_factory(engine)
     try:
         model_provider = FakeModelProvider(prefix="ok:")
-        user_id, agent_id = await _seed_user_model_and_agent(
+        user = await create_builtin_user(
+            session_factory, email="crash-mid-dispatch-user@example.com"
+        )
+        user_id = user.id
+        agent_id = await _seed_model_and_agent(
             session_factory,
-            subject="crash-mid-dispatch-user",
+            user_id=user_id,
             memory_policy=MemoryPolicy(enabled=True, write_enabled=True, write_scope="user"),
         )
 
@@ -1084,9 +1078,13 @@ async def test_review_regressions_reconcile_budget_confirmed_clear_requeue_and_a
     mem_ai_logger.setLevel(logging.INFO)
     try:
         model_provider = FakeModelProvider(prefix="ok:")
-        user_id, agent_id = await _seed_user_model_and_agent(
+        user = await create_builtin_user(
+            session_factory, email="review-regression-user@example.com"
+        )
+        user_id = user.id
+        agent_id = await _seed_model_and_agent(
             session_factory,
-            subject="review-regression-user",
+            user_id=user_id,
             memory_policy=MemoryPolicy(enabled=True, write_enabled=True, write_scope="user"),
         )
 

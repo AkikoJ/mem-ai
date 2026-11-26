@@ -33,12 +33,11 @@ from mem_ai.contracts.model_provider import (
 )
 from mem_ai.core.config import Settings
 from mem_ai.core.logging import JsonLogFormatter
-from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
 from mem_ai.modules.conversations import generation as generation_store
 from mem_ai.modules.memories.adapters.memos import MemOSMemoryProvider
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
-from tests.conftest import FakeMemoryProvider
+from tests.conftest import BuiltinUsers, FakeMemoryProvider
 
 
 class _RecordingModelProvider:
@@ -135,7 +134,7 @@ async def _create_published_agent(
 @pytest.mark.anyio
 async def test_chat_api_isolates_user_vs_conversation_memories_and_persists_injected_refs(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
+    builtin_users: BuiltinUsers,
     fake_memory_provider: FakeMemoryProvider,
 ) -> None:
     model_provider = _RecordingModelProvider()
@@ -145,10 +144,9 @@ async def test_chat_api_isolates_user_vs_conversation_memories_and_persists_inje
             model_provider=model_provider,
             memory_provider=fake_memory_provider,
         ),
-        credential_verifier=test_auth_adapter,
     )
-    alice_headers = {"Authorization": "Bearer token-alice"}
-    bob_headers = {"Authorization": "Bearer token-bob"}
+    alice_headers = builtin_users.alice.headers
+    bob_headers = builtin_users.bob.headers
 
     async with app.router.lifespan_context(app):
         await models_service.sync_model_configs(
@@ -325,7 +323,7 @@ async def test_chat_api_isolates_user_vs_conversation_memories_and_persists_inje
 @pytest.mark.anyio
 async def test_chat_api_degrades_gracefully_on_recall_failure_with_sanitized_logs(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     model_provider = _RecordingModelProvider()
     secret_user_text = "PRIVATE_USER_MESSAGE_MUST_NOT_APPEAR_IN_LOGS"
@@ -336,9 +334,8 @@ async def test_chat_api_degrades_gracefully_on_recall_failure_with_sanitized_log
             model_provider=model_provider,
             memory_provider=failing_provider,
         ),
-        credential_verifier=test_auth_adapter,
     )
-    alice_headers = {"Authorization": "Bearer token-alice"}
+    alice_headers = builtin_users.alice.headers
 
     log_buffer = StringIO()
     log_handler = logging.StreamHandler(log_buffer)
@@ -430,7 +427,7 @@ async def test_chat_api_degrades_gracefully_on_recall_failure_with_sanitized_log
 @pytest.mark.anyio
 async def test_chat_api_end_to_end_with_memos_adapter_encapsulates_vendor_format(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     secret_memos_key = "memos-e2e-secret-token-777"
     captured_memos_calls: list[dict[str, Any]] = []
@@ -488,9 +485,8 @@ async def test_chat_api_end_to_end_with_memos_adapter_encapsulates_vendor_format
     app = create_app(
         migrated_pg_settings,
         providers=ProviderRegistry(model_provider=model_provider),
-        credential_verifier=test_auth_adapter,
     )
-    alice_headers = {"Authorization": "Bearer token-alice"}
+    alice_headers = builtin_users.alice.headers
 
     try:
         async with app.router.lifespan_context(app):

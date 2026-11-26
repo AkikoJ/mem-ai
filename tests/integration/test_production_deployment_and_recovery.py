@@ -18,8 +18,11 @@ from mem_ai.api.dependencies import ProviderRegistry
 from mem_ai.application import create_app
 from mem_ai.contracts.memory_provider import MemoryRecallQuery, MemoryWriteInput
 from mem_ai.core.config import Settings
+from mem_ai.core.exceptions import ForbiddenError, UnauthorizedError
 from mem_ai.db.engine import create_async_engine_from_settings, create_session_factory
+from mem_ai.modules.auth import service as auth_service
 from mem_ai.modules.auth.models import AuthSession
+from mem_ai.modules.auth.schemas import AuthTokenSettings
 from mem_ai.modules.jobs import service as jobs_service
 from mem_ai.modules.memories import service as memories_service
 from mem_ai.modules.memories.adapters.memos import MemOSMemoryProvider
@@ -36,10 +39,12 @@ from mem_ai.workers.assembly import build_worker_registry
 from mem_ai.workers.runner import WorkerConfig, WorkerRunner
 from tests.api.test_builtin_auth import PASSWORD, _bearer, _login, _refresh, _register
 from tests.conftest import (
+    TEST_PASSWORD,
     FakeMemoryProvider,
     FakeModelProvider,
+    create_builtin_user,
     parse_sse_text,
-    sign_hs256_jwt,
+    register_builtin_user,
 )
 
 _PROD_JWT_SECRET = "prod-drill-jwt-signing-secret-32chars!!"
@@ -65,6 +70,7 @@ def _production_settings(
         "auth_trusted_issuers": [_PROD_ISSUER],
         "auth_trusted_audience": _PROD_AUDIENCE,
         "auth_jwt_hs256_secret": SecretStr(_PROD_JWT_SECRET),
+        "auth_jwt_secret": SecretStr(_PROD_JWT_SECRET),
         "deletion_receipt_secret": SecretStr(_PROD_RECEIPT_SECRET),
         "allowed_hosts": [_PROD_HOST],
         "cors_allowed_origins": ["https://app.prod.mem-ai.example"],
@@ -92,26 +98,6 @@ def _production_settings(
     if worker_heartbeat_interval_seconds is not None:
         updates["worker_heartbeat_interval_seconds"] = worker_heartbeat_interval_seconds
     return base_settings.model_copy(update=updates)
-
-
-def _make_jwt(subject: str, *, permissions: list[str] | None = None) -> str:
-    now_ts = int(datetime.now(UTC).timestamp())
-    return sign_hs256_jwt(
-        {
-            "iss": _PROD_ISSUER,
-            "aud": _PROD_AUDIENCE,
-            "sub": subject,
-            "iat": now_ts,
-            "exp": now_ts + 3600,
-            "permissions": permissions or ["chat:write"],
-        },
-        secret=_PROD_JWT_SECRET,
-    )
-
-
-def _auth_header(subject: str, *, permissions: list[str] | None = None) -> dict[str, str]:
-    token = _make_jwt(subject, permissions=permissions)
-    return {"Authorization": f"Bearer {token}", "Host": _PROD_HOST}
 
 
 @pytest.mark.integration
@@ -182,7 +168,8 @@ async def test_unified_single_process_lifecycle_probes_recovery_and_budget(
             assert "mem_ai_worker_last_heartbeat_timestamp_seconds " in metrics_resp.text
 
             # Enqueue an expired-lease job (simulating crashed replica) and confirm recovery
-            me = await client.get("/v1/users/me", headers=_auth_header("ops-recover-user"))
+            registered = await register_builtin_user(client, email="ops-recover@example.com")
+            me = await client.get("/v1/users/me", headers=registered.headers)
             user_id = UUID(me.json()["data"]["userId"])
             async with sf.begin() as session:
                 stale_job = await jobs_service.register_and_claim_sync_job_in_session(
@@ -282,10 +269,18 @@ async def test_backup_restore_audit_replay_prevents_memory_resurrection_and_is_i
             async with httpx.AsyncClient(
                 transport=transport, base_url=f"http://{_PROD_HOST}"
             ) as client:
-                h_single = _auth_header("user-single-del")
-                h_clear = _auth_header("user-clear-all")
-                h_conv = _auth_header("user-conv-del")
-                h_user = _auth_header("user-account-del")
+                h_single = (
+                    await register_builtin_user(client, email="user-single-del@example.com")
+                ).headers
+                h_clear = (
+                    await register_builtin_user(client, email="user-clear-all@example.com")
+                ).headers
+                h_conv = (
+                    await register_builtin_user(client, email="user-conv-del@example.com")
+                ).headers
+                h_user = (
+                    await register_builtin_user(client, email="user-account-del@example.com")
+                ).headers
 
                 # 1. Pre-backup state (before T0): create users, memories, conversations.
                 u_single = UUID(
@@ -667,7 +662,13 @@ async def test_verify_providers_harness_validates_auth_model_and_memos_capabilit
                 base_url="https://memos.staging.example/api/openmem/v1",
                 timeout_seconds=10.0,
             )
-            token = _make_jwt("staging-probe-user")
+            registered = await auth_service.register_user(
+                sf,
+                email="staging-probe@example.com",
+                password=TEST_PASSWORD,
+                token_settings=AuthTokenSettings.from_settings(prod_settings),
+            )
+            token = registered.tokens.access_token
             report = await verify_providers(
                 prod_settings,
                 session_factory=sf,
@@ -694,6 +695,34 @@ async def test_verify_providers_harness_validates_auth_model_and_memos_capabilit
             # Two unique probe writes + one repeated write_id idempotency probe
             assert len(memos_writes_seen) == 3
             assert memos_writes_seen[0] == memos_writes_seen[1]
+            # The operational probe verifies the token signature and current local status.
+            header, payload, signature = token.split(".")
+            wrong_signature = ("A" if signature[0] != "A" else "B") + signature[1:]
+            with pytest.raises(UnauthorizedError):
+                await verify_providers(
+                    prod_settings,
+                    session_factory=sf,
+                    check_auth=True,
+                    auth_headers={"Authorization": f"Bearer {header}.{payload}.{wrong_signature}"},
+                    http_client=mock_http,
+                )
+            with pytest.raises(ValueError, match="session_factory"):
+                await verify_providers(
+                    prod_settings,
+                    check_auth=True,
+                    auth_headers={"Authorization": f"Bearer {token}"},
+                    http_client=mock_http,
+                )
+            await users_service.set_user_status(sf, user_id=registered.user_id, status="disabled")
+            with pytest.raises(ForbiddenError) as disabled:
+                await verify_providers(
+                    prod_settings,
+                    session_factory=sf,
+                    check_auth=True,
+                    auth_headers={"Authorization": f"Bearer {token}"},
+                    http_client=mock_http,
+                )
+            assert disabled.value.code == "user_disabled"
             # Verify --check-auth requires credentials (never silently succeeds)
             with pytest.raises(ValueError, match="auth_headers"):
                 await verify_providers(prod_settings, check_auth=True)
@@ -788,9 +817,7 @@ async def test_audit_replay_handles_disabled_user_and_failed_prebackup_tombstone
         from mem_ai.modules.operations.audit import DeletionAuditEvent
         from mem_ai.modules.users import service as users_service
 
-        user = await users_service.resolve_or_create_user(
-            sf, issuer=_PROD_ISSUER, subject="disabled-replay-user"
-        )
+        user = await create_builtin_user(sf, email="disabled-replay@example.com")
         await users_service.set_user_status(sf, user_id=user.id, status="disabled")
 
         # Seed a pre-backup failed tombstone + failed op for `mem_failed_before_t0`
@@ -848,7 +875,7 @@ async def test_v1_public_contract_end_to_end_acceptance(
     migrated_pg_settings: Settings,
     tmp_path: Path,
 ) -> None:
-    """Exercise all V1 public API contracts end-to-end under production JWT & Host rules."""
+    """Exercise V1 public APIs with built-in authentication and production Host rules."""
     prod_settings = _production_settings(
         migrated_pg_settings,
         archive_path=tmp_path / "v1-audit.jsonl",
@@ -868,7 +895,8 @@ async def test_v1_public_contract_end_to_end_acceptance(
         async with httpx.AsyncClient(
             transport=transport, base_url=f"http://{_PROD_HOST}"
         ) as client:
-            headers = _auth_header("v1-acceptance-user")
+            registered = await register_builtin_user(client, email="acceptance@example.com")
+            headers = registered.headers
 
             # 1. Health & models
             assert (await client.get("/health/live")).status_code == 200
@@ -877,7 +905,7 @@ async def test_v1_public_contract_end_to_end_acceptance(
             assert models_resp.status_code == 200
             assert models_resp.json()["data"]["items"][0]["modelId"] == "gpt-4o-mini"
 
-            # 2. User identity
+            # 2. Built-in user profile
             me_resp = await client.get("/v1/users/me", headers=headers)
             assert me_resp.status_code == 200
 

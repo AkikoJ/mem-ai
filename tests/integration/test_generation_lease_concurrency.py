@@ -28,6 +28,7 @@ from mem_ai.modules.conversations.service import ChatOptions
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
 from mem_ai.modules.users import service as users_service
+from tests.conftest import create_builtin_user
 
 
 class _GatedByMessageModelProvider:
@@ -65,13 +66,9 @@ class _GatedByMessageModelProvider:
 async def _seed_user_model_and_agent(
     session_factory,  # type: ignore[no-untyped-def]
     *,
-    subject: str,
+    email: str,
 ) -> tuple[UUID, UUID]:
-    user = await users_service.resolve_or_create_user(
-        session_factory,
-        issuer="https://test.mem-ai.local",
-        subject=subject,
-    )
+    user = await create_builtin_user(session_factory, email=email)
     await models_service.sync_model_configs(
         session_factory,
         seeds=[
@@ -89,7 +86,7 @@ async def _seed_user_model_and_agent(
         owner_id=user.id,
         data=AgentCreateRequest.model_validate(
             {
-                "name": f"Lease Agent {subject}",
+                "name": f"Lease Agent {email}",
                 "systemPrompt": "Be concise.",
                 "defaultModelId": "gpt-4o-mini",
             }
@@ -116,7 +113,7 @@ async def test_concurrent_same_conversation_conflicts_while_different_conversati
     try:
         alice_id, agent_id = await _seed_user_model_and_agent(
             sf_primary,
-            subject="alice-lease-conflict",
+            email="alice-lease-conflict@example.com",
         )
         provider = _GatedByMessageModelProvider(gated_prompts={"pause-conv-a"})
 
@@ -227,7 +224,7 @@ async def test_lease_renewal_commit_and_failure_enforce_token_expiry_user_and_co
     try:
         alice_id, agent_id = await _seed_user_model_and_agent(
             session_factory,
-            subject="alice-lease-guards",
+            email="alice-lease-guards@example.com",
         )
         persona = await agents_service.get_latest_published_version_for_owner(
             session_factory, owner_id=alice_id, agent_id=agent_id
@@ -461,7 +458,7 @@ async def test_expired_lease_inline_takeover_and_worker_fallback_recovery(
     try:
         alice_id, agent_id = await _seed_user_model_and_agent(
             session_factory,
-            subject="alice-lease-recovery",
+            email="alice-lease-recovery@example.com",
         )
         persona = await agents_service.get_latest_published_version_for_owner(
             session_factory, owner_id=alice_id, agent_id=agent_id
@@ -616,7 +613,7 @@ async def test_lease_renewal_heartbeat_keeps_slow_generation_alive_and_handles_r
     try:
         alice_id, agent_id = await _seed_user_model_and_agent(
             session_factory,
-            subject="alice-lease-heartbeat",
+            email="alice-lease-heartbeat@example.com",
         )
         provider = _GatedByMessageModelProvider(
             gated_prompts={

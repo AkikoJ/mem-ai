@@ -21,7 +21,6 @@ from mem_ai.contracts.memory_provider import (
 )
 from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import GatewayTimeoutError
-from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
 from mem_ai.modules.conversations import generation as generation_store
 from mem_ai.modules.conversations.queries import list_recalled_memories_for_message_for_owner
 from mem_ai.modules.models import service as models_service
@@ -29,7 +28,7 @@ from mem_ai.modules.models.schemas import ModelConfigSeed
 from mem_ai.modules.users import service as users_service
 from mem_ai.workers.assembly import build_worker_registry
 from mem_ai.workers.runner import WorkerConfig, WorkerRunner
-from tests.conftest import FakeMemoryProvider, FakeModelProvider
+from tests.conftest import BuiltinUsers, FakeMemoryProvider, FakeModelProvider
 
 
 class _ScriptedDeletionMemoryProvider(FakeMemoryProvider):
@@ -91,7 +90,7 @@ class _ScriptedDeletionMemoryProvider(FakeMemoryProvider):
 @pytest.mark.anyio
 async def test_single_delete_and_clear_http_contracts_204_202_404_409_422_and_audit(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
+    builtin_users: BuiltinUsers,
     tmp_path: Path,
 ) -> None:
     audit_path = tmp_path / "api-deletion-audit.jsonl"
@@ -106,10 +105,9 @@ async def test_single_delete_and_clear_http_contracts_204_202_404_409_422_and_au
             model_provider=model_provider,
             memory_provider=memory_provider,
         ),
-        credential_verifier=test_auth_adapter,
     )
-    alice_headers = {"Authorization": "Bearer token-alice"}
-    bob_headers = {"Authorization": "Bearer token-bob"}
+    alice_headers = builtin_users.alice.headers
+    bob_headers = builtin_users.bob.headers
 
     async with app.router.lifespan_context(app):
         await models_service.sync_model_configs(

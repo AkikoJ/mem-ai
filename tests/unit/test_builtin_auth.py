@@ -118,7 +118,7 @@ def test_access_token_rejects_wrong_secret_alg_issuer_and_type() -> None:
         )
 
 
-@pytest.mark.parametrize("exp", [None, True, "soon", float("nan")])
+@pytest.mark.parametrize("exp", [None, True, "soon", float("nan"), float("inf")])
 def test_access_token_rejects_invalid_exp(exp: object) -> None:
     payload = _payload()
     if exp is None:
@@ -127,6 +127,18 @@ def test_access_token_rejects_invalid_exp(exp: object) -> None:
         payload["exp"] = exp
     with pytest.raises(UnauthorizedError):
         tokens.verify_access_token(sign_hs256_jwt(payload, secret=SECRET), secret=SECRET)
+
+
+@pytest.mark.parametrize(
+    "claim,value",
+    [("sub", None), ("sub", "x" * 256), ("sid", "invalid-session"), ("email", 123)],
+)
+def test_access_token_rejects_malformed_identity_claims(claim: str, value: object) -> None:
+    with pytest.raises(UnauthorizedError) as exc_info:
+        tokens.verify_access_token(
+            sign_hs256_jwt(_payload(**{claim: value}), secret=SECRET), secret=SECRET
+        )
+    assert exc_info.value.code == "invalid_credentials"
 
 
 def test_access_token_expired_and_malformed() -> None:

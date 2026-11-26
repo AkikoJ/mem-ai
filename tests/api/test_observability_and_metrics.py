@@ -23,13 +23,12 @@ from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import BadGatewayError
 from mem_ai.core.logging import JsonLogFormatter
 from mem_ai.core.telemetry import InMemoryTracer, TelemetryRegistry
-from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
 from mem_ai.modules.conversations import generation as conversations_generation
 from mem_ai.modules.conversations.models import Generation
 from mem_ai.modules.jobs import service as jobs_service
 from mem_ai.modules.jobs.schemas import JobExecutionContext, JobHandlerOutcome
 from mem_ai.workers.runner import JobHandlerRegistry, WorkerConfig, WorkerRunner
-from tests.conftest import FakeMemoryProvider, FakeModelProvider, parse_sse_text
+from tests.conftest import BuiltinUsers, FakeMemoryProvider, FakeModelProvider, parse_sse_text
 
 
 def _with_client_ip(app: ASGIApp, client_ip: str) -> ASGIApp:
@@ -91,7 +90,7 @@ async def test_metrics_endpoint_access_control_by_network_token_and_toggle() -> 
 @pytest.mark.anyio
 async def test_metrics_logs_and_tracing_cover_chat_sse_degradation_lease_jobs_and_barriers(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     class _DegradingMemoryProvider(FakeMemoryProvider):
         def __init__(self) -> None:
@@ -125,7 +124,6 @@ async def test_metrics_logs_and_tracing_cover_chat_sse_degradation_lease_jobs_an
             model_provider=FakeModelProvider(),
             memory_provider=memory_provider,
         ),
-        credential_verifier=test_auth_adapter,
         telemetry=telemetry,
         tracer=tracer,
     )
@@ -137,7 +135,7 @@ async def test_metrics_logs_and_tracing_cover_chat_sse_degradation_lease_jobs_an
     root_logger.addHandler(log_handler)
     root_logger.setLevel(logging.INFO)
 
-    headers = {"Authorization": "Bearer token-alice"}
+    headers = builtin_users.alice.headers
     secret_user_text = "PRIVATE_DIARY_CONTENT_SHOULD_NEVER_LOG_98765"
 
     try:
@@ -296,7 +294,7 @@ async def test_metrics_logs_and_tracing_cover_chat_sse_degradation_lease_jobs_an
                 # Business IDs MUST NOT appear anywhere in Prometheus metrics exposition
                 assert conv_id not in text
                 assert gen_id not in text
-                assert "token-alice" not in text
+                assert builtin_users.alice.access_token not in text
                 assert secret_user_text not in text
     finally:
         root_logger.removeHandler(log_handler)
@@ -305,7 +303,7 @@ async def test_metrics_logs_and_tracing_cover_chat_sse_degradation_lease_jobs_an
     # and NEVER leak message body or Bearer token.
     raw_logs = log_buffer.getvalue()
     assert secret_user_text not in raw_logs
-    assert "token-alice" not in raw_logs
+    assert builtin_users.alice.access_token not in raw_logs
     entries = [json.loads(line) for line in raw_logs.splitlines() if line.strip()]
     sync_entries = [e for e in entries if e.get("request_id") == "req_obs_sync"]
     assert any(

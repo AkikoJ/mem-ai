@@ -31,7 +31,6 @@ def test_model_config_seed_strips_fields_and_rejects_blank_or_secret_keys() -> N
             "provider_id": " openai_compatible ",
             "upstream_model": " vendor-gpt-4o-mini ",
             "display_name": " GPT-4o Mini ",
-            "required_permission": " models:standard ",
             "credential_ref": " OPENAI_COMPAT_API_KEY ",
             "capabilities_json": {"json_mode": True},
         }
@@ -40,7 +39,6 @@ def test_model_config_seed_strips_fields_and_rejects_blank_or_secret_keys() -> N
     assert seed.provider_id == "openai_compatible"
     assert seed.resolved_upstream_model() == "vendor-gpt-4o-mini"
     assert seed.resolved_display_name() == "GPT-4o Mini"
-    assert seed.required_permission == "models:standard"
     assert seed.credential_ref == "OPENAI_COMPAT_API_KEY"
 
     with pytest.raises(ValidationError):
@@ -68,7 +66,6 @@ def test_model_item_response_exposes_only_public_identifiers_and_capabilities() 
         supports_streaming=True,
         max_context_tokens=128000,
         max_output_tokens=8192,
-        required_permission="models:pro",
         credential_ref="SECRET_ENV_OPENAI_PRO_KEY",
         capabilities_json={"json_mode": True, "reasoning": True},
         created_at=now,
@@ -95,9 +92,6 @@ def test_model_item_response_exposes_only_public_identifiers_and_capabilities() 
         "credential_ref",
         "credentialRef",
         "SECRET_ENV_OPENAI_PRO_KEY",
-        "required_permission",
-        "requiredPermission",
-        "models:pro",
     ):
         assert forbidden not in serialized
 
@@ -140,7 +134,6 @@ def test_sync_loader_reads_settings_and_json_file_and_errors_when_missing(tmp_pa
                     {
                         "model_id": "batch-only",
                         "supports_streaming": False,
-                        "required_permission": "models:batch",
                     },
                 ]
             }
@@ -150,7 +143,6 @@ def test_sync_loader_reads_settings_and_json_file_and_errors_when_missing(tmp_pa
     seeds = load_model_seeds_from_file(config_path)
     assert [seed.model_id for seed in seeds] == ["gpt-4o-mini", "batch-only"]
     assert seeds[1].supports_streaming is False
-    assert seeds[1].required_permission == "models:batch"
 
     empty_file = tmp_path / "empty.json"
     empty_file.write_text("[]", encoding="utf-8")

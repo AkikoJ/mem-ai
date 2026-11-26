@@ -19,12 +19,10 @@ from mem_ai.contracts.model_provider import (
 )
 from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import BadGatewayError
-from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
 from mem_ai.modules.conversations import generation as generation_store
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
-from tests.api.test_builtin_auth import _bearer, _register
-from tests.conftest import make_test_principal
+from tests.conftest import BuiltinUsers
 
 
 class _RecordingModelProvider:
@@ -80,20 +78,9 @@ async def _create_published_agent(
 @pytest.mark.integration
 @pytest.mark.anyio
 async def test_models_endpoint_lists_all_enabled_models_equally_and_hides_server_secrets(
+    builtin_users: BuiltinUsers,
     migrated_pg_settings: Settings,
 ) -> None:
-    auth_adapter = StaticTokenAuthAdapter(
-        {
-            "token-standard": make_test_principal(
-                "standard-user",
-                permissions=("chat:use", "agents:manage", "users:self"),
-            ),
-            "token-pro": make_test_principal(
-                "pro-user",
-                permissions=("chat:use", "agents:manage", "users:self", "models:pro"),
-            ),
-        }
-    )
     settings = migrated_pg_settings.model_copy(
         update={
             "model_registry_entries": [
@@ -118,7 +105,6 @@ async def test_models_endpoint_lists_all_enabled_models_equally_and_hides_server
                     "supports_streaming": True,
                     "max_context_tokens": 256000,
                     "max_output_tokens": 16384,
-                    "required_permission": "models:pro",
                     "credential_ref": "ENV_OPENAI_PRO_SECRET",
                     "capabilities_json": {"json_mode": True, "reasoning": True},
                 },
@@ -147,7 +133,6 @@ async def test_models_endpoint_lists_all_enabled_models_equally_and_hides_server
     app = create_app(
         settings,
         providers=ProviderRegistry(model_provider=_RecordingModelProvider()),
-        credential_verifier=auth_adapter,
     )
 
     async with app.router.lifespan_context(app):
@@ -157,10 +142,10 @@ async def test_models_endpoint_lists_all_enabled_models_equally_and_hides_server
             unauth = await client.get("/v1/models")
             assert unauth.status_code == 401
 
-            # 2. Every active user sees all enabled models, including legacy permission-tagged ones.
+            # 2. Every active user sees all enabled models, for both registered users.
             std_resp = await client.get(
                 "/v1/models",
-                headers={"Authorization": "Bearer token-standard"},
+                headers=builtin_users.alice.headers,
             )
             assert std_resp.status_code == 200
             std_body = std_resp.json()
@@ -173,10 +158,10 @@ async def test_models_endpoint_lists_all_enabled_models_equally_and_hides_server
                 "gpt-4o-pro",
             ]
 
-            # 3. Existing permission claims do not change the enabled model list.
+            # 3. Another registered user sees the same enabled model list.
             pro_resp = await client.get(
                 "/v1/models",
-                headers={"Authorization": "Bearer token-pro"},
+                headers=builtin_users.bob.headers,
             )
             assert pro_resp.status_code == 200
             pro_items = pro_resp.json()["data"]["items"]
@@ -189,7 +174,7 @@ async def test_models_endpoint_lists_all_enabled_models_equally_and_hides_server
             # 4. Streaming capability query filter uses the same capability metadata.
             stream_resp = await client.get(
                 "/v1/models?supportsStreaming=true",
-                headers={"Authorization": "Bearer token-pro"},
+                headers=builtin_users.bob.headers,
             )
             assert stream_resp.status_code == 200
             assert [item["modelId"] for item in stream_resp.json()["data"]["items"]] == [
@@ -197,7 +182,7 @@ async def test_models_endpoint_lists_all_enabled_models_equally_and_hides_server
                 "gpt-4o-pro",
             ]
 
-            # 5. Internal provider/upstream/credential/permission fields are never exposed.
+            # 5. Internal provider/upstream/credential fields are never exposed.
             raw_json = json.dumps(pro_resp.json())
             for secret_or_internal in (
                 "providerId",
@@ -211,16 +196,14 @@ async def test_models_endpoint_lists_all_enabled_models_equally_and_hides_server
                 "credential_ref",
                 "ENV_OPENAI_MINI_SECRET",
                 "ENV_OPENAI_PRO_SECRET",
-                "requiredPermission",
-                "required_permission",
-                "models:pro",
             ):
                 assert secret_or_internal not in raw_json
 
 
 @pytest.mark.integration
 @pytest.mark.anyio
-async def test_builtin_users_share_enabled_models_and_select_legacy_permission_model(
+async def test_builtin_users_share_enabled_models_and_select_requested_model(
+    builtin_users: BuiltinUsers,
     migrated_pg_settings: Settings,
 ) -> None:
     settings = migrated_pg_settings.model_copy(
@@ -232,7 +215,6 @@ async def test_builtin_users_share_enabled_models_and_select_legacy_permission_m
                     "model_id": "pro",
                     "upstream_model": "vendor-pro",
                     "enabled": True,
-                    "required_permission": "models:pro",
                 },
                 {"model_id": "disabled", "enabled": False},
             ],
@@ -244,10 +226,8 @@ async def test_builtin_users_share_enabled_models_and_select_legacy_permission_m
         app.router.lifespan_context(app),
         httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
     ):
-        alice = await _register(client, "models-alice@example.com")
-        bob = await _register(client, "models-bob@example.com")
-        alice_headers = _bearer(alice["tokens"])
-        for headers in (alice_headers, _bearer(bob["tokens"])):
+        alice_headers = builtin_users.alice.headers
+        for headers in (alice_headers, builtin_users.bob.headers):
             response = await client.get("/v1/models", headers=headers)
             assert response.status_code == 200, response.text
             assert [item["modelId"] for item in response.json()["data"]["items"]] == [
@@ -280,20 +260,9 @@ async def test_builtin_users_share_enabled_models_and_select_legacy_permission_m
 @pytest.mark.integration
 @pytest.mark.anyio
 async def test_chat_model_override_disabled_pinned_default_failure_recording_and_schema_guard(
+    builtin_users: BuiltinUsers,
     migrated_pg_settings: Settings,
 ) -> None:
-    auth_adapter = StaticTokenAuthAdapter(
-        {
-            "token-standard": make_test_principal(
-                "standard-chat",
-                permissions=("chat:use", "agents:manage", "users:self"),
-            ),
-            "token-pro": make_test_principal(
-                "pro-chat",
-                permissions=(),
-            ),
-        }
-    )
     provider = _RecordingModelProvider()
     settings = migrated_pg_settings.model_copy(
         update={
@@ -317,7 +286,6 @@ async def test_chat_model_override_disabled_pinned_default_failure_recording_and
                     "upstream_model": "vendor-pro",
                     "display_name": "Pro",
                     "enabled": True,
-                    "required_permission": "models:pro",
                 },
                 {
                     "model_id": "gpt-disabled",
@@ -331,10 +299,9 @@ async def test_chat_model_override_disabled_pinned_default_failure_recording_and
     app = create_app(
         settings,
         providers=ProviderRegistry(model_provider=provider),
-        credential_verifier=auth_adapter,
     )
-    std_headers = {"Authorization": "Bearer token-standard"}
-    pro_headers = {"Authorization": "Bearer token-pro"}
+    std_headers = builtin_users.alice.headers
+    pro_headers = builtin_users.bob.headers
 
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
@@ -385,7 +352,7 @@ async def test_chat_model_override_disabled_pinned_default_failure_recording_and
                 assert rejected.json()["code"] == expected_code
             assert len(provider.requests) == 0
 
-            # 3. A user with no permission claims can select every enabled model.
+            # 3. Every active user can select every enabled model.
             pro_agent = await _create_published_agent(
                 client,
                 headers=pro_headers,
@@ -517,14 +484,10 @@ async def test_chat_model_override_disabled_pinned_default_failure_recording_and
 @pytest.mark.integration
 @pytest.mark.anyio
 async def test_server_forced_policy_takes_precedence_over_request_and_agent_default(
+    builtin_users: BuiltinUsers,
     migrated_pg_settings: Settings,
 ) -> None:
-    auth_adapter = StaticTokenAuthAdapter(
-        {
-            "token-alice": make_test_principal("alice-forced"),
-        }
-    )
-    alice_headers = {"Authorization": "Bearer token-alice"}
+    alice_headers = builtin_users.alice.headers
 
     provider = _RecordingModelProvider()
     forced_settings = migrated_pg_settings.model_copy(
@@ -551,7 +514,6 @@ async def test_server_forced_policy_takes_precedence_over_request_and_agent_defa
     app_forced = create_app(
         forced_settings,
         providers=ProviderRegistry(model_provider=provider),
-        credential_verifier=auth_adapter,
     )
 
     async with app_forced.router.lifespan_context(app_forced):
@@ -588,14 +550,10 @@ async def test_server_forced_policy_takes_precedence_over_request_and_agent_defa
 @pytest.mark.integration
 @pytest.mark.anyio
 async def test_missing_server_model_config_returns_503_before_upstream_call(
+    builtin_users: BuiltinUsers,
     migrated_pg_settings: Settings,
 ) -> None:
-    auth_adapter = StaticTokenAuthAdapter(
-        {
-            "token-alice": make_test_principal("alice-missing-cfg"),
-        }
-    )
-    alice_headers = {"Authorization": "Bearer token-alice"}
+    alice_headers = builtin_users.alice.headers
 
     empty_provider = _RecordingModelProvider()
     missing_cfg_settings = migrated_pg_settings.model_copy(
@@ -608,7 +566,6 @@ async def test_missing_server_model_config_returns_503_before_upstream_call(
     app_missing = create_app(
         missing_cfg_settings,
         providers=ProviderRegistry(model_provider=empty_provider),
-        credential_verifier=auth_adapter,
     )
     async with app_missing.router.lifespan_context(app_missing):
         transport = httpx.ASGITransport(app=app_missing)

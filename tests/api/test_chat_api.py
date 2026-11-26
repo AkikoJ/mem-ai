@@ -21,12 +21,11 @@ from mem_ai.contracts.model_provider import (
 )
 from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import BadGatewayError
-from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
 from mem_ai.modules.conversations import generation as generation_store
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.adapters.openai_compatible import OpenAICompatibleModelProvider
 from mem_ai.modules.models.schemas import ModelConfigSeed
-from tests.conftest import FakeMemoryProvider
+from tests.conftest import BuiltinUsers, FakeMemoryProvider
 
 
 class _ScriptedModelProvider:
@@ -124,7 +123,7 @@ async def _create_and_publish_agent(
 @pytest.mark.anyio
 async def test_chat_start_continue_pinned_persona_rejections_and_isolation(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
+    builtin_users: BuiltinUsers,
     fake_memory_provider: FakeMemoryProvider,
 ) -> None:
     model_provider = _ScriptedModelProvider()
@@ -134,10 +133,9 @@ async def test_chat_start_continue_pinned_persona_rejections_and_isolation(
             model_provider=model_provider,
             memory_provider=fake_memory_provider,
         ),
-        credential_verifier=test_auth_adapter,
     )
-    alice_headers = {"Authorization": "Bearer token-alice"}
-    bob_headers = {"Authorization": "Bearer token-bob"}
+    alice_headers = builtin_users.alice.headers
+    bob_headers = builtin_users.bob.headers
 
     async with app.router.lifespan_context(app):
         await models_service.sync_model_configs(
@@ -400,15 +398,14 @@ async def test_chat_start_continue_pinned_persona_rejections_and_isolation(
 @pytest.mark.anyio
 async def test_sync_chat_disconnect_does_not_abort_in_flight_model_commit(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     gate_provider = _GateModelProvider()
     app = create_app(
         migrated_pg_settings,
         providers=ProviderRegistry(model_provider=gate_provider),
-        credential_verifier=test_auth_adapter,
     )
-    alice_headers = {"Authorization": "Bearer token-alice"}
+    alice_headers = builtin_users.alice.headers
 
     async with app.router.lifespan_context(app):
         await models_service.sync_model_configs(
@@ -485,7 +482,7 @@ async def test_sync_chat_disconnect_does_not_abort_in_flight_model_commit(
 @pytest.mark.anyio
 async def test_chat_end_to_end_with_openai_compatible_adapter_and_startup_model_sync(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     def upstream_handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8"))
@@ -540,9 +537,8 @@ async def test_chat_end_to_end_with_openai_compatible_adapter_and_startup_model_
     app = create_app(
         configured_settings,
         providers=ProviderRegistry(model_provider=adapter),
-        credential_verifier=test_auth_adapter,
     )
-    alice_headers = {"Authorization": "Bearer token-alice"}
+    alice_headers = builtin_users.alice.headers
 
     try:
         async with app.router.lifespan_context(app):

@@ -23,7 +23,6 @@ from mem_ai.contracts.memory_provider import (
     MemoryWriteResult,
 )
 from mem_ai.core.config import Settings
-from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
 from mem_ai.modules.auth.models import AuthSession
 from mem_ai.modules.conversations import service as conversations_service
 from mem_ai.modules.conversations.schemas import PreparedGeneration
@@ -40,9 +39,7 @@ from mem_ai.workers.runner import JobHandlerRegistry, WorkerConfig, WorkerRunner
 from tests.api.test_builtin_auth import PASSWORD, _bearer, _login, _register
 from tests.api.test_chat_idempotency_and_generations_api import _ControllableModelProvider
 from tests.api.test_conversations_api import GatedMemoryProvider
-
-ALICE = {"Authorization": "Bearer token-alice"}
-BOB = {"Authorization": "Bearer token-bob"}
+from tests.conftest import BuiltinUsers, register_builtin_user
 
 
 class DeletionMemoryProvider(GatedMemoryProvider):
@@ -117,6 +114,7 @@ class UserDeletionHarness:
     memory: DeletionMemoryProvider
     model: _ControllableModelProvider
     settings: Settings
+    users: BuiltinUsers
     audit_archiver: _RecordingAuditArchiver = field(default_factory=_RecordingAuditArchiver)
     clock_time: datetime | None = None
 
@@ -193,7 +191,7 @@ class UserDeletionHarness:
 
 @pytest.fixture
 async def deletion_harness(
-    migrated_pg_settings: Settings, test_auth_adapter: StaticTokenAuthAdapter
+    migrated_pg_settings: Settings, builtin_users: BuiltinUsers
 ) -> AsyncIterator[UserDeletionHarness]:
     memory = DeletionMemoryProvider()
     model = _ControllableModelProvider()
@@ -201,7 +199,6 @@ async def deletion_harness(
     app = create_app(
         migrated_pg_settings,
         providers=ProviderRegistry(model_provider=model, memory_provider=memory),
-        credential_verifier=test_auth_adapter,
     )
     async with app.router.lifespan_context(app):
         app.state.deletion_audit_archiver = audit_archiver
@@ -226,19 +223,22 @@ async def deletion_harness(
                 memory,
                 model,
                 migrated_pg_settings,
+                builtin_users,
                 audit_archiver,
             )
 
 
-async def create_agent(harness: UserDeletionHarness, headers: dict[str, str] = ALICE) -> str:
+async def create_agent(harness: UserDeletionHarness, headers: dict[str, str] | None = None) -> str:
     response = await harness.client.post(
         "/v1/agents",
-        headers=headers,
+        headers=headers or harness.users.alice.headers,
         json={"name": "Deletion", "systemPrompt": "Be helpful", "defaultModelId": "test-model"},
     )
     assert response.status_code == 201, response.text
     agent_id: str = response.json()["data"]["agentId"]
-    published = await harness.client.post(f"/v1/agents/{agent_id}/publish", headers=headers)
+    published = await harness.client.post(
+        f"/v1/agents/{agent_id}/publish", headers=headers or harness.users.alice.headers
+    )
     assert published.status_code == 200, published.text
     return agent_id
 
@@ -248,12 +248,12 @@ async def chat(
     agent_id: str,
     key: str,
     *,
-    headers: dict[str, str] = ALICE,
+    headers: dict[str, str] | None = None,
     conversation_id: str | None = None,
 ) -> dict[str, Any]:
     response = await harness.client.post(
         "/v1/chat",
-        headers={**headers, "Idempotency-Key": key},
+        headers={**(headers or harness.users.alice.headers), "Idempotency-Key": key},
         json={"agentId": agent_id, "message": key, "conversationId": conversation_id},
     )
     assert response.status_code == 200, response.text
@@ -265,12 +265,12 @@ async def create_memory(
     harness: UserDeletionHarness,
     content: str,
     *,
-    headers: dict[str, str] = ALICE,
+    headers: dict[str, str] | None = None,
     conversation_id: str | None = None,
 ) -> str:
     response = await harness.client.post(
         "/v1/memories",
-        headers=headers,
+        headers=headers or harness.users.alice.headers,
         json={
             "content": content,
             "scope": "conversation" if conversation_id else "user",
@@ -283,7 +283,7 @@ async def create_memory(
 
 
 async def accept_deletion(harness: UserDeletionHarness) -> dict[str, Any]:
-    response = await harness.client.delete("/v1/users/me", headers=ALICE)
+    response = await harness.client.delete("/v1/users/me", headers=harness.users.alice.headers)
     assert response.status_code == 202, response.text
     data: dict[str, Any] = response.json()["data"]
     return data
@@ -293,7 +293,7 @@ async def resource_counts(harness: UserDeletionHarness, owner_id: UUID) -> dict[
     """Observe the agreed PostgreSQL cleanup contract, including indirectly owned rows."""
     query = text(
         "SELECT 'users', count(*) FROM users WHERE id = :owner "
-        "UNION ALL SELECT 'identities', count(*) FROM user_identities WHERE user_id = :owner "
+        "UNION ALL SELECT 'sessions', count(*) FROM auth_sessions WHERE user_id = :owner "
         "UNION ALL SELECT 'agents', count(*) FROM agents WHERE owner_id = :owner "
         "UNION ALL SELECT 'versions', count(*) FROM persona_versions WHERE agent_id IN "
         "(SELECT id FROM agents WHERE owner_id = :owner) "
@@ -393,15 +393,24 @@ async def test_builtin_email_stays_reserved_until_remote_and_local_cleanup_finis
 
 @pytest.mark.integration
 @pytest.mark.anyio
-async def test_deletes_complete_resource_graph_retains_receipt_and_recreates_identity(
+async def test_deletes_complete_resource_graph_retains_receipt_and_reregisters_email(
     deletion_harness: UserDeletionHarness,
 ) -> None:
     harness = deletion_harness
     alice_id = UUID(
-        (await harness.client.get("/v1/users/me", headers=ALICE)).json()["data"]["userId"]
+        (await harness.client.get("/v1/users/me", headers=harness.users.alice.headers)).json()[
+            "data"
+        ]["userId"]
     )
-    bob_id = UUID((await harness.client.get("/v1/users/me", headers=BOB)).json()["data"]["userId"])
-    alice_agent, bob_agent = await create_agent(harness), await create_agent(harness, BOB)
+    bob_id = UUID(
+        (await harness.client.get("/v1/users/me", headers=harness.users.bob.headers)).json()[
+            "data"
+        ]["userId"]
+    )
+    alice_agent, bob_agent = (
+        await create_agent(harness),
+        await create_agent(harness, harness.users.bob.headers),
+    )
     await create_memory(harness, "Alice user memory")
     alice_turn = await chat(harness, alice_agent, "Alice remembered turn")
     cid = alice_turn["conversationId"]
@@ -409,11 +418,15 @@ async def test_deletes_complete_resource_graph_retains_receipt_and_recreates_ide
         harness, "Alice conversation memory", conversation_id=cid
     )
     await chat(harness, alice_agent, "Alice recalls both scopes", conversation_id=cid)
-    bob_memory = await create_memory(harness, "Bob retained memory", headers=BOB)
-    bob_turn = await chat(harness, bob_agent, "Bob retained conversation", headers=BOB)
+    bob_memory = await create_memory(
+        harness, "Bob retained memory", headers=harness.users.bob.headers
+    )
+    bob_turn = await chat(
+        harness, bob_agent, "Bob retained conversation", headers=harness.users.bob.headers
+    )
     harness.memory.defer_delete = True
     deleted_memory = await harness.client.delete(
-        f"/v1/memories/{conversation_memory}", headers=ALICE
+        f"/v1/memories/{conversation_memory}", headers=harness.users.alice.headers
     )
     assert deleted_memory.status_code == 202, deleted_memory.text
     old_operation = deleted_memory.json()["data"]["operationId"]
@@ -432,9 +445,11 @@ async def test_deletes_complete_resource_graph_retains_receipt_and_recreates_ide
     bob_before = await resource_counts(harness, bob_id)
 
     accepted = await accept_deletion(harness)
-    assert (await harness.client.get("/v1/users/me", headers=ALICE)).status_code == 403
+    assert (
+        await harness.client.get("/v1/users/me", headers=harness.users.alice.headers)
+    ).status_code == 403
     during = await resource_counts(harness, alice_id)
-    assert during["users"] == during["identities"] == 1
+    assert during["users"] == during["sessions"] == 1
     operation = await harness.finish(accepted)
     assert operation["progress"]["local_complete"] is True
     assert operation["progress"]["remote_complete"] is True
@@ -445,7 +460,7 @@ async def test_deletes_complete_resource_graph_retains_receipt_and_recreates_ide
     bob_after = await resource_counts(harness, bob_id)
     assert all(bob_after[name] == bob_before[name] for name in bob_before if name != "jobs")
     history = await harness.client.get(
-        f"/v1/conversations/{bob_turn['conversationId']}", headers=BOB
+        f"/v1/conversations/{bob_turn['conversationId']}", headers=harness.users.bob.headers
     )
     assert history.status_code == 200
     async with harness.sessions() as session:
@@ -473,9 +488,11 @@ async def test_deletes_complete_resource_graph_retains_receipt_and_recreates_ide
             )
             == 0
         )
-    recreated = await harness.client.get("/v1/users/me", headers=ALICE)
-    assert recreated.status_code == 200
-    assert UUID(recreated.json()["data"]["userId"]) != alice_id
+    stale = await harness.client.get("/v1/users/me", headers=harness.users.alice.headers)
+    assert stale.status_code == 403
+    recreated = await register_builtin_user(harness.client, email=harness.users.alice.email)
+    assert recreated.user_id != alice_id
+    assert (await harness.client.get("/v1/users/me", headers=recreated.headers)).status_code == 200
     assert (await harness.operation(accepted))["status"] == "succeeded"
     user_delete_events = [
         event
@@ -500,11 +517,15 @@ async def test_waits_for_live_memory_write_and_clears_its_late_remote_record(
 ) -> None:
     harness = deletion_harness
     user_id = UUID(
-        (await harness.client.get("/v1/users/me", headers=ALICE)).json()["data"]["userId"]
+        (await harness.client.get("/v1/users/me", headers=harness.users.alice.headers)).json()[
+            "data"
+        ]["userId"]
     )
     pending = asyncio.create_task(
         harness.client.post(
-            "/v1/memories", headers=ALICE, json={"content": "gated", "scope": "user"}
+            "/v1/memories",
+            headers=harness.users.alice.headers,
+            json={"content": "gated", "scope": "user"},
         )
     )
     await asyncio.wait_for(harness.memory.started.wait(), timeout=5)
@@ -519,7 +540,7 @@ async def test_waits_for_live_memory_write_and_clears_its_late_remote_record(
         assert operation["progress"]["remote_complete"] is False
         assert harness.memory.clear_calls == []
         counts = await resource_counts(harness, user_id)
-        assert counts["users"] == counts["identities"] == 1
+        assert counts["users"] == counts["sessions"] == 1
     finally:
         harness.memory.release.set()
     response = await asyncio.wait_for(pending, timeout=5)
@@ -543,7 +564,10 @@ async def test_waits_for_live_generation_and_rejects_its_final_commit(
     pending = asyncio.create_task(
         harness.client.post(
             "/v1/chat",
-            headers={**ALICE, "Idempotency-Key": "Generation crossing user deletion"},
+            headers={
+                **harness.users.alice.headers,
+                "Idempotency-Key": "Generation crossing user deletion",
+            },
             json={
                 "agentId": agent_id,
                 "conversationId": turn["conversationId"],
@@ -572,7 +596,12 @@ async def test_waits_for_live_generation_and_rejects_its_final_commit(
                 )
                 == 1
             )
-            assert await session.scalar(text("SELECT count(*) FROM user_identities")) == 1
+            assert (
+                await session.scalar(
+                    text("SELECT count(*) FROM auth_sessions WHERE revoked_at IS NOT NULL")
+                )
+                == 1
+            )
     finally:
         release.set()
     response = await asyncio.wait_for(pending, timeout=5)
@@ -586,12 +615,14 @@ async def test_waits_for_live_generation_and_rejects_its_final_commit(
 @pytest.mark.parametrize(
     "error_code", ["memory_provider_auth_error", "memory_provider_unavailable"]
 )
-async def test_remote_failure_retains_identity_and_resumes_after_controlled_retry(
+async def test_remote_failure_retains_email_and_resumes_after_controlled_retry(
     deletion_harness: UserDeletionHarness, error_code: str
 ) -> None:
     harness = deletion_harness
     user_id = UUID(
-        (await harness.client.get("/v1/users/me", headers=ALICE)).json()["data"]["userId"]
+        (await harness.client.get("/v1/users/me", headers=harness.users.alice.headers)).json()[
+            "data"
+        ]["userId"]
     )
     agent_id = await create_agent(harness)
     await chat(harness, agent_id, "Local data cleared even when remote fails")
@@ -644,7 +675,7 @@ async def test_remote_failure_retains_identity_and_resumes_after_controlled_retr
     assert len(harness.memory.clear_calls) == stopped_calls
     assert memory_id in harness.memory.records
     retained = await resource_counts(harness, user_id)
-    assert retained["users"] == retained["identities"] == 1
+    assert retained["users"] == retained["sessions"] == 1
     assert retained["conversations"] == 0 and retained["agents"] == 0
     assert retained["snapshots"] == 0
     assert retained["scopes"] >= 1 and retained["operations"] >= 2
@@ -666,7 +697,9 @@ async def test_remote_failure_retains_identity_and_resumes_after_controlled_retr
         )
     assert parent_next_run is not None
     assert (parent_next_run - stalled_check_at).total_seconds() >= 59.0
-    assert (await harness.client.get("/v1/users/me", headers=ALICE)).status_code == 403
+    assert (
+        await harness.client.get("/v1/users/me", headers=harness.users.alice.headers)
+    ).status_code == 403
 
     harness.memory.clear_error_code = None
     await jobs_service.requeue_failed_job(
@@ -688,12 +721,16 @@ async def test_partial_remote_clear_and_batched_finalization_survive_worker_rest
 ) -> None:
     harness = deletion_harness
     user_id = UUID(
-        (await harness.client.get("/v1/users/me", headers=ALICE)).json()["data"]["userId"]
+        (await harness.client.get("/v1/users/me", headers=harness.users.alice.headers)).json()[
+            "data"
+        ]["userId"]
     )
     memories = [await create_memory(harness, f"Partial clear record {index}") for index in range(3)]
     harness.memory.defer_delete = True
     for memory_id in memories:
-        response = await harness.client.delete(f"/v1/memories/{memory_id}", headers=ALICE)
+        response = await harness.client.delete(
+            f"/v1/memories/{memory_id}", headers=harness.users.alice.headers
+        )
         assert response.status_code == 202, response.text
     harness.memory.defer_delete = False
     harness.memory.defer_clear = True
@@ -707,7 +744,7 @@ async def test_partial_remote_clear_and_batched_finalization_survive_worker_rest
     assert pending["progress"]["remote_complete"] is False
     assert len(harness.memory.clear_calls) == 1
     assert any(record.user_id == user_id for record in harness.memory.records.values())
-    assert (await resource_counts(harness, user_id))["identities"] == 1
+    assert (await resource_counts(harness, user_id))["sessions"] == 1
     async with harness.sessions() as session:
         assert (
             await session.scalar(
@@ -728,7 +765,7 @@ async def test_partial_remote_clear_and_batched_finalization_survive_worker_rest
         if operation["progress"].get("phase") == "finalizing_identity":
             saw_batched_finalization = True
             counts = await resource_counts(harness, user_id)
-            assert counts["users"] == counts["identities"] == 1
+            assert counts["users"] == counts["sessions"] == 1
             assert counts["operations"] > 1
         if operation["status"] == "succeeded":
             break
@@ -748,10 +785,14 @@ async def test_completed_ordinary_clear_is_not_reused_for_user_deletion(
 ) -> None:
     harness = deletion_harness
     user_id = UUID(
-        (await harness.client.get("/v1/users/me", headers=ALICE)).json()["data"]["userId"]
+        (await harness.client.get("/v1/users/me", headers=harness.users.alice.headers)).json()[
+            "data"
+        ]["userId"]
     )
     await create_memory(harness, "Before ordinary clear")
-    cleared = await harness.client.delete("/v1/memories?confirm=true", headers=ALICE)
+    cleared = await harness.client.delete(
+        "/v1/memories?confirm=true", headers=harness.users.alice.headers
+    )
     assert cleared.status_code == 204, cleared.text
     async with harness.sessions() as session:
         previous_clear = await session.scalar(
@@ -793,12 +834,14 @@ async def test_unknown_write_pages_retain_timeout_and_require_delayed_compensati
     harness.memory.unknown_writes = True
     harness.memory.late_record_after_first_clear = True
     user_id = UUID(
-        (await harness.client.get("/v1/users/me", headers=ALICE)).json()["data"]["userId"]
+        (await harness.client.get("/v1/users/me", headers=harness.users.alice.headers)).json()[
+            "data"
+        ]["userId"]
     )
     for index in range(51):
         response = await harness.client.post(
             "/v1/memories",
-            headers=ALICE,
+            headers=harness.users.alice.headers,
             json={"content": f"Unknown write {index}", "scope": "user"},
         )
         assert response.status_code == 202, response.text
@@ -854,7 +897,7 @@ async def test_unknown_write_pages_retain_timeout_and_require_delayed_compensati
     assert (await harness.operation(accepted))["progress"]["remote_complete"] is False
     await harness.run(harness.worker(job_types=selected), now=now + timedelta(seconds=123))
     assert harness.memory.clear_calls == [user_id]
-    assert (await resource_counts(harness, user_id))["identities"] == 1
+    assert (await resource_counts(harness, user_id))["sessions"] == 1
     assert (
         await harness.finish(
             accepted, worker=harness.worker(job_types=selected), now=now + timedelta(minutes=3)
@@ -873,7 +916,9 @@ async def test_expired_generation_is_recovered_before_user_cleanup_finishes(
     harness = deletion_harness
     agent_id = await create_agent(harness)
     user_id = UUID(
-        (await harness.client.get("/v1/users/me", headers=ALICE)).json()["data"]["userId"]
+        (await harness.client.get("/v1/users/me", headers=harness.users.alice.headers)).json()[
+            "data"
+        ]["userId"]
     )
     prepared = await conversations_service.prepare_chat_turn(
         harness.sessions,
@@ -922,12 +967,14 @@ async def test_explicit_write_confirmed_mid_deletion_does_not_trigger_false_time
     harness = deletion_harness
     harness.memory.supports_write_status_verification = False
     user_id = UUID(
-        (await harness.client.get("/v1/users/me", headers=ALICE)).json()["data"]["userId"]
+        (await harness.client.get("/v1/users/me", headers=harness.users.alice.headers)).json()[
+            "data"
+        ]["userId"]
     )
     pending_write = asyncio.create_task(
         harness.client.post(
             "/v1/memories",
-            headers=ALICE,
+            headers=harness.users.alice.headers,
             json={"content": "gated", "scope": "user"},
         )
     )
@@ -969,7 +1016,9 @@ async def test_superseded_conversation_delete_waits_for_remote_confirmation_and_
 ) -> None:
     harness = deletion_harness
     user_id = UUID(
-        (await harness.client.get("/v1/users/me", headers=ALICE)).json()["data"]["userId"]
+        (await harness.client.get("/v1/users/me", headers=harness.users.alice.headers)).json()[
+            "data"
+        ]["userId"]
     )
     agent_id = await create_agent(harness)
     turn = await chat(harness, agent_id, "Conversation joining user deletion")
@@ -983,7 +1032,9 @@ async def test_superseded_conversation_delete_waits_for_remote_confirmation_and_
         records=[record for record in harness.memory.records.values() if record.user_id == user_id],
         limit=1,
     )
-    conv_delete = await harness.client.delete(f"/v1/conversations/{conversation_id}", headers=ALICE)
+    conv_delete = await harness.client.delete(
+        f"/v1/conversations/{conversation_id}", headers=harness.users.alice.headers
+    )
     assert conv_delete.status_code == 202, conv_delete.text
     conv_op_id = UUID(conv_delete.json()["data"]["operationId"])
 
@@ -1012,7 +1063,7 @@ async def test_superseded_conversation_delete_waits_for_remote_confirmation_and_
     assert retained["conversations"] == 0
     assert retained["agents"] == 0
     assert retained["snapshots"] == 0
-    assert retained["users"] == retained["identities"] == 1
+    assert retained["users"] == retained["sessions"] == 1
     assert retained["scopes"] >= 1
     assert conv_memory in harness.memory.records
 

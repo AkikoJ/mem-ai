@@ -24,7 +24,7 @@ from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelRoutingPolicy
 from mem_ai.modules.models.sync import main as sync_cli_main
 from mem_ai.modules.models.sync import run_sync_models
-from mem_ai.modules.users import service as users_service
+from tests.conftest import create_builtin_user
 
 
 @pytest.mark.integration
@@ -175,7 +175,6 @@ async def test_model_routing_precedence_capabilities_and_shared_streaming_gate(
                     "display_name": "Pro",
                     "enabled": True,
                     "supports_streaming": True,
-                    "required_permission": "models:pro",
                     "capabilities_json": {"json_mode": True, "reasoning": True},
                 },
                 {
@@ -200,7 +199,7 @@ async def test_model_routing_precedence_capabilities_and_shared_streaming_gate(
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
     try:
-        # 1. Discovery uses enabled/capability/forced rules, including legacy permission rows.
+        # 1. Discovery uses enabled/capability/forced rules, without per-user filtering.
         visible = await models_service.list_available_models(session_factory)
         assert [m.model_id for m in visible] == ["model-batch", "model-pro", "model-standard"]
 
@@ -338,11 +337,7 @@ async def test_model_routing_precedence_capabilities_and_shared_streaming_gate(
         assert no_reasoning.value.details["missing_capabilities"] == ["reasoning"]
 
         # 5. Shared `prepare_generation` enforces streaming capability BEFORE creating a generation.
-        alice = await users_service.resolve_or_create_user(
-            session_factory,
-            issuer="https://test.mem-ai.local",
-            subject="alice-stream-cap",
-        )
+        alice = await create_builtin_user(session_factory, email="alice-stream-cap@example.com")
         agent = await agents_service.create_agent(
             session_factory,
             owner_id=alice.id,

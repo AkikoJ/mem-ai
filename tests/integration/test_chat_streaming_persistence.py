@@ -38,8 +38,7 @@ from mem_ai.modules.conversations.service import ChatOptions
 from mem_ai.modules.jobs.models import Job
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
-from mem_ai.modules.users import service as users_service
-from tests.conftest import FakeMemoryProvider, parse_sse_text
+from tests.conftest import FakeMemoryProvider, create_builtin_user, parse_sse_text
 
 
 class _ScriptedStreamingModelProvider:
@@ -72,11 +71,7 @@ class _ScriptedStreamingModelProvider:
 async def _seed_user_agent_and_model(
     session_factory: Any,
 ) -> tuple[Any, Any]:
-    user = await users_service.resolve_or_create_user(
-        session_factory,
-        issuer="https://test.mem-ai.local",
-        subject="stream-alice",
-    )
+    user = await create_builtin_user(session_factory, email="stream-alice@example.com")
     await models_service.sync_model_configs(
         session_factory,
         seeds=[

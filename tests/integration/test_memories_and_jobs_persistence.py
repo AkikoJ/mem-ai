@@ -28,7 +28,7 @@ from mem_ai.modules.memories import service as memories_service
 from mem_ai.modules.memories.schemas import AcceptedMemoryOutcome, CreatedMemoryOutcome
 from mem_ai.modules.memories.snapshots import MemoryListScopeKey, MemorySnapshotStore
 from mem_ai.modules.operations import service as operations_service
-from mem_ai.modules.users import service as users_service
+from tests.conftest import create_builtin_user
 
 
 class _ControlledMemoryProvider:
@@ -84,16 +84,8 @@ async def test_explicit_create_persists_sync_job_for_succeeded_accepted_and_reco
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
     try:
-        alice = await users_service.resolve_active_user(
-            session_factory,
-            issuer="https://test.mem-ai.local",
-            subject="alice-mem-persist",
-        )
-        bob = await users_service.resolve_active_user(
-            session_factory,
-            issuer="https://test.mem-ai.local",
-            subject="bob-mem-persist",
-        )
+        alice = await create_builtin_user(session_factory, email="alice-mem-persist@example.com")
+        bob = await create_builtin_user(session_factory, email="bob-mem-persist@example.com")
 
         # 1. Sync single-ID confirmation persists a succeeded job with business_id & metadata.
         sync_provider = _ControlledMemoryProvider(
@@ -212,11 +204,7 @@ async def test_memory_scope_clearing_barrier_blocks_pre_call_and_reconciles_mid_
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
     try:
-        alice = await users_service.resolve_active_user(
-            session_factory,
-            issuer="https://test.mem-ai.local",
-            subject="alice-barrier",
-        )
+        alice = await create_builtin_user(session_factory, email="alice-barrier@example.com")
 
         # 1. Mid-flight clear started while external provider call is running -> reconciling 202.
         async def mid_flight_clear(item: MemoryWriteInput) -> MemoryWriteResult:
@@ -347,16 +335,8 @@ async def test_memory_list_snapshot_store_cross_replica_expiry_and_owner(
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
     try:
-        alice = await users_service.resolve_active_user(
-            session_factory,
-            issuer="https://test.mem-ai.local",
-            subject="alice-snap",
-        )
-        bob = await users_service.resolve_active_user(
-            session_factory,
-            issuer="https://test.mem-ai.local",
-            subject="bob-snap",
-        )
+        alice = await create_builtin_user(session_factory, email="alice-snap@example.com")
+        bob = await create_builtin_user(session_factory, email="bob-snap@example.com")
 
         base_time = datetime(2026, 11, 21, 10, 0, 0, tzinfo=UTC)
         records = [

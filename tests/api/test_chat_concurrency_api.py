@@ -21,11 +21,11 @@ from mem_ai.contracts.model_provider import (
 )
 from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import BadGatewayError
-from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
 from mem_ai.modules.conversations import generation as generation_store
 from mem_ai.modules.conversations.models import Generation
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
+from tests.conftest import BuiltinUsers
 
 
 class _ControllableChatModelProvider:
@@ -91,7 +91,7 @@ async def _create_published_agent(
 @pytest.mark.anyio
 async def test_chat_api_rejects_overlapping_generation_allows_parallel_and_recovers_expired_lease(
     migrated_pg_settings: Settings,
-    test_auth_adapter: StaticTokenAuthAdapter,
+    builtin_users: BuiltinUsers,
 ) -> None:
     provider = _ControllableChatModelProvider()
     settings = migrated_pg_settings.model_copy(
@@ -104,9 +104,8 @@ async def test_chat_api_rejects_overlapping_generation_allows_parallel_and_recov
     app = create_app(
         settings,
         providers=ProviderRegistry(model_provider=provider),
-        credential_verifier=test_auth_adapter,
     )
-    alice_headers = {"Authorization": "Bearer token-alice"}
+    alice_headers = builtin_users.alice.headers
 
     async with app.router.lifespan_context(app):
         await models_service.sync_model_configs(

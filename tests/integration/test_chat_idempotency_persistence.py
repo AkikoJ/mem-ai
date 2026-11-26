@@ -35,8 +35,8 @@ from mem_ai.modules.conversations.schemas import (
 )
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
-from mem_ai.modules.users import service as users_service
 from mem_ai.modules.users.models import User
+from tests.conftest import create_builtin_user
 
 
 class _StubModelProvider:
@@ -61,19 +61,15 @@ class _StubModelProvider:
 async def _seed_user_and_agent(
     session_factory: async_sessionmaker[AsyncSession],
     *,
-    subject: str,
+    email: str,
     model_id: str = "gpt-4o-mini",
 ) -> tuple[UUID, UUID]:
-    user = await users_service.resolve_or_create_user(
-        session_factory,
-        issuer="https://test.mem-ai.local",
-        subject=subject,
-    )
+    user = await create_builtin_user(session_factory, email=email)
     agent = await agents_service.create_agent(
         session_factory,
         owner_id=user.id,
         data=AgentCreateRequest(
-            name=f"Agent {subject}",
+            name=f"Agent {email}",
             systemPrompt="Helpful assistant.",
             defaultModelId=model_id,
         ),
@@ -107,7 +103,9 @@ async def test_same_key_concurrent_implicit_and_existing_conversation_creates_si
 
     try:
         await _seed_model(session_factory)
-        alice_id, agent_id = await _seed_user_and_agent(session_factory, subject="alice-conc-idem")
+        alice_id, agent_id = await _seed_user_and_agent(
+            session_factory, email="alice-conc-idem@example.com"
+        )
 
         # 1. Concurrent same-key requests with omitted conversationId:
         #    exactly one PreparedGeneration and one ChatAcceptedResult pointing to the SAME IDs.
@@ -245,7 +243,9 @@ async def test_idempotency_finalization_across_success_failure_cancel_and_lease_
 
     try:
         await _seed_model(session_factory)
-        alice_id, agent_id = await _seed_user_and_agent(session_factory, subject="alice-term")
+        alice_id, agent_id = await _seed_user_and_agent(
+            session_factory, email="alice-term@example.com"
+        )
 
         # 1. Active running record has NULL terminal_at & expires_at and never expires at t0 + 48h.
         p1 = await conversations_service.prepare_chat_turn(
@@ -433,8 +433,10 @@ async def test_idempotency_cross_user_isolation_check_constraints_and_deleted_re
 
     try:
         await _seed_model(session_factory)
-        alice_id, alice_agent = await _seed_user_and_agent(session_factory, subject="alice-iso")
-        bob_id, bob_agent = await _seed_user_and_agent(session_factory, subject="bob-iso")
+        alice_id, alice_agent = await _seed_user_and_agent(
+            session_factory, email="alice-iso@example.com"
+        )
+        bob_id, bob_agent = await _seed_user_and_agent(session_factory, email="bob-iso@example.com")
 
         # Same Idempotency-Key across different users is completely independent.
         alice_res = await conversations_service.run_sync_chat(

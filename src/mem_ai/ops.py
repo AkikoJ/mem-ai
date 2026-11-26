@@ -33,6 +33,7 @@ from mem_ai.modules.auth.adapters import (
     StaticTokenAuthAdapter,
     build_credential_verifier,
 )
+from mem_ai.modules.auth.tokens import BUILTIN_JWT_ISSUER, try_peek_jwt_issuer, verify_access_token
 from mem_ai.modules.conversations import cleanup as conversation_cleanup
 from mem_ai.modules.conversations import queries as conversation_queries
 from mem_ai.modules.conversations.queries import DatabaseRecalledMemoryReferenceMarker
@@ -334,17 +335,33 @@ async def verify_providers(
     memory_reconcile_ok: bool | None = None
 
     if check_auth:
-        verifier = build_credential_verifier(settings)
-        if settings.app_env == "production" and isinstance(
-            verifier, (DevelopmentAuthAdapter, StaticTokenAuthAdapter)
-        ):
-            raise ValueError("development/static auth adapter is forbidden in production")
         if auth_headers is None:
             raise ValueError("auth_headers (--bearer-token) is required when --check-auth is set")
-        principal = await verifier.verify(
-            AuthRequest(headers=auth_headers, client_host=client_host)
-        )
-        auth_ok = bool(principal.issuer and principal.subject)
+        auth_request = AuthRequest(headers=auth_headers, client_host=client_host)
+        authorization = auth_request.get_single_header("Authorization") or ""
+        parts = authorization.strip().split(None, 1)
+        if (
+            len(parts) == 2
+            and parts[0].lower() == "bearer"
+            and try_peek_jwt_issuer(parts[1].strip()) == BUILTIN_JWT_ISSUER
+        ):
+            if session_factory is None:
+                raise ValueError("session_factory is required to verify a built-in user")
+            claims = verify_access_token(
+                parts[1].strip(),
+                secret=settings.auth_jwt_secret.get_secret_value().strip(),
+                leeway_seconds=settings.auth_jwt_leeway_seconds,
+            )
+            await users_service.get_active_user(session_factory, user_id=claims.user_id)
+            auth_ok = True
+        else:
+            verifier = build_credential_verifier(settings)
+            if settings.app_env == "production" and isinstance(
+                verifier, (DevelopmentAuthAdapter, StaticTokenAuthAdapter)
+            ):
+                raise ValueError("development/static auth adapter is forbidden in production")
+            principal = await verifier.verify(auth_request)
+            auth_ok = bool(principal.issuer and principal.subject)
 
     owned_http = http_client is None
     client = http_client if http_client is not None else create_http_client(settings)

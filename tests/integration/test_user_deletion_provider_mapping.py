@@ -1,4 +1,4 @@
-"""Historical provider outages retain user identity and durable deletion mappings."""
+"""Historical provider outages retain user email and durable deletion mappings."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from sqlalchemy import text
 from mem_ai.modules.memories import service as memories_service
 from mem_ai.modules.memories.schemas import CreatedMemoryOutcome
 from tests.integration.test_user_deletion import (
-    ALICE,
     DeletionMemoryProvider,
     UserDeletionHarness,
     accept_deletion,
@@ -21,12 +20,14 @@ from tests.integration.test_user_deletion import deletion_harness as deletion_ha
 
 @pytest.mark.integration
 @pytest.mark.anyio
-async def test_missing_historical_provider_retains_identity_scope_and_operation_mapping(
+async def test_missing_historical_provider_retains_email_scope_and_operation_mapping(
     deletion_harness: UserDeletionHarness,
 ) -> None:
     harness = deletion_harness
     user_id = UUID(
-        (await harness.client.get("/v1/users/me", headers=ALICE)).json()["data"]["userId"]
+        (await harness.client.get("/v1/users/me", headers=harness.users.alice.headers)).json()[
+            "data"
+        ]["userId"]
     )
     historical = DeletionMemoryProvider()
     historical.provider_id = "retired-memory-provider"
@@ -64,7 +65,9 @@ async def test_missing_historical_provider_retains_identity_scope_and_operation_
     assert operation["status"] == "reconciling"
     assert operation["progress"]["phase"] == "provider_unavailable"
     assert operation["error"]["code"] == "memory_provider_mismatch"
-    assert (await harness.client.get("/v1/users/me", headers=ALICE)).status_code == 403
+    assert (
+        await harness.client.get("/v1/users/me", headers=harness.users.alice.headers)
+    ).status_code == 403
     assert created.record.memory_id in historical.records
     assert historical.clear_calls == []
     assert harness.memory.clear_calls == [user_id]
@@ -78,7 +81,10 @@ async def test_missing_historical_provider_retains_identity_scope_and_operation_
         )
         assert (
             await session.scalar(
-                text("SELECT count(*) FROM user_identities WHERE user_id = :owner"),
+                text(
+                    "SELECT count(*) FROM auth_sessions "
+                    "WHERE user_id = :owner AND revoked_at IS NOT NULL"
+                ),
                 {"owner": user_id},
             )
             == 1
