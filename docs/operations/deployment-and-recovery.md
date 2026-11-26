@@ -1,50 +1,53 @@
 # Mem-AI 生产部署、迁移与恢复运行手册
 
-本手册面向 Mem-AI V1 生产与验收环境，覆盖容器构建、API 与 Worker 独立运行、连接预算校验、Expand/Migrate/Contract 数据库发布、两种分层备份恢复基线（独立删除审计归档重放与 PostgreSQL PITR）、密钥注入与轮换、TLS/反向代理与入口限流配置、故障处置，以及有限权限提供方接入核验。
+本手册面向 Mem-AI V2 生产与验收环境，覆盖容器构建、统一单进程后端运行、连接预算校验、Expand/Migrate/Contract 数据库发布、两种分层备份恢复基线（独立删除审计归档重放与 PostgreSQL PITR）、密钥注入与轮换、TLS/反向代理与入口限流配置、故障处置，以及有限权限提供方接入核验。
 
-相关工程契约见 [后端工程设计](../backend-scaffold-design.md)、[总体设计](../../DESIGN.md) 与 [ADR-0005](../adr/0005-memory-epochs-and-deletion-barriers.md)。
+相关工程契约见 [后端工程设计](../backend-scaffold-design.md)、[总体设计](../../DESIGN.md)、[ADR-0007](../adr/0007-unified-single-process-backend.md) 与 [ADR-0005](../adr/0005-memory-epochs-and-deletion-barriers.md)。
 
 ---
 
-## 1. 部署拓扑与独立进程运行
+## 1. 部署拓扑与统一单进程运行
 
-API 与 Worker 使用同一多阶段容器镜像（[`Dockerfile`](../../Dockerfile)、[`.dockerignore`](../../.dockerignore)），以非 root 用户 `memai` 运行，依赖由 [`uv.lock`](../../uv.lock) 锁定。两者必须作为**独立进程/工作负载**部署、扩缩和停机。
+Mem-AI 后端服务采用**统一单进程架构**，将 HTTP/SSE 请求处理与持久后台任务执行内嵌到同一 Python 进程中，使用同一多阶段容器镜像（[`Dockerfile`](../../Dockerfile)、[`.dockerignore`](../../.dockerignore)），以非 root 用户 `memai` 运行，依赖由 [`uv.lock`](../../uv.lock) 锁定。横向扩展时部署多个同构单进程副本，通过 PostgreSQL 行锁跳过领取（`FOR UPDATE SKIP LOCKED`）与周期窗口去重安全并发消费后台任务。
 
 ### 1.1 镜像构建与验证
 
 ```bash
-docker build -t mem-ai:v1 .
+docker build -t mem-ai:v2 .
 ```
 
 ### 1.2 进程启动入口
 
 | 角色 | 启动命令 | 暴露端口与探针 |
 | --- | --- | --- |
-| API 服务 | `uvicorn mem_ai.main:app --host 0.0.0.0 --port 8000` | `GET /health/live`、`GET /health/ready`、受控 `GET /metrics` |
-| 后台 Worker | `python -m mem_ai.workers.main` | 可选独立探针端口 `WORKER_METRICS_PORT`（`/health/live`、`/health/ready`、`/metrics`）及原子心跳文件 `WORKER_HEARTBEAT_FILE` |
+| 统一后端服务 | `uvicorn mem_ai.main:app --host 0.0.0.0 --port 8000` | `GET /health/live`、`GET /health/ready`、受控 `GET /metrics`；可选原子心跳文件 `WORKER_HEARTBEAT_FILE` |
 | 单执行者迁移 | `alembic upgrade head && alembic check` | 发布前单实例 Job 执行 |
 | 模型配置同步 | `python -m mem_ai.modules.models.sync` | 启动自动同步（`MODEL_SYNC_ON_STARTUP=true`）或发布 Job 显式幂等同步 |
 | 运维与恢复 CLI | `python -m mem_ai.ops <subcommand>` | `check-budget` / `inspect-health` / `replay-audit` / `requeue-job` / `verify-providers` |
 
 ### 1.3 优雅停机与恢复语义
 
-- **API**：收到 `SIGTERM` 后将 `app.state.ready` 置为 `false`（`/health/ready` 返回 `503` 通知负载均衡摘流），等待在途请求及已进入模型调用的同步生成屏蔽任务（`SyncGenerationTaskRegistry`）安全收敛，再关闭 HTTP 客户端与数据库连接池。
-- **Worker**：收到 `SIGTERM`/`SIGINT` 后停止领取新任务，在 `WORKER_SHUTDOWN_GRACE_SECONDS`（默认 15s）内等待在途处理器提交结果；未能在宽限期内完成的任务随租约到期由其他健康 Worker 接管恢复，并自动触发 `generation_lease_recovery` 周期任务收敛进程崩溃遗留的过期生成。
+统一后端服务收到 `SIGTERM` 后按序执行以下步骤：
+
+1. 将 `app.state.ready` 置为 `false`（`/health/ready` 返回 `503` 通知负载均衡摘流）。
+2. 停止内嵌后台任务执行器领取新任务。
+3. 在 `WORKER_SHUTDOWN_GRACE_SECONDS`（默认 15s）宽限期内，并行排空在途 HTTP 请求、已进入模型调用的同步生成任务（`SyncGenerationTaskRegistry`）及在途后台任务处理器。
+4. 未能在宽限期内完成的后台任务保留可恢复 `running` 租约状态，随租约到期由其他健康副本接管恢复，并自动触发 `generation_lease_recovery` 周期任务收敛崩溃遗留的过期生成。
+5. 关闭共享 HTTP 客户端与数据库连接池。
 
 ### 1.4 PostgreSQL 连接总预算校验
 
-每个 API 进程和 Worker 进程的最大连接数为 `DB_POOL_SIZE + DB_MAX_OVERFLOW`。总连接预算公式为：
+每个统一后端服务副本的最大连接数为 `DB_POOL_SIZE + DB_MAX_OVERFLOW`。总连接预算公式为：
 
-$$\text{total\_required} = (\text{api\_replicas} + \text{worker\_replicas}) \times (\text{DB\_POOL\_SIZE} + \text{DB\_MAX\_OVERFLOW}) + \text{reserved\_connections}$$
+$$\text{total\_required} = \text{replicas} \times (\text{DB\_POOL\_SIZE} + \text{DB\_MAX\_OVERFLOW}) + \text{reserved\_connections}$$
 
-其中 `reserved_connections` 至少预留 10 个连接给 Alembic 迁移、备份工具和运维诊断；同时每个 Worker 进程池上限须满足 `DB_POOL_SIZE + DB_MAX_OVERFLOW >= WORKER_CONCURRENCY + 1`。
+其中 `reserved_connections` 至少预留 10 个连接给 Alembic 迁移、备份工具和运维诊断；当内嵌后台任务执行器启用（`WORKER_LOOP_ENABLED=true`，默认）时，单进程池上限须满足 `DB_POOL_SIZE + DB_MAX_OVERFLOW >= MAX_CONCURRENT_REQUESTS + MAX_CONCURRENT_GENERATIONS + WORKER_CONCURRENCY + 1`。
 
-部署或扩缩前执行强制校验（超预算或 Worker 池不足时退出码为 `1`）：
+部署或扩缩前执行强制校验（超预算或池不足时退出码为 `1`）：
 
 ```bash
 uv run python -m mem_ai.ops check-budget \
-  --api-replicas 4 \
-  --worker-replicas 2 \
+  --replicas 4 \
   --reserved-connections 10 \
   --postgres-max-connections 100
 ```
@@ -65,15 +68,15 @@ uv run python -m mem_ai.ops check-budget \
    uv run python -m mem_ai.modules.models.sync
    ```
 3. **滚动升级兼容**：
-   - 在新旧版本共存窗口内，为正在运行的旧版 API/Worker 设置 `COMPATIBLE_ALEMBIC_REVISIONS`（如 `["20261123_0011","20261124_0012"]`），确保 `/health/ready` 在迁移升级完成后仍保持就绪。
-   - 滚动发布新版 API 与 Worker，等待 `/health/ready` 返回 `200` 且 `migration_revision` 匹配目标版本。
+   - 在新旧版本共存窗口内，为正在运行的旧版服务实例设置 `COMPATIBLE_ALEMBIC_REVISIONS`（如 `["20261123_0011","20261124_0012"]`），确保 `/health/ready` 在迁移升级完成后仍保持就绪。
+   - 滚动发布新版服务实例，等待 `/health/ready` 返回 `200` 且 `migration_revision` 匹配目标版本。
 4. **Migrate / Backfill 阶段**：通过可恢复的分批后台任务或幂等脚本完成数据回填，核对数据完整性。
 5. **Contract 阶段**：待全部旧副本下线并稳定观察后，在后续独立发布中移除已废弃旧列或旧约束。
 
 ### 2.2 发布失败处置：前向修复与兼容应用回滚
 
 - **优先前向修复（Forward-fix）**：若迁移已提交但新版存在缺陷，优先发布修复补丁或通过新增前向迁移修正，避免对生产库执行破坏性 `alembic downgrade`。
-- **兼容应用回滚**：因为 Expand 阶段对旧版保持结构兼容，可直接将 API 与 Worker 镜像回滚至上一稳定版本（配置 `COMPATIBLE_ALEMBIC_REVISIONS` 包含当前数据库 head 版本），验证 `/health/ready` 与关键业务接口恢复正常。
+- **兼容应用回滚**：因为 Expand 阶段对旧版保持结构兼容，可直接将服务镜像回滚至上一稳定版本（配置 `COMPATIBLE_ALEMBIC_REVISIONS` 包含当前数据库 head 版本），验证 `/health/ready` 与关键业务接口恢复正常。
 - **数据库恢复为独立操作**：仅在发生严重数据损坏或不可逆误操作时触发第 3 节的独立数据库恢复流程，绝不将数据库回档混入普通应用回滚动作。
 
 ---
@@ -88,7 +91,7 @@ uv run python -m mem_ai.ops check-budget \
 | --- | --- |
 | 事故指挥（IC） | 批准恢复目标时间点 $T_0$、评估可接受数据损失与窗口、签发停写与恢复放行 |
 | DBA / 发布执行者 | 执行备份校验、主库或目标库物理/逻辑恢复、验证 `alembic_version` 与数据完整性 |
-| 应用 / Worker 运维 | 暂停入口写入与停止 Worker、执行删除审计重放、重启 Worker 收敛后恢复 API 流量 |
+| 应用运维 | 暂停入口写入与缩容服务副本至 0、执行删除审计重放、重启服务副本收敛后恢复流量 |
 | 验收人 | 抽检恢复后健康状态、屏障/任务收敛、删除主体隔离与 V1 核心读写回归 |
 
 每次演练或恢复必须填写下表并归档：
@@ -101,9 +104,9 @@ uv run python -m mem_ai.ops check-budget \
 | 目标 RPO / 实测 RPO | 基线 A：数据同快照/WAL，删除与代次 RPO = 0（归档实时 `fsync`）；基线 B：取决于 WAL 归档频率 |
 | 目标 RTO / 实测 RTO | 如目标 <= 30 分钟，记录实际耗时 |
 | 检查点 1（备份可读性） | `pg_restore -l` 或 `pg_verifybackup` 通过 |
-| 检查点 2（写入与 Worker 冻结） | API 切维护/拒绝写流量，所有 Worker 副本数降为 0 |
+| 检查点 2（写入与任务冻结） | 入口切维护/拒绝写流量，所有服务副本数降为 0 |
 | 检查点 3（恢复与重放结果） | `alembic_version` 核对、`replay-audit` 干跑与执行 JSON 输出留存 |
-| 检查点 4（恢复后验证） | `inspect-health` 无异常告警、Worker 收敛全部重放任务、API `/health/ready` 200 |
+| 检查点 4（恢复后验证） | `inspect-health` 无异常告警、服务副本收敛全部重放任务、`/health/ready` 200 |
 
 ### 3.2 迁移前备份与可读性校验
 
@@ -132,7 +135,7 @@ psql -U "$POSTGRES_USER" -d postgres -c "DROP DATABASE mem_ai_restore_drill WITH
 
 **标准恢复步骤：**
 
-1. **暂停写入与停止 Worker**：在入口网关停止业务写入流量，将 API 与 Worker 副本数缩至 `0`（防止旧任务抢先执行导致记忆复活）。
+1. **暂停写入与缩容服务副本**：在入口网关停止业务写入流量，将服务副本数缩至 `0`（防止旧任务抢先执行导致记忆复活）。
 2. **恢复主库备份至时间点 $T_0$**：使用经过校验的备份快照将 PostgreSQL 恢复到 $T_0$，核对 `alembic_version`。
 3. **干跑预览审计重放计划**：
    ```bash
@@ -153,7 +156,7 @@ psql -U "$POSTGRES_USER" -d postgres -c "DROP DATABASE mem_ai_restore_drill WITH
    - `conversation_delete`：立即将存活会话置为 `deleting` 并入队 `conversation_delete` 任务；
    - `memory_clear` / `memory_epoch_advanced`：提升 `memory_scopes.epoch` 至归档代次、安装 `clearing` 屏障、**立即取消恢复库中所有旧代次排队记忆写入任务**并入队 `memory_clear` 远程清空任务；
    - `memory_delete`：立即写入 `memory_tombstones`（即刻拦截召回）、标记历史引用并入队 `memory_delete` 任务。
-5. **先启动 Worker 收敛外部副作用与清理任务**：启动独立 Worker 进程，通过 `inspect-health` 观察所有重放删除任务收敛且 `barriers_clearing == 0`、`jobs_failed == 0`：
+5. **先启动服务副本收敛外部副作用与清理任务**：启动服务副本（内嵌后台任务执行器自动运行），通过 `inspect-health` 观察所有重放删除任务收敛且 `barriers_clearing == 0`、`jobs_failed == 0`：
    ```bash
    uv run python -m mem_ai.ops inspect-health
    ```
@@ -163,12 +166,12 @@ psql -U "$POSTGRES_USER" -d postgres -c "DROP DATABASE mem_ai_restore_drill WITH
 
 当部署未启用外部独立删除审计归档时，仅以 PostgreSQL 基础备份 + WAL 归档的时间点恢复（PITR）作为恢复手段：
 
-1. 暂停 API 写入与所有 Worker 实例。
+1. 暂停入口写入与将所有服务副本数缩至 0。
 2. 恢复最近的 `pg_basebackup` 基础备份，在 `postgresql.auto.conf` 配置 `restore_command` 与 `recovery_target_time = '<T0>'`（及 `recovery_target_action = 'promote'`），创建 `recovery.signal` 启动 PostgreSQL 完成 WAL 重放。
-3. 核对 `alembic_version` 与关键表完整性后，先启动 Worker 核验 `reconciling` / 过期租约任务，再恢复 API。
+3. 核对 `alembic_version` 与关键表完整性后，先启动服务副本核验 `reconciling` / 过期租约任务收敛，再恢复入口流量。
 4. **显式一致性边界与风险声明**：
    - 若 WAL 归档连续且完整，RPO 接近最后一个已归档 WAL 段（通常数秒至数分钟）。
-   - **若 WAL 归档发生丢失或被迫回档至早于某次删除受理的 $T_0$**：主库内部表（`operations`、`memory_scopes`、`memory_tombstones`）会一并回退，**系统无法自动获知 $T_0$ 之后的删除与代次递增记录**，恢复库中遗留的旧代次排队写入任务存在再次写入外部记忆提供方的风险。此时必须在启动 Worker 前由运维手动核查外部工单/审计日志，通过 SQL 取消可疑旧写入任务并手动重新触发对应用户的清空/删除操作，或升级启用基线 A 的独立删除审计归档。
+   - **若 WAL 归档发生丢失或被迫回档至早于某次删除受理的 $T_0$**：主库内部表（`operations`、`memory_scopes`、`memory_tombstones`）会一并回退，**系统无法自动获知 $T_0$ 之后的删除与代次递增记录**，恢复库中遗留的旧代次排队写入任务存在再次写入外部记忆提供方的风险。此时必须在启动服务副本前由运维手动核查外部工单/审计日志，通过 SQL 取消可疑旧写入任务并手动重新触发对应用户的清空/删除操作，或升级启用基线 A 的独立删除审计归档。
 
 ---
 
@@ -183,9 +186,9 @@ psql -U "$POSTGRES_USER" -d postgres -c "DROP DATABASE mem_ai_restore_drill WITH
 
 | 密钥 | 轮换步骤 | 影响与注意事项 |
 | --- | --- | --- |
-| `OPENAI_COMPAT_API_KEY` / `MEMOS_API_KEY` | 上游签发新 Key -> 更新 Secret -> 滚动重启 API 与 Worker -> 观察请求正常后吊销旧 Key | 零停机；旧 Key 在全部副本滚动完成后吊销 |
+| `OPENAI_COMPAT_API_KEY` / `MEMOS_API_KEY` | 上游签发新 Key -> 更新 Secret -> 滚动重启服务副本 -> 观察请求正常后吊销旧 Key | 零停机；旧 Key 在全部副本滚动完成后吊销 |
 | `METRICS_BEARER_TOKEN` | 先向采集端配置新 Token 或短暂双配置 -> 更新应用 Secret 滚动重启 -> 确认抓取成功 | 仅影响内部监控抓取出入，不影响业务流量 |
-| `POSTGRES_PASSWORD` | 推荐新建过渡 DB 角色或分阶段切密 -> 更新 Secret 滚动重启 API 与 Worker -> 清理旧凭据 | 滚动期间保留连接预算余量 |
+| `POSTGRES_PASSWORD` | 推荐新建过渡 DB 角色或分阶段切密 -> 更新 Secret 滚动重启服务副本 -> 清理旧凭据 | 滚动期间保留连接预算余量 |
 | `AUTH_JWT_HS256_SECRET` / `AUTH_GATEWAY_SHARED_SECRET` | 与上游 IdP/网关协同窗口切换；若需零中断，建议在网关层或 IdP 侧做短暂双签过渡 | 切换瞬间未更新的旧令牌将返回 `401` |
 | `DELETION_RECEIPT_SECRET` | 仅在密钥泄漏或定期计划窗口轮换；保持密钥在 `DELETION_RECEIPT_TTL_SECONDS`（默认 30 天）内稳定 | **注意**：轮换会使所有未到期的既有用户删除回执立即失效；若仅需作废单个回执，应走单条回执撤销时间（`deletion_receipt_revoked_at`）而非全局轮换 |
 
@@ -278,7 +281,7 @@ python3 tools/check_architecture.py
 
 - **CI 与静态检查**：`uv lock --check`、`ruff check`、`ruff format --check`、`mypy src`（strict）、`tools/check_architecture.py` 全部通过。
 - **PostgreSQL 17 迁移与历史升级**：空库 `upgrade head` / `downgrade base` / `upgrade head` / 元数据漂移检测、含历史数据（`20261122_0005` -> `20261124_0012`）无损升级与多版本兼容就绪校验均通过实测。
-- **PostgreSQL 17 备份与恢复演练**：实测 `pg_dump -Fc` -> `pg_restore -l` 可读性验证 -> 隔离库 `pg_restore --single-transaction` -> `alembic_version = 20261124_0012` 通过；`tests/integration/test_production_deployment_and_recovery.py` 完整演练了独立 API + Worker 生命周期、心跳与任务恢复、基线 A 独立删除审计归档干跑/重放/幂等/防旧任务复活、耗尽任务受控重入队、受控提供方核验及全部 V1 公开 HTTP 契约。
+- **PostgreSQL 17 备份与恢复演练**：实测 `pg_dump -Fc` -> `pg_restore -l` 可读性验证 -> 隔离库 `pg_restore --single-transaction` -> `alembic_version = 20261124_0012` 通过；`tests/integration/test_production_deployment_and_recovery.py` 完整演练了统一单进程生命周期、心跳与任务恢复、基线 A 独立删除审计归档干跑/重放/幂等/防旧任务复活、耗尽任务受控重入队、受控提供方核验及全部 V2 公开 HTTP 契约。
 - **剩余上线前置条件（需在拥有真实外部凭据的 Staging 环境执行）**：
   1. 注入受控测试用 `MEMOS_API_KEY`、`OPENAI_COMPAT_API_KEY` 与真实 IdP JWT/网关凭据，执行一次 `python -m mem_ai.ops verify-providers --check-auth --check-model --check-memory` 验证真实上游分页、幂等、取消与 `get/status` 收敛延迟。
   2. 在目标集群配置外部对象存储/独立审计卷挂载 `DELETION_AUDIT_ARCHIVE_PATH`（基线 A）或配置 PostgreSQL WAL 连续归档（基线 B）并完成一次平台级演练签核。

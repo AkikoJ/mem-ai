@@ -38,9 +38,8 @@ USER memai
 
 EXPOSE 8000
 
-# Default entrypoint runs the API server; override CMD for standalone Worker,
-# single-executor Alembic migrations, model registry sync, or ops recovery CLI:
-#   Worker:     ["python", "-m", "mem_ai.workers.main"]
+# Default entrypoint runs the unified single-process backend server.
+# Override CMD for single-executor operations:
 #   Migrations: ["alembic", "upgrade", "head"]
 #   Model sync: ["python", "-m", "mem_ai.modules.models.sync"]
 #   Ops CLI:    ["python", "-m", "mem_ai.ops", "inspect-health"]

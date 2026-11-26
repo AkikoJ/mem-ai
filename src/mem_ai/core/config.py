@@ -284,8 +284,6 @@ class Settings(BaseSettings):
     worker_shutdown_grace_seconds: float = Field(default=15.0, gt=0.0, le=300.0)
     worker_heartbeat_interval_seconds: float = Field(default=30.0, gt=0.0, le=300.0)
     worker_heartbeat_file: str | None = None
-    worker_metrics_host: str = Field(default="127.0.0.1", min_length=1)
-    worker_metrics_port: int | None = Field(default=None, ge=1, le=65535)
     conversation_retention_policy: Literal["indefinite"] = "indefinite"
     job_attempt_retention_days: int = Field(default=30, ge=1, le=365)
     idempotency_retention_hours: int = Field(default=24, ge=1, le=720)
