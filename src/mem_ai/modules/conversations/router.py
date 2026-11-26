@@ -198,7 +198,6 @@ async def post_chat(
         )
     options = chat_options_from_settings(
         settings,
-        user_permissions=auth.permissions,
         require_streaming=payload.stream,
         task_registry=task_registry,
         generation_limiter=generation_limiter,

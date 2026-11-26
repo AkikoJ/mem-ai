@@ -15,6 +15,7 @@ from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import ForbiddenError
 from mem_ai.db.base import get_database_now
 from mem_ai.modules.agents.service import cleanup_user_agents_in_session
+from mem_ai.modules.auth import service as auth_service
 from mem_ai.modules.conversations.cleanup import (
     cleanup_user_conversations_in_session,
     settle_user_conversation_operations_in_session,
@@ -71,12 +72,12 @@ async def _accept_user_deletion_in_session(
         if recovery_replay:
             return "skipped_missing"
         raise ForbiddenError(code="user_not_active", message="user is not active")
-    if recovery_replay:
-        if user.status == "deleting":
-            return "already_applied"
-    else:
+    if not recovery_replay:
         service.assert_user_active(UserRecord.model_validate(user))
     now = await get_database_now(session)
+    await auth_service.revoke_user_sessions_in_session(session, user_id=owner_id, revoked_at=now)
+    if recovery_replay and user.status == "deleting":
+        return "already_applied"
     user.status = "deleting"
     user.deleted_at = now
     user.updated_at = now

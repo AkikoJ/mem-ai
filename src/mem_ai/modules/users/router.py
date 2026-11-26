@@ -32,6 +32,7 @@ async def get_current_user(
         actor_id=auth.actor_id,
         auth_method=auth.auth_method,
         permissions=sorted(auth.permissions),
+        email=user.email,
         status=user.status,
         created_at=user.created_at,
     )

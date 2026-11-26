@@ -39,16 +39,6 @@ def model_routing_policy_from_settings(settings: Settings) -> ModelRoutingPolicy
     )
 
 
-def _is_model_permitted(
-    config: ModelConfigRecord,
-    *,
-    user_permissions: AbstractSet[str],
-) -> bool:
-    if config.required_permission is None:
-        return True
-    return config.required_permission in user_permissions
-
-
 def _missing_capabilities(
     config: ModelConfigRecord,
     *,
@@ -87,12 +77,11 @@ async def sync_model_configs(
 async def list_available_models(
     session_factory: async_sessionmaker[AsyncSession],
     *,
-    user_permissions: AbstractSet[str] = frozenset(),
     policy: ModelRoutingPolicy | None = None,
     supports_streaming: bool | None = None,
     required_capabilities: AbstractSet[str] = frozenset(),
 ) -> list[ModelConfigRecord]:
-    """List enabled, permitted models matching the same policy and capability rules as chat."""
+    """List enabled models matching the same server policy and capability rules as chat."""
     async with session_factory() as session:
         rows = await repository.list_enabled_model_configs(session)
 
@@ -104,8 +93,6 @@ async def list_available_models(
     visible: list[ModelConfigRecord] = []
     for record in records:
         if forced_model_id is not None and record.model_id != forced_model_id:
-            continue
-        if not _is_model_permitted(record, user_permissions=user_permissions):
             continue
         if supports_streaming is not None and record.supports_streaming != supports_streaming:
             continue
@@ -124,7 +111,6 @@ async def resolve_model_for_chat(
     *,
     agent_default_model_id: str | None,
     requested_model_id: str | None = None,
-    user_permissions: AbstractSet[str] = frozenset(),
     require_streaming: bool = False,
     required_capabilities: AbstractSet[str] = frozenset(),
     policy: ModelRoutingPolicy | None = None,
@@ -197,13 +183,6 @@ async def resolve_model_for_chat(
             code="model_unavailable",
             message="selected model is not available",
             details={"model_id": candidate_model_id},
-        )
-
-    if not _is_model_permitted(config, user_permissions=user_permissions):
-        raise ForbiddenError(
-            code="model_permission_denied",
-            message="current user is not permitted to use the selected model",
-            details={"model_id": config.model_id},
         )
 
     missing = _missing_capabilities(

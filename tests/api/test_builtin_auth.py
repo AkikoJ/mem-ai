@@ -84,11 +84,62 @@ async def test_register_login_and_builtin_token_accesses_protected_endpoints(
     for path in ("/v1/users/me", "/v1/agents", "/v1/conversations"):
         response = await client.get(path, headers=_bearer(login["tokens"]))
         assert response.status_code == 200, (path, response.text)
+        if path == "/v1/users/me":
+            profile = response.json()["data"]
+            assert profile["userId"] == registered["userId"]
+            assert profile["email"] == "alice@example.com"
+            assert profile["status"] == "active"
+            assert {"actorId", "authMethod", "permissions", "createdAt"} <= profile.keys()
 
     tampered = {"Authorization": f"Bearer {login['tokens']['accessToken']}x"}
     assert (await client.get("/v1/users/me", headers=tampered)).status_code == 401
     receipt = {"Authorization": "DeletionReceipt abc123"}
     assert (await client.get("/v1/users/me", headers=receipt)).status_code == 401
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
+async def test_user_deletion_revokes_all_sessions_and_reserves_normalized_email(
+    auth_app: tuple[FastAPI, httpx.AsyncClient],
+) -> None:
+    app, client = auth_app
+    registered = await _register(client, "Delete@Example.com")
+    other = await _login(client, "delete@example.com")
+    user_id = UUID(registered["userId"])
+
+    deleted = await client.delete("/v1/users/me", headers=_bearer(registered["tokens"]))
+    assert deleted.status_code == 202, deleted.text
+    accepted = deleted.json()["data"]
+    async with app.state.session_factory() as session:
+        sessions = (
+            await session.scalars(select(AuthSession).where(AuthSession.user_id == user_id))
+        ).all()
+        assert len(sessions) == 2
+        assert all(row.revoked_at is not None for row in sessions)
+        user = await session.get(User, user_id)
+        assert user is not None and user.status == "deleting"
+
+    for tokens in (registered["tokens"], other["tokens"]):
+        denied = await client.get("/v1/users/me", headers=_bearer(tokens))
+        assert denied.status_code == 403
+        assert denied.json()["code"] == "user_deleting"
+        assert (await _refresh(client, tokens["refreshToken"])).status_code == 401
+    denied_login = await client.post(
+        "/v1/auth/login", json={"email": "delete@example.com", "password": PASSWORD}
+    )
+    assert denied_login.status_code == 403
+    conflict = await client.post(
+        "/v1/auth/register", json={"email": "  DELETE@EXAMPLE.COM  ", "password": PASSWORD}
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["code"] == "email_already_registered"
+
+    receipt_headers = {"Authorization": f"DeletionReceipt {accepted['deletionReceipt']}"}
+    progress = await client.get(accepted["statusUrl"], headers=receipt_headers)
+    assert progress.status_code == 200
+    assert progress.json()["data"]["operationId"] == accepted["operationId"]
+    for path in ("/v1/users/me", "/v1/agents", "/v1/conversations", "/v1/models"):
+        assert (await client.get(path, headers=receipt_headers)).status_code == 401
 
 
 @pytest.mark.integration

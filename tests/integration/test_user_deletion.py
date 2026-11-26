@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
-from sqlalchemy import text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mem_ai.api.dependencies import ProviderRegistry
@@ -24,6 +24,7 @@ from mem_ai.contracts.memory_provider import (
 )
 from mem_ai.core.config import Settings
 from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
+from mem_ai.modules.auth.models import AuthSession
 from mem_ai.modules.conversations import service as conversations_service
 from mem_ai.modules.conversations.schemas import PreparedGeneration
 from mem_ai.modules.conversations.service import ChatOptions
@@ -33,8 +34,10 @@ from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
 from mem_ai.modules.operations.audit import DeletionAuditEvent
 from mem_ai.modules.users.cleanup import JOB_TYPE_USER_DELETE, UserCleanupJobHandler
+from mem_ai.modules.users.models import User
 from mem_ai.workers.assembly import build_worker_registry
 from mem_ai.workers.runner import JobHandlerRegistry, WorkerConfig, WorkerRunner
+from tests.api.test_builtin_auth import PASSWORD, _bearer, _login, _register
 from tests.api.test_chat_idempotency_and_generations_api import _ControllableModelProvider
 from tests.api.test_conversations_api import GatedMemoryProvider
 
@@ -315,6 +318,77 @@ async def resource_counts(harness: UserDeletionHarness, owner_id: UUID) -> dict[
         assert isinstance(count, int)
         counts[str(name)] = count
     return counts
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
+async def test_builtin_email_stays_reserved_until_remote_and_local_cleanup_finish(
+    migrated_pg_settings: Settings,
+) -> None:
+    memory = DeletionMemoryProvider()
+    memory.defer_clear = True
+    app = create_app(migrated_pg_settings, providers=ProviderRegistry(memory_provider=memory))
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
+    ):
+        registered = await _register(client, "cleanup@example.com")
+        await _login(client, "cleanup@example.com")
+        user_id = UUID(registered["userId"])
+        headers = _bearer(registered["tokens"])
+        created = await client.post(
+            "/v1/memories", headers=headers, json={"content": "delete with account"}
+        )
+        assert created.status_code == 201, created.text
+        deleted = await client.delete("/v1/users/me", headers=headers)
+        assert deleted.status_code == 202, deleted.text
+        accepted = deleted.json()["data"]
+        receipt_headers = {"Authorization": f"DeletionReceipt {accepted['deletionReceipt']}"}
+        now = datetime.now(UTC)
+        for step in range(10):
+            await app.state.worker_runner.run_once(now=now + timedelta(minutes=step + 1))
+        pending = await client.get(accepted["statusUrl"], headers=receipt_headers)
+        assert pending.status_code == 200
+        progress = pending.json()["data"]
+        assert progress["status"] == "reconciling"
+        assert progress["progress"]["local_complete"] is True
+        assert progress["progress"]["remote_complete"] is False
+        assert any(record.user_id == user_id for record in memory.records.values())
+        async with app.state.session_factory() as session:
+            user = await session.get(User, user_id)
+            assert user is not None and user.status == "deleting"
+            assert (
+                await session.scalar(
+                    select(func.count(AuthSession.id)).where(AuthSession.user_id == user_id)
+                )
+                == 2
+            )
+        conflict = await client.post(
+            "/v1/auth/register", json={"email": "CLEANUP@example.com", "password": PASSWORD}
+        )
+        assert conflict.status_code == 409
+
+        memory.allow_clear_verification = True
+        for step in range(30):
+            await app.state.worker_runner.run_once(now=now + timedelta(minutes=step + 11))
+            finished = await client.get(accepted["statusUrl"], headers=receipt_headers)
+            if finished.json()["data"]["status"] == "succeeded":
+                break
+        assert finished.json()["data"]["status"] == "succeeded"
+        assert finished.json()["data"]["progress"]["remote_complete"] is True
+        assert not any(record.user_id == user_id for record in memory.records.values())
+        async with app.state.session_factory() as session:
+            assert await session.get(User, user_id) is None
+            assert (
+                await session.scalar(
+                    select(func.count(AuthSession.id)).where(AuthSession.user_id == user_id)
+                )
+                == 0
+            )
+        replacement = await _register(client, "CLEANUP@example.com")
+        assert replacement["userId"] != registered["userId"]
+        assert (await client.get("/v1/users/me", headers=headers)).status_code == 403
+        assert (await client.get(accepted["statusUrl"], headers=receipt_headers)).status_code == 200
 
 
 @pytest.mark.integration

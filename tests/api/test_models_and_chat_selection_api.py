@@ -23,6 +23,7 @@ from mem_ai.modules.auth.adapters import StaticTokenAuthAdapter
 from mem_ai.modules.conversations import generation as generation_store
 from mem_ai.modules.models import service as models_service
 from mem_ai.modules.models.schemas import ModelConfigSeed
+from tests.api.test_builtin_auth import _bearer, _register
 from tests.conftest import make_test_principal
 
 
@@ -78,7 +79,7 @@ async def _create_published_agent(
 
 @pytest.mark.integration
 @pytest.mark.anyio
-async def test_models_endpoint_filters_by_enabled_permissions_and_hides_server_secrets(
+async def test_models_endpoint_lists_all_enabled_models_equally_and_hides_server_secrets(
     migrated_pg_settings: Settings,
 ) -> None:
     auth_adapter = StaticTokenAuthAdapter(
@@ -156,7 +157,7 @@ async def test_models_endpoint_filters_by_enabled_permissions_and_hides_server_s
             unauth = await client.get("/v1/models")
             assert unauth.status_code == 401
 
-            # 2. Standard user sees only enabled models without `models:pro`.
+            # 2. Every active user sees all enabled models, including legacy permission-tagged ones.
             std_resp = await client.get(
                 "/v1/models",
                 headers={"Authorization": "Bearer token-standard"},
@@ -169,9 +170,10 @@ async def test_models_endpoint_filters_by_enabled_permissions_and_hides_server_s
             assert [item["modelId"] for item in std_items] == [
                 "batch-non-stream",
                 "gpt-4o-mini",
+                "gpt-4o-pro",
             ]
 
-            # 3. Pro user sees enabled models including `gpt-4o-pro`, never disabled models.
+            # 3. Existing permission claims do not change the enabled model list.
             pro_resp = await client.get(
                 "/v1/models",
                 headers={"Authorization": "Bearer token-pro"},
@@ -218,6 +220,65 @@ async def test_models_endpoint_filters_by_enabled_permissions_and_hides_server_s
 
 @pytest.mark.integration
 @pytest.mark.anyio
+async def test_builtin_users_share_enabled_models_and_select_legacy_permission_model(
+    migrated_pg_settings: Settings,
+) -> None:
+    settings = migrated_pg_settings.model_copy(
+        update={
+            "model_allow_request_override": True,
+            "model_registry_entries": [
+                {"model_id": "standard", "enabled": True},
+                {
+                    "model_id": "pro",
+                    "upstream_model": "vendor-pro",
+                    "enabled": True,
+                    "required_permission": "models:pro",
+                },
+                {"model_id": "disabled", "enabled": False},
+            ],
+        }
+    )
+    provider = _RecordingModelProvider()
+    app = create_app(settings, providers=ProviderRegistry(model_provider=provider))
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
+    ):
+        alice = await _register(client, "models-alice@example.com")
+        bob = await _register(client, "models-bob@example.com")
+        alice_headers = _bearer(alice["tokens"])
+        for headers in (alice_headers, _bearer(bob["tokens"])):
+            response = await client.get("/v1/models", headers=headers)
+            assert response.status_code == 200, response.text
+            assert [item["modelId"] for item in response.json()["data"]["items"]] == [
+                "pro",
+                "standard",
+            ]
+
+        agent = await _create_published_agent(
+            client,
+            headers=alice_headers,
+            name="Built-in Model Selection",
+            default_model_id="standard",
+        )
+        chat = await client.post(
+            "/v1/chat",
+            headers={**alice_headers, "Idempotency-Key": f"builtin-model-{uuid4().hex}"},
+            json={
+                "agentId": agent["agentId"],
+                "message": "use the pro model",
+                "modelId": "pro",
+            },
+        )
+        assert chat.status_code == 200, chat.text
+        assert chat.json()["data"]["modelId"] == "pro"
+        assert [(request.model_id, request.upstream_model) for request in provider.requests] == [
+            ("pro", "vendor-pro")
+        ]
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
 async def test_chat_model_override_disabled_pinned_default_failure_recording_and_schema_guard(
     migrated_pg_settings: Settings,
 ) -> None:
@@ -229,7 +290,7 @@ async def test_chat_model_override_disabled_pinned_default_failure_recording_and
             ),
             "token-pro": make_test_principal(
                 "pro-chat",
-                permissions=("chat:use", "agents:manage", "users:self", "models:pro"),
+                permissions=(),
             ),
         }
     )
@@ -306,9 +367,8 @@ async def test_chat_model_override_disabled_pinned_default_failure_recording_and
                 assert bad.status_code == 422
             assert len(provider.requests) == 0
 
-            # 2. Unauthorized, unregistered, and disabled requested models fail before model call.
+            # 2. Unregistered and disabled requested models fail before any model call.
             for bad_model, expected_status, expected_code in (
-                ("gpt-4o-pro", 403, "model_permission_denied"),
                 ("does-not-exist", 409, "model_unavailable"),
                 ("gpt-disabled", 409, "model_unavailable"),
             ):
@@ -325,7 +385,7 @@ async def test_chat_model_override_disabled_pinned_default_failure_recording_and
                 assert rejected.json()["code"] == expected_code
             assert len(provider.requests) == 0
 
-            # 3. Omitting modelId uses Agent default; allowed request modelId overrides default.
+            # 3. A user with no permission claims can select every enabled model.
             pro_agent = await _create_published_agent(
                 client,
                 headers=pro_headers,

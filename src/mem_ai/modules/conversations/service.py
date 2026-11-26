@@ -77,7 +77,6 @@ class ChatOptions:
     """Shared runtime budgets, model routing policy, memory policy, and hooks for sync & SSE."""
 
     model_policy: ModelRoutingPolicy | None = None
-    user_permissions: frozenset[str] = frozenset()
     require_streaming: bool = False
     required_capabilities: frozenset[str] = frozenset()
     history_limit: int = 20
@@ -104,7 +103,6 @@ class ChatOptions:
 def chat_options_from_settings(
     settings: Settings,
     *,
-    user_permissions: frozenset[str] = frozenset(),
     require_streaming: bool = False,
     task_registry: SyncGenerationTaskRegistry | None = None,
     generation_limiter: ConcurrencyLimiter | None = None,
@@ -112,7 +110,6 @@ def chat_options_from_settings(
     """Construct `ChatOptions` with the shared server `ModelRoutingPolicy` and budgets."""
     return ChatOptions(
         model_policy=models_service.model_routing_policy_from_settings(settings),
-        user_permissions=user_permissions,
         require_streaming=require_streaming,
         history_limit=settings.chat_history_message_limit,
         lease_ttl_seconds=float(settings.chat_lease_ttl_seconds),
@@ -214,7 +211,6 @@ async def prepare_generation(
         session_factory,
         agent_default_model_id=persona.default_model_id,
         requested_model_id=requested_model_id,
-        user_permissions=resolved.user_permissions,
         require_streaming=resolved.require_streaming,
         required_capabilities=resolved.required_capabilities,
         policy=resolved.model_policy,

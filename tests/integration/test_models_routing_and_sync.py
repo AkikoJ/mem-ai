@@ -154,7 +154,7 @@ async def test_explicit_model_sync_command_is_idempotent_and_rejects_missing_con
 
 @pytest.mark.integration
 @pytest.mark.anyio
-async def test_model_routing_precedence_permissions_capabilities_and_shared_streaming_gate(
+async def test_model_routing_precedence_capabilities_and_shared_streaming_gate(
     migrated_pg_settings: Settings,
 ) -> None:
     seeded_settings = migrated_pg_settings.model_copy(
@@ -200,29 +200,18 @@ async def test_model_routing_precedence_permissions_capabilities_and_shared_stre
     engine = create_async_engine_from_settings(migrated_pg_settings)
     session_factory = create_session_factory(engine)
     try:
-        # 1. Discovery shares exact enabled/permission/capability/forced rules.
-        standard_visible = await models_service.list_available_models(
-            session_factory,
-            user_permissions=frozenset({"chat:use"}),
-        )
-        assert [m.model_id for m in standard_visible] == ["model-batch", "model-standard"]
-
-        pro_visible = await models_service.list_available_models(
-            session_factory,
-            user_permissions=frozenset({"chat:use", "models:pro"}),
-        )
-        assert [m.model_id for m in pro_visible] == ["model-batch", "model-pro", "model-standard"]
+        # 1. Discovery uses enabled/capability/forced rules, including legacy permission rows.
+        visible = await models_service.list_available_models(session_factory)
+        assert [m.model_id for m in visible] == ["model-batch", "model-pro", "model-standard"]
 
         streaming_only = await models_service.list_available_models(
             session_factory,
-            user_permissions=frozenset({"chat:use", "models:pro"}),
             supports_streaming=True,
         )
         assert [m.model_id for m in streaming_only] == ["model-pro", "model-standard"]
 
         forced_visible = await models_service.list_available_models(
             session_factory,
-            user_permissions=frozenset({"chat:use", "models:pro"}),
             policy=ModelRoutingPolicy(forced_model_id="model-pro"),
         )
         assert [m.model_id for m in forced_visible] == ["model-pro"]
@@ -232,7 +221,6 @@ async def test_model_routing_precedence_permissions_capabilities_and_shared_stre
             session_factory,
             agent_default_model_id="model-standard",
             requested_model_id="model-batch",
-            user_permissions=frozenset({"chat:use", "models:pro"}),
             policy=ModelRoutingPolicy(
                 forced_model_id="model-pro",
                 allow_request_override=True,
@@ -246,7 +234,6 @@ async def test_model_routing_precedence_permissions_capabilities_and_shared_stre
             session_factory,
             agent_default_model_id="model-standard",
             requested_model_id="model-pro",
-            user_permissions=frozenset({"chat:use", "models:pro"}),
             policy=ModelRoutingPolicy(
                 allow_request_override=True,
                 default_model_id="model-batch",
@@ -258,7 +245,6 @@ async def test_model_routing_precedence_permissions_capabilities_and_shared_stre
             session_factory,
             agent_default_model_id="model-standard",
             requested_model_id=None,
-            user_permissions=frozenset({"chat:use"}),
             policy=ModelRoutingPolicy(
                 allow_request_override=True,
                 default_model_id="model-batch",
@@ -270,7 +256,6 @@ async def test_model_routing_precedence_permissions_capabilities_and_shared_stre
             session_factory,
             agent_default_model_id=None,
             requested_model_id=None,
-            user_permissions=frozenset({"chat:use"}),
             policy=ModelRoutingPolicy(default_model_id="model-standard"),
         )
         assert server_default.model_id == "model-standard"
@@ -301,7 +286,7 @@ async def test_model_routing_precedence_permissions_capabilities_and_shared_stre
             )
         assert missing_server_default.value.code == "model_configuration_missing"
 
-        # 4. Disallowed override, disabled/unregistered, unauthorized, unsupported capability.
+        # 4. Disallowed override, disabled/unregistered models, and unsupported capability.
         with pytest.raises(ForbiddenError) as no_override:
             await models_service.resolve_model_for_chat(
                 session_factory,
@@ -331,16 +316,6 @@ async def test_model_routing_precedence_permissions_capabilities_and_shared_stre
                 policy=ModelRoutingPolicy(allow_request_override=True),
             )
         assert unregistered_req.value.code == "model_unavailable"
-
-        with pytest.raises(ForbiddenError) as no_perm:
-            await models_service.resolve_model_for_chat(
-                session_factory,
-                agent_default_model_id="model-standard",
-                requested_model_id="model-pro",
-                user_permissions=frozenset({"chat:use"}),
-                policy=ModelRoutingPolicy(allow_request_override=True),
-            )
-        assert no_perm.value.code == "model_permission_denied"
 
         with pytest.raises(UnprocessableEntityError) as no_stream:
             await models_service.resolve_model_for_chat(
@@ -389,7 +364,6 @@ async def test_model_routing_precedence_permissions_capabilities_and_shared_stre
                 conversation_id=None,
                 user_message="Try streaming on batch model",
                 options=ChatOptions(
-                    user_permissions=frozenset({"chat:use"}),
                     require_streaming=True,
                 ),
             )
@@ -403,7 +377,6 @@ async def test_model_routing_precedence_permissions_capabilities_and_shared_stre
             conversation_id=None,
             user_message="Sync works on batch model",
             options=ChatOptions(
-                user_permissions=frozenset({"chat:use"}),
                 require_streaming=False,
             ),
         )

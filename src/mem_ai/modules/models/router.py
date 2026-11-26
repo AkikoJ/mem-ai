@@ -29,7 +29,6 @@ async def list_models(
     policy = model_routing_policy_from_settings(settings)
     records = await list_available_models(
         session_factory,
-        user_permissions=auth.permissions,
         policy=policy,
         supports_streaming=supports_streaming,
     )

@@ -12,18 +12,20 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from pydantic import SecretStr
-from sqlalchemy import text
+from sqlalchemy import select, text, update
 
 from mem_ai.api.dependencies import ProviderRegistry
 from mem_ai.application import create_app
 from mem_ai.contracts.memory_provider import MemoryRecallQuery, MemoryWriteInput
 from mem_ai.core.config import Settings
 from mem_ai.db.engine import create_async_engine_from_settings, create_session_factory
+from mem_ai.modules.auth.models import AuthSession
 from mem_ai.modules.jobs import service as jobs_service
 from mem_ai.modules.memories import service as memories_service
 from mem_ai.modules.memories.adapters.memos import MemOSMemoryProvider
 from mem_ai.modules.models.adapters.openai_compatible import OpenAICompatibleModelProvider
-from mem_ai.modules.operations.audit import JsonlDeletionAuditArchiver
+from mem_ai.modules.operations.audit import DeletionAuditEvent, JsonlDeletionAuditArchiver
+from mem_ai.modules.users import service as users_service
 from mem_ai.ops import (
     compute_connection_budget,
     inspect_operational_health,
@@ -32,6 +34,7 @@ from mem_ai.ops import (
 )
 from mem_ai.workers.assembly import build_worker_registry
 from mem_ai.workers.runner import WorkerConfig, WorkerRunner
+from tests.api.test_builtin_auth import PASSWORD, _bearer, _login, _refresh, _register
 from tests.conftest import (
     FakeMemoryProvider,
     FakeModelProvider,
@@ -696,6 +699,77 @@ async def test_verify_providers_harness_validates_auth_model_and_memos_capabilit
                 await verify_providers(prod_settings, check_auth=True)
     finally:
         await engine.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.anyio
+@pytest.mark.parametrize("restored_status", ["active", "disabled", "deleting"])
+async def test_audit_replay_revokes_restored_builtin_sessions(
+    migrated_pg_settings: Settings,
+    tmp_path: Path,
+    restored_status: str,
+) -> None:
+    archive_path = tmp_path / "builtin-deletion-audit.jsonl"
+    app = create_app(migrated_pg_settings)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
+    ):
+        registered = await _register(client, "restore@example.com")
+        other = await _login(client, "restore@example.com")
+        user_id = UUID(registered["userId"])
+        sessions = app.state.session_factory
+        if restored_status == "deleting":
+            deleted = await client.delete("/v1/users/me", headers=_bearer(registered["tokens"]))
+            assert deleted.status_code == 202
+            # A restored legacy deletion can retain both its job and unrevoked sessions.
+            async with sessions.begin() as session:
+                await session.execute(
+                    update(AuthSession)
+                    .where(AuthSession.user_id == user_id)
+                    .values(revoked_at=None)
+                )
+        elif restored_status == "disabled":
+            await users_service.set_user_status(sessions, user_id=user_id, status="disabled")
+
+        await JsonlDeletionAuditArchiver(archive_path).export_event(
+            DeletionAuditEvent(
+                event_type="operation_accepted",
+                user_id=user_id,
+                operation_type="user_delete",
+                target_type="user",
+                status="pending",
+            )
+        )
+        report = await replay_deletion_audit_archive(
+            sessions, archive_path=archive_path, settings=migrated_pg_settings
+        )
+        assert report.enqueued_count == (0 if restored_status == "deleting" else 1)
+        assert report.already_applied_count == (1 if restored_status == "deleting" else 0)
+        async with sessions() as session:
+            restored = (
+                await session.scalars(select(AuthSession).where(AuthSession.user_id == user_id))
+            ).all()
+            assert len(restored) == 2
+            assert all(row.revoked_at is not None for row in restored)
+        for tokens in (registered["tokens"], other["tokens"]):
+            denied = await client.get("/v1/users/me", headers=_bearer(tokens))
+            assert denied.status_code == 403
+            assert denied.json()["code"] == "user_deleting"
+            assert (await _refresh(client, tokens["refreshToken"])).status_code == 401
+        login = await client.post(
+            "/v1/auth/login", json={"email": "restore@example.com", "password": PASSWORD}
+        )
+        assert login.status_code == 403
+        duplicate = await client.post(
+            "/v1/auth/register", json={"email": "RESTORE@example.com", "password": PASSWORD}
+        )
+        assert duplicate.status_code == 409
+        repeated = await replay_deletion_audit_archive(
+            sessions, archive_path=archive_path, settings=migrated_pg_settings
+        )
+        assert repeated.enqueued_count == 0
+        assert repeated.already_applied_count == 1
 
 
 @pytest.mark.integration

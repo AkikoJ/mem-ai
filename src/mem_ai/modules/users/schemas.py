@@ -47,5 +47,6 @@ class UserMeResponse(BaseModel):
     actor_id: str = Field(alias="actorId", serialization_alias="actorId")
     auth_method: str = Field(alias="authMethod", serialization_alias="authMethod")
     permissions: list[str]
+    email: str | None
     status: UserStatus
     created_at: datetime = Field(alias="createdAt", serialization_alias="createdAt")

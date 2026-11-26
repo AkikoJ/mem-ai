@@ -119,9 +119,11 @@ async def login_user(
         raise UnauthorizedError(code="invalid_credentials", message=_INVALID_LOGIN_MESSAGE)
 
     async with session_factory.begin() as session:
+        # Keep deletion behind this issuance, or observe its committed deleting status first.
         active_user = await users_service.ensure_user_active_in_session(
             session,
             user_id=credentials.id,
+            for_share=True,
         )
         now = await get_database_now(session)
         resolved_email = active_user.email or normalized_email
@@ -146,8 +148,17 @@ async def refresh_tokens(
     replay_detected = False
     token_pair: TokenPair | None = None
 
+    # Discover the immutable owner without retaining a stale ORM snapshot in the write session.
+    async with session_factory() as session:
+        observed = await repository.get_session_by_token_hash(session, token_hash=token_hash)
+        if observed is None:
+            raise UnauthorizedError(code="invalid_credentials", message="invalid refresh token")
+        owner_id = observed.user_id
+
     async with session_factory.begin() as session:
-        now = await get_database_now(session)
+        # Deletion and password changes lock user -> sessions. Use the same order, but defer
+        # active-status validation until after the replay branch so revoked tokens stay 401.
+        await users_service.get_user_by_id_in_session(session, user_id=owner_id, for_update=True)
         old_session = await repository.get_session_by_token_hash(
             session,
             token_hash=token_hash,
@@ -155,6 +166,7 @@ async def refresh_tokens(
         )
         if old_session is None:
             raise UnauthorizedError(code="invalid_credentials", message="invalid refresh token")
+        now = await get_database_now(session)
 
         if old_session.revoked_at is not None:
             # 先提交家族吊销，再在事务外返回 401，避免回滚吊销。
