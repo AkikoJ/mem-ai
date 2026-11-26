@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from mem_ai.core.exceptions import ConflictError
 from mem_ai.db.base import get_database_now, normalize_utc
+from mem_ai.modules.auth import service as auth_service
 from mem_ai.modules.conversations import idempotency as conversations_idempotency
 from mem_ai.modules.jobs import cleanup as jobs_cleanup
 from mem_ai.modules.jobs.schemas import JobExecutionContext, JobHandlerOutcome
@@ -191,6 +192,23 @@ async def run_retention_batch_in_session(
             has_more=summary_batch.has_more,
         )
 
+    if stage == "auth_sessions":
+        auth_batch = await auth_service.purge_expired_auth_sessions_batch_in_session(
+            session,
+            current_time=utc_now,
+            retention_days=policy.auth_sessions_retention_days,
+            batch_size=policy.batch_size,
+            cursor=raw_cursor,
+        )
+        return RetentionBatchResult(
+            stage=stage,
+            deleted_count=auth_batch.deleted_count,
+            protected_skipped=0,
+            scanned_count=auth_batch.scanned_count,
+            next_cursor=_to_cursor(auth_batch.next_cursor),
+            has_more=auth_batch.has_more,
+        )
+
     periodic_batch = await jobs_cleanup.purge_expired_periodic_jobs_batch_in_session(
         session,
         current_time=utc_now,
@@ -247,6 +265,7 @@ def _build_summary(
         user_delete_operations_deleted=state.totals["user_delete_operations_deleted"],
         operation_summaries_deleted=state.totals["operation_summaries_deleted"],
         periodic_jobs_deleted=state.totals["periodic_jobs_deleted"],
+        auth_sessions_deleted=state.totals["auth_sessions_deleted"],
         protected_skipped=state.totals["protected_skipped"],
         batches_executed=state.batches_completed,
         duration_ms=duration_ms,

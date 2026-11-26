@@ -116,7 +116,7 @@ def test_discover_alembic_head_falls_back_to_cwd_for_non_editable_container_inst
     health_service._discover_alembic_head.cache_clear()
     try:
         head = health_service._discover_alembic_head()
-        assert head == "20261124_0012"
+        assert head == "20261126_0013"
     finally:
         health_service._discover_alembic_head.cache_clear()
 

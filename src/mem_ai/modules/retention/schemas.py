@@ -18,6 +18,7 @@ RetentionStage = Literal[
     "user_delete_operations",
     "operation_summaries",
     "periodic_jobs",
+    "auth_sessions",
 ]
 
 RETENTION_STAGES: tuple[RetentionStage, ...] = (
@@ -27,6 +28,7 @@ RETENTION_STAGES: tuple[RetentionStage, ...] = (
     "user_delete_operations",
     "operation_summaries",
     "periodic_jobs",
+    "auth_sessions",
 )
 
 STAGE_COUNT_KEYS: dict[RetentionStage, str] = {
@@ -36,6 +38,7 @@ STAGE_COUNT_KEYS: dict[RetentionStage, str] = {
     "user_delete_operations": "user_delete_operations_deleted",
     "operation_summaries": "operation_summaries_deleted",
     "periodic_jobs": "periodic_jobs_deleted",
+    "auth_sessions": "auth_sessions_deleted",
 }
 
 _TOTAL_COUNT_KEYS: tuple[str, ...] = (
@@ -45,6 +48,7 @@ _TOTAL_COUNT_KEYS: tuple[str, ...] = (
     "user_delete_operations_deleted",
     "operation_summaries_deleted",
     "periodic_jobs_deleted",
+    "auth_sessions_deleted",
     "protected_skipped",
 )
 
@@ -67,6 +71,7 @@ class RetentionPolicy(BaseModel):
     memory_list_snapshot_ttl_seconds: int = Field(default=600, ge=10, le=86400)
     deletion_receipt_ttl_seconds: int = Field(default=2592000, ge=60, le=31536000)
     operation_summary_retention_days: int = Field(default=30, ge=1, le=365)
+    auth_sessions_retention_days: int = Field(default=90, ge=1, le=365)
     cleanup_interval_seconds: int = Field(default=900, ge=10, le=86400)
     batch_size: int = Field(default=100, ge=1, le=500)
     max_batches_per_run: int = Field(default=50, ge=1, le=1000)
@@ -83,6 +88,7 @@ def retention_policy_from_settings(settings: Settings) -> RetentionPolicy:
         memory_list_snapshot_ttl_seconds=settings.memory_list_snapshot_ttl_seconds,
         deletion_receipt_ttl_seconds=settings.deletion_receipt_ttl_seconds,
         operation_summary_retention_days=settings.operation_summary_retention_days,
+        auth_sessions_retention_days=settings.auth_sessions_retention_days,
         cleanup_interval_seconds=settings.retention_cleanup_interval_seconds,
         batch_size=settings.retention_batch_size,
         max_batches_per_run=settings.retention_max_batches_per_run,
@@ -164,6 +170,7 @@ class RetentionSweepSummary(BaseModel):
     user_delete_operations_deleted: int = 0
     operation_summaries_deleted: int = 0
     periodic_jobs_deleted: int = 0
+    auth_sessions_deleted: int = 0
     protected_skipped: int = 0
     batches_executed: int = 0
     duration_ms: float = 0.0
@@ -180,6 +187,7 @@ class RetentionSweepSummary(BaseModel):
             + self.user_delete_operations_deleted
             + self.operation_summaries_deleted
             + self.periodic_jobs_deleted
+            + self.auth_sessions_deleted
         )
 
     def to_result_summary(self) -> dict[str, Any]:
@@ -191,6 +199,7 @@ class RetentionSweepSummary(BaseModel):
             "user_delete_operations_deleted": self.user_delete_operations_deleted,
             "operation_summaries_deleted": self.operation_summaries_deleted,
             "periodic_jobs_deleted": self.periodic_jobs_deleted,
+            "auth_sessions_deleted": self.auth_sessions_deleted,
             "total_deleted": self.total_deleted,
             "protected_skipped": self.protected_skipped,
             "batches_executed": self.batches_executed,

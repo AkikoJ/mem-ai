@@ -5,22 +5,38 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, String, UniqueConstraint
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from mem_ai.db.base import Base, CreatedAtMixin, TimestampMixin, UUIDPrimaryKeyMixin
 
 USER_IDENTITY_UNIQUE_CONSTRAINT = "uq_user_identities_issuer_subject"
+USER_EMAIL_UNIQUE_INDEX = "ix_users_email_unique"
 
 
 class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """Application-owned local user subject with lifecycle status."""
+    """Application-owned local user subject with lifecycle status and built-in credentials."""
 
     __tablename__ = "users"
     __table_args__ = (
         CheckConstraint("status IN ('active', 'disabled', 'deleting')", name="status_valid"),
+        CheckConstraint("email IS NULL OR email = lower(email)", name="email_lowercase"),
         Index("ix_users_status", "status"),
+        Index(
+            USER_EMAIL_UNIQUE_INDEX,
+            "email",
+            unique=True,
+            postgresql_where=text("email IS NOT NULL"),
+        ),
     )
 
     status: Mapped[str] = mapped_column(
@@ -32,6 +48,17 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     deleted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
+        default=None,
+    )
+    # 内置认证凭据：规范化小写邮箱与强哈希密码
+    email: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,  # 兼容历史行升级
+        default=None,
+    )
+    password_hash: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,  # 兼容历史行升级
         default=None,
     )
 

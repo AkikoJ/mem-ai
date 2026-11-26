@@ -10,6 +10,7 @@ def load_all_models() -> None:
     modules here so `alembic check` and autogenerate always see the full schema.
     """
     import mem_ai.modules.agents.models as _agents_models
+    import mem_ai.modules.auth.models as _auth_models
     import mem_ai.modules.conversations.models as _conversations_models
     import mem_ai.modules.jobs.models as _jobs_models
     import mem_ai.modules.memories.models as _memories_models
@@ -19,6 +20,7 @@ def load_all_models() -> None:
 
     _ = (
         _agents_models,
+        _auth_models,
         _conversations_models,
         _jobs_models,
         _memories_models,

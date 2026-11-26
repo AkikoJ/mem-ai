@@ -18,6 +18,21 @@ class UserRecord(BaseModel):
 
     id: UUID
     status: UserStatus
+    email: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    deleted_at: datetime | None = None
+
+
+class UserCredentialRecord(BaseModel):
+    """Credential-bearing user snapshot restricted to built-in auth verification."""
+
+    model_config = ConfigDict(from_attributes=True, frozen=True)
+
+    id: UUID
+    status: UserStatus
+    email: str | None = None
+    password_hash: str | None = None
     created_at: datetime
     updated_at: datetime
     deleted_at: datetime | None = None

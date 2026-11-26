@@ -25,6 +25,8 @@ class AuthenticationContext:
     user_id: UUID
     auth_method: str
     permissions: frozenset[str] = frozenset()
+    email: str | None = None
+    session_id: UUID | None = None
 
     def has_permission(self, permission: str) -> bool:
         """Return True when this context grants the requested permission."""

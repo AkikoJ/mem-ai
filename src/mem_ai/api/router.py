@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from mem_ai.modules.agents.router import router as agents_router
+from mem_ai.modules.auth.router import router as auth_router
 from mem_ai.modules.conversations.router import router as conversations_router
 from mem_ai.modules.health.router import metrics_router as metrics_router
 from mem_ai.modules.health.router import router as health_router
@@ -21,6 +22,7 @@ def build_api_router() -> APIRouter:
     root_router.include_router(metrics_router)
 
     v1_router = APIRouter(prefix="/v1")
+    v1_router.include_router(auth_router)  # 内置认证路由
     v1_router.include_router(users_router)
     v1_router.include_router(agents_router)
     v1_router.include_router(models_router)

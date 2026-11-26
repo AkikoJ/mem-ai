@@ -159,7 +159,7 @@ async def test_unified_single_process_lifecycle_probes_recovery_and_budget(
             assert (await client.get("/health/live")).status_code == 200
             ready_resp = await client.get("/health/ready")
             assert ready_resp.status_code == 200
-            assert ready_resp.json()["data"]["migration_revision"] == "20261124_0012"
+            assert ready_resp.json()["data"]["migration_revision"] == "20261126_0013"
 
             for _ in range(40):
                 if hb_file.exists():

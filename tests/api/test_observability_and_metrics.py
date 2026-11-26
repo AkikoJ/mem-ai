@@ -335,7 +335,7 @@ async def test_readiness_checks_startup_lifecycle_and_compatible_migration_revis
     settings = migrated_pg_settings.model_copy(
         update={
             "expected_alembic_revision": "99999999_future",
-            "compatible_alembic_revisions": ["20261124_0012"],
+            "compatible_alembic_revisions": ["20261126_0013"],
         }
     )
     app = create_app(settings)
@@ -347,7 +347,7 @@ async def test_readiness_checks_startup_lifecycle_and_compatible_migration_revis
             # Compatible revision list allows rolling upgrade compatibility.
             ok_ready = await client.get("/health/ready")
             assert ok_ready.status_code == 200
-            assert ok_ready.json()["data"]["migration_revision"] == "20261124_0012"
+            assert ok_ready.json()["data"]["migration_revision"] == "20261126_0013"
 
             # Simulated pre-ready / shutting-down state returns 503 service_not_ready.
             app.state.ready = False

@@ -39,6 +39,7 @@ def test_production_rejects_default_postgres_password() -> None:
             _env_file=None,
             app_env="production",
             postgres_password="change-this-local-password",
+            auth_jwt_secret="strong-secret-key-at-least-32-chars",
         )
 
 
@@ -48,6 +49,7 @@ def test_production_rejects_wildcard_cors_origin() -> None:
             _env_file=None,
             app_env="production",
             postgres_password="strong-prod-password-123",
+            auth_jwt_secret="strong-secret-key-at-least-32-chars",
             cors_allowed_origins=["*"],
         )
 
@@ -62,6 +64,7 @@ def test_production_accepts_hardened_configuration() -> None:
         cors_allowed_origins=["https://app.example.com"],
         auth_mode="jwt_hs256",
         auth_jwt_hs256_secret="super-secret-jwt-signing-key-at-least-32-chars",
+        auth_jwt_secret="super-secret-jwt-signing-key-at-least-32-chars",
         auth_trusted_issuers=["https://idp.example.com"],
         auth_trusted_audience="mem-ai-api",
     )
@@ -77,6 +80,7 @@ def test_production_rejects_development_auth_mode() -> None:
             _env_file=None,
             app_env="production",
             postgres_password="strong-prod-password-123",
+            auth_jwt_secret="strong-secret-key-at-least-32-chars",
             auth_mode="development",
         )
 
@@ -117,6 +121,7 @@ def test_jwt_hs256_mode_requires_secret_issuer_and_audience() -> None:
             allowed_hosts=["api.example.com"],
             auth_mode="jwt_hs256",
             auth_jwt_hs256_secret="too-short",
+            auth_jwt_secret="strong-secret-key-at-least-32-chars",
             auth_trusted_issuers=["https://idp.example.com"],
             auth_trusted_audience="mem-ai-api",
         )
@@ -161,6 +166,7 @@ def test_trusted_gateway_mode_requires_explicit_proxies_issuers_and_secret() -> 
                 auth_trusted_proxies=[wildcard],
                 auth_trusted_issuers=["https://gateway.example.com"],
                 auth_gateway_shared_secret="gateway-shared-secret-value-at-least-32-chars",
+                auth_jwt_secret="strong-secret-key-at-least-32-chars",
             )
 
     settings = Settings(
@@ -172,6 +178,7 @@ def test_trusted_gateway_mode_requires_explicit_proxies_issuers_and_secret() -> 
         auth_trusted_proxies=["10.0.0.0/8", "127.0.0.1"],
         auth_trusted_issuers=["https://gateway.example.com"],
         auth_gateway_shared_secret="gateway-shared-secret-value-at-least-32-chars",
+        auth_jwt_secret="strong-secret-key-at-least-32-chars",
     )
     assert settings.auth_mode == "trusted_gateway"
 
@@ -579,6 +586,7 @@ def test_resource_limits_observability_and_proxy_heartbeat_coordination_settings
             postgres_password="strong-prod-password-123",
             auth_mode="jwt_hs256",
             auth_jwt_hs256_secret="super-secret-jwt-signing-key-at-least-32-chars",
+            auth_jwt_secret="super-secret-jwt-signing-key-at-least-32-chars",
             auth_trusted_issuers=["https://idp.example.com"],
             auth_trusted_audience="mem-ai-api",
         )
@@ -591,6 +599,7 @@ def test_resource_limits_observability_and_proxy_heartbeat_coordination_settings
             allowed_hosts=["*"],
             auth_mode="jwt_hs256",
             auth_jwt_hs256_secret="super-secret-jwt-signing-key-at-least-32-chars",
+            auth_jwt_secret="super-secret-jwt-signing-key-at-least-32-chars",
             auth_trusted_issuers=["https://idp.example.com"],
             auth_trusted_audience="mem-ai-api",
         )
@@ -604,6 +613,7 @@ def test_resource_limits_observability_and_proxy_heartbeat_coordination_settings
             metrics_allowed_networks=["0.0.0.0/0"],
             auth_mode="jwt_hs256",
             auth_jwt_hs256_secret="super-secret-jwt-signing-key-at-least-32-chars",
+            auth_jwt_secret="super-secret-jwt-signing-key-at-least-32-chars",
             auth_trusted_issuers=["https://idp.example.com"],
             auth_trusted_audience="mem-ai-api",
         )
@@ -616,6 +626,7 @@ def test_resource_limits_observability_and_proxy_heartbeat_coordination_settings
         cors_allowed_origins=["https://app.example.com"],
         auth_mode="jwt_hs256",
         auth_jwt_hs256_secret="super-secret-jwt-signing-key-at-least-32-chars",
+        auth_jwt_secret="super-secret-jwt-signing-key-at-least-32-chars",
         auth_trusted_issuers=["https://idp.example.com"],
         auth_trusted_audience="mem-ai-api",
     )

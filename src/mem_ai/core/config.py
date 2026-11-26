@@ -19,6 +19,7 @@ ProxyNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
 _INSECURE_DEFAULT_PASSWORDS = frozenset({"", "change-this-local-password", "postgres", "password"})
 _MIN_PRODUCTION_SECRET_LENGTH = 32
+_DEFAULT_AUTH_JWT_SECRET = "change-this-jwt-secret-in-production"
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +228,13 @@ class Settings(BaseSettings):
     auth_gateway_actor_header: str = Field(default="X-Auth-Actor-Id", min_length=1)
     auth_gateway_permissions_header: str = Field(default="X-Auth-Permissions", min_length=1)
 
+    # Built-in auth: email + password + JWT Access Token + persistent Refresh Token sessions
+    auth_jwt_secret: SecretStr = Field(default=SecretStr(_DEFAULT_AUTH_JWT_SECRET))
+    auth_access_token_expires_in: int = Field(default=3600, ge=60, le=86400)  # 1 hour
+    auth_refresh_token_expires_in: int = Field(default=2592000, ge=3600, le=31536000)  # 30 days
+    auth_allow_self_registration: bool = True  # 是否开放自助注册
+    auth_sessions_retention_days: int = Field(default=90, ge=1, le=365)  # 过期会话保留期限
+
     # Account deletion receipts; HMAC keys must remain stable throughout receipt retention.
     deletion_receipt_secret: SecretStr | None = None
     deletion_receipt_ttl_seconds: int = Field(default=2592000, ge=60, le=31536000)
@@ -299,6 +307,21 @@ class Settings(BaseSettings):
             raise ValueError("postgres_password must not be empty")
 
         is_production = self.app_env == "production"
+
+        # 校验内置 JWT 密钥
+        jwt_secret = self.auth_jwt_secret.get_secret_value().strip()
+        if not jwt_secret:
+            raise ValueError("auth_jwt_secret must not be empty")
+        if is_production:
+            if jwt_secret in _INSECURE_DEFAULT_PASSWORDS or jwt_secret == _DEFAULT_AUTH_JWT_SECRET:
+                raise ValueError(
+                    "auth_jwt_secret must be set to a non-default secret in production"
+                )
+            if len(jwt_secret) < _MIN_PRODUCTION_SECRET_LENGTH:
+                raise ValueError(
+                    f"auth_jwt_secret must be at least {_MIN_PRODUCTION_SECRET_LENGTH} "
+                    "characters in production"
+                )
 
         if self.deletion_receipt_secret is not None:
             receipt_secret = self.deletion_receipt_secret.get_secret_value().strip()

@@ -9,10 +9,12 @@ from typing import Annotated, cast
 from fastapi import Depends, Request
 
 from mem_ai.api.dependencies import SessionFactoryDep
+from mem_ai.core.config import Settings
 from mem_ai.core.exceptions import UnauthorizedError
 from mem_ai.core.logging import bind_log_context
 from mem_ai.modules.auth.adapters import AuthRequest, CredentialVerifier
 from mem_ai.modules.auth.context import AuthenticationContext
+from mem_ai.modules.auth.tokens import BUILTIN_JWT_ISSUER, try_peek_jwt_issuer, verify_access_token
 from mem_ai.modules.users import service as users_service
 
 
@@ -63,6 +65,45 @@ def get_credential_verifier(request: Request) -> CredentialVerifier:
 CredentialVerifierDep = Annotated[CredentialVerifier, Depends(get_credential_verifier)]
 
 
+def _extract_single_bearer_token(request: Request) -> str | None:
+    """Return the sole Bearer token, or None when absent/not Bearer; reject duplicate headers."""
+    headers = request.headers.getlist("authorization")
+    if not headers:
+        return None
+    if len(headers) > 1:
+        raise UnauthorizedError(
+            code="invalid_credentials",
+            message="duplicate authentication header",
+        )
+    parts = headers[0].strip().split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
+        return None
+    return parts[1].strip()
+
+
+async def _resolve_builtin_context(
+    request: Request,
+    session_factory: SessionFactoryDep,
+    bearer_token: str,
+) -> AuthenticationContext:
+    """Verify a built-in Access Token and resolve the active local user."""
+    settings = cast(Settings, request.app.state.settings)
+    claims = verify_access_token(
+        bearer_token,
+        secret=settings.auth_jwt_secret.get_secret_value().strip(),
+        leeway_seconds=settings.auth_jwt_leeway_seconds,
+    )
+    user = await users_service.get_active_user(session_factory, user_id=claims.user_id)
+    return AuthenticationContext(
+        actor_id=user.email or str(user.id),
+        user_id=user.id,
+        auth_method="builtin_jwt",
+        permissions=frozenset(),
+        email=user.email,
+        session_id=claims.session_id,
+    )
+
+
 async def get_auth_context(
     request: Request,
     verifier: CredentialVerifierDep,
@@ -74,6 +115,13 @@ async def get_auth_context(
             code="invalid_auth_scheme",
             message="deletion receipts can only query their deletion operation",
         )
+
+    bearer_token = _extract_single_bearer_token(request)
+    if bearer_token is not None and try_peek_jwt_issuer(bearer_token) == BUILTIN_JWT_ISSUER:
+        context = await _resolve_builtin_context(request, session_factory, bearer_token)
+        bind_log_context(user_id=str(context.user_id))
+        return context
+
     client_host = request.client.host if request.client is not None else None
     raw_headers = tuple(
         (key.decode("latin-1"), value.decode("latin-1")) for key, value in request.headers.raw
@@ -101,6 +149,35 @@ async def get_auth_context(
 
 
 AuthContextDep = Annotated[AuthenticationContext, Depends(get_auth_context)]
+
+
+async def get_optional_auth_context(
+    request: Request,
+    verifier: CredentialVerifierDep,
+    session_factory: SessionFactoryDep,
+) -> AuthenticationContext | None:
+    """Resolve auth when an Authorization header is present; otherwise return None."""
+    if not request.headers.getlist("authorization"):
+        return None
+    override = request.app.dependency_overrides.get(get_auth_context)
+    if override is not None:
+        available = {
+            "request": request,
+            "verifier": verifier,
+            "session_factory": session_factory,
+        }
+        params = inspect.signature(override).parameters
+        kwargs = {name: available[name] for name in params if name in available}
+        resolved = override(**kwargs) if len(kwargs) == len(params) else override()
+        auth = await resolved if inspect.isawaitable(resolved) else resolved
+        return cast(AuthenticationContext, auth)
+    return await get_auth_context(request, verifier, session_factory)
+
+
+OptionalAuthContextDep = Annotated[
+    AuthenticationContext | None,
+    Depends(get_optional_auth_context),
+]
 
 
 async def get_operation_auth_context(

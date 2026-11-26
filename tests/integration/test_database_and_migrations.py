@@ -231,11 +231,11 @@ async def test_historical_schema_upgrade_preserves_data_and_rolling_readiness(
         rolling_settings = empty_pg_settings.model_copy(
             update={
                 "expected_alembic_revision": "20261123_0011",
-                "compatible_alembic_revisions": ["20261124_0012"],
+                "compatible_alembic_revisions": ["20261126_0013"],
             }
         )
         readiness = await check_readiness(session_factory, rolling_settings)
         assert readiness.database == "ok"
-        assert readiness.migration_revision == "20261124_0012"
+        assert readiness.migration_revision == "20261126_0013"
     finally:
         await async_engine.dispose()

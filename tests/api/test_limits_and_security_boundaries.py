@@ -378,6 +378,7 @@ async def test_allowed_hosts_cors_trusted_proxy_request_id_and_forged_headers() 
         auth_trusted_proxies=["10.0.0.0/8"],
         auth_trusted_issuers=["https://gw.example.com"],
         auth_gateway_shared_secret=SecretStr("gateway-shared-secret-value-at-least-32-chars"),
+        auth_jwt_secret=SecretStr("super-secret-jwt-signing-key-at-least-32-chars"),
     )
     app = create_app(
         prod_settings,

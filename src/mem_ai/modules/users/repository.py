@@ -95,3 +95,56 @@ async def delete_user_and_identities(session: AsyncSession, *, user_id: UUID) ->
     )
     if removed is None:
         raise RuntimeError("user cleanup lost its deleting root")
+
+
+# ========================================
+# 基于邮箱的用户管理（内置认证）
+# ========================================
+
+
+async def get_user_by_email(
+    session: AsyncSession,
+    *,
+    email: str,
+    for_update: bool = False,
+) -> User | None:
+    """根据邮箱查找用户"""
+    stmt = select(User).where(User.email == email)
+    if for_update:
+        stmt = stmt.with_for_update()
+    return await session.scalar(stmt)
+
+
+async def create_user_with_email(
+    session: AsyncSession,
+    *,
+    email: str,
+    password_hash: str,
+    status: UserStatus = "active",
+) -> User:
+    """创建带邮箱密码的新用户"""
+    user = User(
+        status=status,
+        email=email,
+        password_hash=password_hash,
+    )
+    session.add(user)
+    await session.flush()
+    await session.refresh(user)
+    return user
+
+
+async def update_user_password(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    password_hash: str,
+) -> User | None:
+    """更新用户密码"""
+    user = await get_user_by_id(session, user_id=user_id, for_update=True)
+    if user is None:
+        return None
+    user.password_hash = password_hash
+    await session.flush()
+    await session.refresh(user)
+    return user

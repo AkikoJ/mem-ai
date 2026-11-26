@@ -379,6 +379,7 @@ async def test_credential_verifier_dependency_override_and_production_guard(
         allowed_hosts=["api.example.com"],
         auth_mode="jwt_hs256",
         auth_jwt_hs256_secret="super-secret-jwt-signing-key-at-least-32-chars",
+        auth_jwt_secret="super-secret-jwt-signing-key-at-least-32-chars",
         auth_trusted_issuers=["https://idp.example.com"],
         auth_trusted_audience="mem-ai-api",
     )
